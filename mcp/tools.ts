@@ -19,6 +19,7 @@ import {
 import { compileMonarchOrders, MONARCH_MAX_ORDERS } from '../src/gen/civ/monarch';
 import { dmPresetInfo } from '../src/gen/civ/dm';
 import { monarchBriefList, monarchRound, monarchStatus, setupMonarch, verifySession } from './monarch';
+import { dmRound, dmSetup, dmStatus } from './dm';
 
 export interface ToolDef {
   name: string;
@@ -231,6 +232,50 @@ export const TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    name: 'civ_dm_oracle_setup',
+    description:
+      '配置 DM 小决策 oracle:给"另一个设备上的本地模型"留的接口,只决定天灾、小贸易这类小事。任何 OpenAI 兼容的 /chat/completions 服务都行(OpenJEV、Ollama、LM Studio、vLLM、llama.cpp server 等),填 baseUrl + model 即可;Key 可选且只存当前进程内存。天灾会编译成引擎 disaster 命令(真改人口/发展,可回放对账),小贸易只记叙事。mock:true 不联网。也可以设置环境变量 CIV_DM_BASE_URL / CIV_DM_MODEL / CIV_DM_API_KEY。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        mock: { type: 'boolean', description: '不联网,用确定性 mock 小决策(默认 false)' },
+        provider: { type: 'string', enum: ['custom', 'deepseek', 'bailian'], description: '本地模型用 custom;deepseek/bailian 用它们的默认地址' },
+        baseUrl: { type: 'string', description: 'OpenAI 兼容地址,如 http://192.168.1.20:8000/v1;也可用环境变量 CIV_DM_BASE_URL' },
+        model: { type: 'string', description: '模型名,如 openjev;也可用环境变量 CIV_DM_MODEL' },
+        apiKey: { type: 'string', description: '可选 Bearer Key;也可用环境变量 CIV_DM_API_KEY' },
+        temperature: { type: 'number', minimum: 0, maximum: 2 },
+        timeoutMs: { type: 'integer', minimum: 5000, maximum: 600000, description: '单次请求超时毫秒(默认 120000)' },
+        maxDecisions: { type: 'integer', minimum: 1, maximum: 5, description: '每回合最多几条小决策(默认 2)' },
+        probe: { type: 'boolean', description: '配置完发一个最小请求测连通(默认 false)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_dm_oracle_status',
+    description: '查看当前会话的 DM 小决策配置(不含 Key)和已跑回合数。',
+    inputSchema: { type: 'object', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
+  },
+  {
+    name: 'civ_dm_round',
+    description:
+      '跑一个 DM 小决策回合:问 oracle(或用手动 decisions 跳过模型)→ 编译成天灾/贸易叙事 → 交命令 → 推演 stepYears 年 → 写 dm-round 日志。若同时配置了君主模式,下一次 civ_monarch_round 也会自动把 DM 小决策并进同一回合。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        years: { type: 'integer', minimum: 1, maximum: 1000, description: '可选:本回合推几年(默认用会话的 stepYears)' },
+        decisions: {
+          type: 'array',
+          description: '可选:手动指定小决策(绕过模型),格式同 oracle 返回的 decisions 数组',
+          items: { type: 'object', additionalProperties: true },
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
 ];
 
 function text(value: unknown): ToolResult {
@@ -277,6 +322,35 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     case 'civ_dm_preset': {
       const overrides = isObject(args.overrides) ? (args.overrides as never) : undefined;
       return text(dmPresetInfo(overrides));
+    }
+    case 'civ_dm_oracle_setup': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(
+        await dmSetup(s, {
+          mock: typeof args.mock === 'boolean' ? args.mock : undefined,
+          provider: typeof args.provider === 'string' ? args.provider : undefined,
+          baseUrl: typeof args.baseUrl === 'string' ? args.baseUrl : undefined,
+          model: typeof args.model === 'string' ? args.model : undefined,
+          apiKey: typeof args.apiKey === 'string' ? args.apiKey : undefined,
+          temperature: optNum(args.temperature, 'temperature'),
+          timeoutMs: optNum(args.timeoutMs, 'timeoutMs'),
+          maxDecisions: optNum(args.maxDecisions, 'maxDecisions'),
+          probe: args.probe === true,
+        }),
+      );
+    }
+    case 'civ_dm_oracle_status': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(dmStatus(s));
+    }
+    case 'civ_dm_round': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(
+        await dmRound(s, {
+          years: optNum(args.years, 'years'),
+          decisions: Array.isArray(args.decisions) ? args.decisions : undefined,
+        }),
+      );
     }
     case 'civ_orders_submit': {
       const s = getSession(String(args.sessionId ?? ''));

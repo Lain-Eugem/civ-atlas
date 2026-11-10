@@ -53,6 +53,14 @@
     model: $('#model'),
     apiKey: $('#apiKey'),
     temperature: $('#temperature'),
+    dmEnable: $('#dmEnable'),
+    dmMock: $('#dmMock'),
+    dmBaseUrl: $('#dmBaseUrl'),
+    dmModel: $('#dmModel'),
+    dmKey: $('#dmKey'),
+    dmMax: $('#dmMax'),
+    btnDmConnect: $('#btnDmConnect'),
+    dmStatusLine: $('#dmStatusLine'),
     btnWorld: $('#btnWorld'),
     btnSession: $('#btnSession'),
     btnRound: $('#btnRound'),
@@ -395,6 +403,13 @@
     el.polSub.textContent = `${st.polities.length} 个在世国家 · 君主 ${st.monarch ? (st.monarch.kingCount ?? 0) : 0} 家${st.finished ? ' · 已结束' : ''}`;
     el.mapTitle.textContent = `第 ${fmtInt(yearOf(st.year))} 年`;
     el.mapSub.textContent = `当前回合 ${st.rounds}/${st.maxRounds}${st.dmPreset ? ' · DM 规则' : ' · 官方规则'}${st.finished ? ' · 会话已结束' : ''} · 点击国家看详情`;
+    if (el.dmStatusLine) {
+      const dm = st.dm;
+      el.dmStatusLine.textContent =
+        dm && dm.configured
+          ? `DM 已连接:${dm.mode === 'mock' ? 'mock(离线)' : esc(dm.label)} · 每回合最多 ${dm.maxDecisions} 条 · 已跑 ${dm.rounds} 回合${dm.last ? ` · 上回合 ${dm.last.decisions} 条决定` : ''}`
+          : 'DM 未连接。填地址和模型后点「连接 / 测试 DM」;天灾会写成引擎命令,小贸易只记叙事。';
+    }
   }
 
   function renderPolities() {
@@ -482,7 +497,7 @@
     if (!S.state || !el.tabBody) return;
     if (S.tab === 'decisions') {
       el.tabBody.innerHTML = renderDecisions();
-      el.tabNote.textContent = `${S.state.monarchRounds.length} 回合`;
+      el.tabNote.textContent = `${S.state.monarchRounds.length} 回合${S.state.dmRounds && S.state.dmRounds.length ? ` · DM ${S.state.dmRounds.length} 回合` : ''}`;
     } else if (S.tab === 'chronicle') {
       el.tabBody.innerHTML = renderChronicle();
       el.tabNote.textContent = `共 ${fmtInt(S.state.chronicleTotal)} 条,最近 ${S.state.events.length} 条`;
@@ -492,14 +507,47 @@
     }
   }
 
+  function dmInlineHtml(dm, keyNames) {
+    if (!dm) return '';
+    const decisions = dm.decisions || [];
+    const cmdNum = typeof dm.commands === 'number' ? dm.commands : (dm.commands || []).length;
+    const items = decisions
+      .map((d) => {
+        const cmd = d.command
+          ? `<span class="cmd-chip">${esc(cmdText(d.command, keyNames))}</span>`
+          : '<span class="muted" style="font-size:11px">叙事(不产生引擎命令)</span>';
+        const label = d.kind === 'trade' ? '小贸易' : d.kind === 'disaster' ? '天灾' : 'DM';
+        return `
+          <div class="dec-item">
+            <span class="pol-dot" style="background:#8a7cff"></span>
+            <div class="dec-country"><span class="name">${esc(label)}</span><span class="badge">DM</span></div>
+            <div class="dec-body">
+              <div class="dec-reason${d.summary || d.note ? '' : ' empty'}">${esc(d.summary || d.note || '（没有说明）')}</div>
+              <div class="dec-cmds">${cmd}</div>
+            </div>
+          </div>`;
+      })
+      .join('') || '<div class="muted" style="font-size:11px">本回合没有小决策</div>';
+    const rej = (dm.rejected || []).length
+      ? `<span class="cmd-chip rej">拒收 ${dm.rejected.length} 条</span>`
+      : '';
+    const err = dm.error ? `<span class="cmd-chip err">${esc(dm.error)}</span>` : '';
+    return `
+      <div class="dm-inline">
+        <div class="dm-inline-head"><b>DM 小决策</b><span>${esc(dm.source || '')} · ${decisions.length} 条 · ${cmdNum} 条引擎命令</span>${err}${rej}</div>
+        ${items}
+      </div>`;
+  }
+
   function renderDecisions() {
     const st = S.state;
     const rounds = st.monarchRounds || [];
-    if (!rounds.length) {
-      return '<div class="side-empty">还没有跑过回合。点「跑一回合」,这里会列出每个君主看到了什么、为什么这么下命令。</div>';
+    const dmRounds = st.dmRounds || [];
+    if (!rounds.length && !dmRounds.length) {
+      return '<div class="side-empty">还没有跑过回合。点「跑一回合」,这里会列出每个君主看到了什么、为什么这么下命令;启用 DM 后还会列出天灾和小贸易。</div>';
     }
     const keyNames = keyNamesOf(st);
-    return rounds
+    const royal = rounds
       .slice()
       .reverse()
       .map((r) => {
@@ -535,9 +583,26 @@
               <span>第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年 · ${decisions.length} 位君主 · ${cmdCount} 条命令${rejCount ? ` · 拒收 ${rejCount}` : ''}${(r.engineRejected || []).length ? ` · 引擎拒收 ${r.engineRejected.length}` : ''}</span>
             </div>
             ${items}
+            ${dmInlineHtml(r.dm, keyNames)}
           </div>`;
       })
       .join('');
+    const dmOnly = dmRounds
+      .slice()
+      .reverse()
+      .map((r) => {
+        const decisions = r.decisions || [];
+        const cmdNum = (r.commands || []).length;
+        return `
+          <div class="dec-round">
+            <div class="dec-round-head"><b>DM 第 ${r.round} 回合</b>
+              <span>第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年 · ${decisions.length} 条小决策 · ${cmdNum} 条引擎命令${(r.engineRejected || []).length ? ` · 引擎拒收 ${r.engineRejected.length}` : ''}</span>
+            </div>
+            ${dmInlineHtml({ source: r.source, decisions, commands: r.commands, notes: r.notes }, keyNames)}
+          </div>`;
+      })
+      .join('');
+    return royal + dmOnly;
   }
 
   function renderChronicle() {
@@ -603,6 +668,7 @@
     el.btnAuto.disabled = !hasSession || finished || S.busy;
     el.btnVerify.disabled = !hasSession || S.busy;
     el.btnExport.disabled = !hasSession || S.busy;
+    el.btnDmConnect.disabled = !hasSession || S.busy;
     el.btnAuto.textContent = S.autoOn ? '暂停自动播放' : '自动播放';
     el.btnAuto.classList.toggle('playing', S.autoOn);
   }
@@ -666,6 +732,14 @@
         temperature: Number(el.temperature.value) || 0.7,
       });
       await applyState(setup.state || d.state);
+      if (el.dmEnable.checked) {
+        try {
+          setBusy(true, '正在连接 DM 小决策…', el.dmMock.checked ? 'mock 模式,不联网' : 'OpenAI 兼容服务;Key 只在服务端内存。');
+          await connectDm(true);
+        } catch (e) {
+          toast(`DM 小决策未连接(不影响君主):${e instanceof Error ? e.message : String(e)}`, true);
+        }
+      }
       const king = setup.setup.monarchs.length;
       toast(`会话已开始:第 ${fmtInt(yearOf(d.session.year))} 年,${king} 家君主接管${el.mock.checked ? '(mock)' : '(真模型)'}`);
       setHint('点「跑一回合」:每个君主先看简报,再下命令;收齐后引擎统一推演一个回合。');
@@ -729,6 +803,29 @@
     refreshButtons();
   }
 
+  async function connectDm(silent = false) {
+    if (!S.sessionId) return;
+    const mock = el.dmMock.checked;
+    const d = await api('/api/dm/setup', {
+      sessionId: S.sessionId,
+      mock,
+      provider: 'custom',
+      baseUrl: el.dmBaseUrl.value.trim(),
+      model: el.dmModel.value.trim(),
+      apiKey: el.dmKey.value,
+      maxDecisions: int(el.dmMax, 2),
+      probe: !mock,
+    });
+    if (d && d.state) await applyState(d.state);
+    if (!silent) {
+      toast(
+        mock
+          ? 'DM 已连接(mock):天灾会写成引擎命令,小贸易只记叙事'
+          : `DM 已连接:${d && d.dm && d.dm.label ? d.dm.label : 'OpenAI 兼容'}`,
+      );
+    }
+  }
+
   async function verifySession() {
     if (!S.sessionId) return;
     try {
@@ -774,6 +871,20 @@
     });
     el.btnVerify.addEventListener('click', () => { void verifySession(); });
     el.btnExport.addEventListener('click', () => { void exportSession(); });
+    el.btnDmConnect.addEventListener('click', () => {
+      void (async () => {
+        try {
+          setBusy(true, el.dmMock.checked ? '正在连接 DM(mock)…' : '正在测试 DM 连接…', '只决定天灾和小贸易;Key 只在服务端内存。');
+          await connectDm(false);
+          setHint('DM 已接上:跑一回合时,君主命令和 DM 小决策会一起提交给引擎。');
+        } catch (e) {
+          toast(`连接 DM 失败:${e instanceof Error ? e.message : String(e)}`, true);
+        } finally {
+          setBusy(false);
+          refreshButtons();
+        }
+      })();
+    });
 
     el.tabs.addEventListener('click', (e) => {
       const btn = e.target.closest('.tab');
@@ -793,6 +904,12 @@
       el.apiKey.disabled = el.mock.checked;
     });
 
+    el.dmMock.addEventListener('change', () => {
+      el.dmBaseUrl.disabled = el.dmMock.checked;
+      el.dmModel.disabled = el.dmMock.checked;
+      el.dmKey.disabled = el.dmMock.checked;
+    });
+
     window.addEventListener('resize', () => resizeCanvas());
     if (window.ResizeObserver && el.mapWrap) {
       new ResizeObserver(() => resizeCanvas()).observe(el.mapWrap);
@@ -801,6 +918,9 @@
 
     el.provider.disabled = el.mock.checked;
     el.apiKey.disabled = el.mock.checked;
+    el.dmBaseUrl.disabled = el.dmMock.checked;
+    el.dmModel.disabled = el.dmMock.checked;
+    el.dmKey.disabled = el.dmMock.checked;
   }
 
   bind();

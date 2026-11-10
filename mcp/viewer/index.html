@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -63,6 +63,22 @@
         <label class="field"><span>模型</span><input id="model" type="text" placeholder="deepseek-chat / qwen-plus"></label>
         <label class="field grow"><span>API Key</span><input id="apiKey" type="password" placeholder="sk-…" autocomplete="off"></label>
         <label class="field"><span>温度</span><input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1"></label>
+      </div>
+    </details>
+
+    <details class="llm-row" id="dmRow">
+      <summary>DM 小决策 <span class="muted">(另一台设备的本地模型 / mock:天灾、小贸易;Key 只存在这个进程的内存里)</span></summary>
+      <div class="control-row">
+        <label class="field check"><input id="dmEnable" type="checkbox"><span>本局启用 DM</span></label>
+        <label class="field check"><input id="dmMock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
+        <label class="field grow"><span>OpenAI 兼容地址</span><input id="dmBaseUrl" type="text" placeholder="http://192.168.1.20:8000/v1"></label>
+        <label class="field"><span>模型</span><input id="dmModel" type="text" placeholder="openjev"></label>
+        <label class="field grow"><span>API Key(可留空)</span><input id="dmKey" type="password" placeholder="本地模型通常不需要" autocomplete="off"></label>
+        <label class="field"><span>每回合上限</span><input id="dmMax" type="number" value="2" min="1" max="5" step="1"></label>
+      </div>
+      <div class="control-row">
+        <button id="btnDmConnect" class="btn" disabled>连接 / 测试 DM</button>
+        <span class="hint grow" id="dmStatusLine">DM 未连接。填地址和模型后点「连接 / 测试 DM」;天灾会写成引擎命令,小贸易只记叙事。</span>
       </div>
     </details>
 

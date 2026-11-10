@@ -38,6 +38,9 @@ node mcp/.build/mcp/selftest-press.js
 
 # DM 规则预设自检(预设生效、可复现、不改官方世界)
 node mcp/.build/mcp/selftest-dm.js
+
+# DM 小决策自检(天灾/贸易编译、mock 回合、日志、回放对账)
+node mcp/.build/mcp/selftest-dm-oracle.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -77,6 +80,9 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | `civ_monarch_round` | 跑一个君主回合:简报 → 并发 LLM/mock → 编译命令 → 统一推演 → 写日志 |
 | `civ_monarch_status` | 看君主模式配置与已跑回合数(不含 Key) |
 | `civ_dm_preset` | 看 DM 规则预设的默认值(7 项)、换算后的旋钮、每项说明;可传 `overrides` 预览自定义 |
+| `civ_dm_oracle_setup` | 配置 DM 小决策:离线 `mock`,或 `baseUrl` + `model`(OpenAI 兼容)+ 可选 Key/温度/超时/每回合上限;可 `probe` 测连通 |
+| `civ_dm_oracle_status` | 看 DM 小决策状态(模式/上限/已跑回合/最近一回合;不含 Key) |
+| `civ_dm_round` | 单独跑一个 DM 回合(只做天灾/小贸易),或传 `decisions` 手动指定 |
 | `civ_session_verify` | 回放对账:用同一世界 + 命令史重推,比较 16 位 civ 指纹与年份 |
 
 ## 君主模式(任务二)
@@ -120,6 +126,22 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
   - `b` 可省略(= 跟谁都继续打);给了 `b` 就只管跟这一国的仗。
   - 讨伐民变的战争不吃 `press`(民变由 `split` 规则管,和对外命令分开)。
 
+## DM 小决策(接另一台设备的本地模型)
+
+给 DM(推演主持人)留的外部模型接口:让它决定引擎里没有的小事——**天灾、小贸易结果**。天灾会编译成引擎的 `disaster` 干预(真改历史);小贸易只写进 DM 日志(引擎没有贸易原语,不产生命令)。
+
+另一台设备上跑 OpenJEV / Ollama / LM Studio / vLLM 都行,只要它提供 OpenAI 兼容的 `/v1/chat/completions`:
+
+- `civ_dm_oracle_setup`:`{ "sessionId": "...", "baseUrl": "http://192.168.1.20:8000/v1", "model": "openjev", "maxDecisions": 2 }`。
+- 也可以不传参数,改用环境变量 `CIV_DM_BASE_URL`、`CIV_DM_MODEL`、`CIV_DM_API_KEY`(本地模型通常不需要 Key)。
+- `mock: true` 用离线确定性 mock,不联网,适合演示/自检。
+- `civ_dm_oracle_status`:看是否连上、模式、每回合上限、已跑回合(返回值不含 Key)。
+- `civ_dm_round`:单独跑一个 DM 回合(只做小决策);配置好 DM 后,君主回合会自动把 DM 决策合并进同一批命令,通常不用单独调。
+- 能决定的只有 `disaster`(plague / famine / quake / pandemic,需要城/州/国家目标)与 `trade`(a/b 两个国家、货物、赚/赔/平,仅叙事);其它决策会被拒收。
+- 天灾的 `from` 必须是当前回合年,所以 DM 只能在整个推演"当下"制造灾祸;所有命令都会写进命令日志和 `dm-round-*.jsonl`,回放对账仍然逐位一致。
+
+浏览器查看器里也有对应面板:展开「DM 小决策」→ 勾选「本局启用 DM」→(假模型就勾 mock;真模型填地址/模型)→ 点「连接 / 测试 DM」;之后「跑一回合」时 DM 小决策会随君主命令一起提交,AI 决策页会显示每条天灾/贸易。
+
 ## 参数全部可自定义
 
 没有写死的「默认对局」:世界生成参数、起始年、每回合年数、回合数、结束年、引擎参数(`civParams`)、接管的君主数量、每国命令上限、模型/温度/超时都由调用方给。想固定一套配置,就由调用方每次传同样的值,或者自己包一层脚本/MCP 客户端配置。
@@ -151,7 +173,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争)。
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹)。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 注意:查看器进程内的世界/会话表是内存里的,关掉进程就没了;日志仍写在 `mcp/.runs/`。查看器不改变引擎的确定性,只是把同一套 `mcp/engine.ts` / `mcp/monarch.ts` 搬到 HTTP 后面。
 
@@ -161,6 +183,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **任务二(已完成)**:君主回合循环,新增 5 个君主工具;`mock` 与真 LLM 两条路径;回放对账。
 - **任务三(已完成)**:DM 规则预设(`tuningPatch` 写 `CivParams.knobs`,`civ_dm_preset` 查看/覆盖)+ 新增 `press` 干预(引擎自动议和 vs 君主坚持打);官方世界确定性逐位不变(21/21 对账通过)。
 - **阶段四(已完成)**:本地浏览器查看器(`mcp/viewer.ts` + `mcp/viewer/` 前端),地图/疆域/君主决策/编年史/回合日志可视化,零新依赖。
+- **DM 小决策接口(新增)**:`mcp/dm.ts` + `civ_dm_oracle_setup/status/round` 三个工具 + 查看器 DM 面板;OpenAI 兼容(OpenJEV / Ollama / LM Studio / vLLM),天灾写成 `disaster` 命令真改历史,小贸易只记叙事;命令照常进日志,回放对账仍一致。
 
 ## 目录
 
@@ -171,13 +194,15 @@ mcp/
   monarch.ts         君主回合编排(setup/brief/round/status/verify)
   prompt.ts          君主系统提示词
   llm.ts             DeepSeek/百炼/自定义 OpenAI 兼容 + mock 决策
-  tools.ts           14 个 MCP 工具定义与分发
+  dm.ts              DM 小决策(OpenAI 兼容 oracle + 天灾/小贸易编译 + 日志)
+  tools.ts           17 个 MCP 工具定义与分发
   server.ts          JSON-RPC 2.0 over stdio(逐行串行处理)
   selftest.ts        引擎自检(31 项)
   selftest-protocol.ts  协议自检(16 项)
   selftest-monarch.ts   君主回合自检(29 项,mock)
   selftest-press.ts     press 干预自检(16 项)
   selftest-dm.ts        DM 规则预设自检(17 项)
+  selftest-dm-oracle.ts DM 小决策自检(34 项,mock)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1

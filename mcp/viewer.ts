@@ -39,6 +39,7 @@ import {
   type Session,
 } from './engine';
 import { setupMonarch, monarchRound, monarchStatus, verifySession } from './monarch';
+import { dmRound, dmSetup, dmStatus } from './dm';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
 import { polityName } from '../src/gen/civ/growth';
 import type { World } from '../src/gen/world';
@@ -530,6 +531,25 @@ function stateView(s: Session): Record<string, unknown> {
     commands: st.commands,
     monarch: s.monarch ? { ...monarchStatus(s), kingCount } : null,
     monarchRounds: s.monarch ? s.monarch.rounds.map(trimRound) : [],
+    // DM 小决策(oracle)的状态;天灾会真改引擎,小贸易只记叙事
+    dm: s.dm ? dmStatus(s) : null,
+    dmRounds: s.dm
+      ? s.dm.rounds.map((r) => {
+          const o = r as Record<string, unknown>;
+          return {
+            round: o.round,
+            year: o.year,
+            fromYear: o.fromYear,
+            toYear: o.toYear,
+            source: o.source,
+            reason: o.reason,
+            decisions: Array.isArray(o.decisions) ? o.decisions : [],
+            notes: Array.isArray(o.notes) ? o.notes : [],
+            changes: Array.isArray(o.changes) ? o.changes : [],
+            fingerprint: o.fingerprint,
+          };
+        })
+      : [],
     // 让前端能直接拿到君主信息(与 polities[].ruler 相同,单独列一份方便调试)
     monarchOn: !!s.monarch,
   };
@@ -779,6 +799,40 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const round = await monarchRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
       ownerCache.delete(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/dm/setup') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const mock = args.mock === true;
+      const provider = args.provider === undefined || args.provider === '' ? 'custom' : String(args.provider);
+      const dm = await dmSetup(s, {
+        mock,
+        provider: mock ? undefined : provider,
+        baseUrl: args.baseUrl === undefined || args.baseUrl === '' ? undefined : String(args.baseUrl),
+        model: args.model === undefined || args.model === '' ? undefined : String(args.model),
+        apiKey: args.apiKey === undefined || args.apiKey === '' ? undefined : String(args.apiKey),
+        temperature: args.temperature === undefined ? undefined : num(args, 'temperature', 0.8),
+        timeoutMs: args.timeoutMs === undefined ? undefined : num(args, 'timeoutMs', 120000),
+        maxDecisions: args.maxDecisions === undefined ? undefined : num(args, 'maxDecisions', 2),
+        probe: args.probe === true,
+      });
+      sendJson(res, 200, { dm, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/dm/round') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const dm = await dmRound(s, {
+        ...(args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) }),
+        ...(Array.isArray(args.decisions) ? { decisions: args.decisions } : {}),
+      });
+      ownerCache.delete(s.id);
+      sendJson(res, 200, { dm, state: stateView(s) });
       return true;
     }
 

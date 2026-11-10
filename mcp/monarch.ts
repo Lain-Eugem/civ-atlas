@@ -43,6 +43,7 @@ import {
   type LlmProviderInput,
   type LlmProviderSettings,
 } from './llm';
+import { decideDm, type DmDecisionOutcome } from './dm';
 import { MONARCH_SYSTEM_PROMPT, monarchUserPrompt } from './prompt';
 
 export interface MonarchRunConfig {
@@ -182,6 +183,16 @@ export interface MonarchRoundResult {
   toYear: number;
   years: number;
   decisions: MonarchDecisionRecord[];
+  /** 同一回合里由 DM 小决策(oracle)产生的那部分;没配置 DM = 不存在 */
+  dm?: {
+    source: DmDecisionOutcome['source'];
+    reason: string;
+    decisions: DmDecisionOutcome['decisions'];
+    commands: number;
+    rejected: number;
+    notes: string[];
+    error?: string;
+  };
   engineRejected: unknown[];
   changes: TurnResult['polities'];
   events: TurnResult['events'];
@@ -257,7 +268,35 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     });
   }
 
-  submitOrders(s, allCommands);
+  // 同一回合的 DM 小决策(天灾/小贸易):和君主命令一起,在同一刻交给引擎
+  let dm: MonarchRoundResult['dm'] | undefined;
+  const dmCommands: Intervention[] = [];
+  if (s.dm) {
+    try {
+      const out = await decideDm(s);
+      dmCommands.push(...out.commands);
+      dm = {
+        source: out.source,
+        reason: out.reason,
+        decisions: out.decisions,
+        commands: out.commands.length,
+        rejected: out.rejected.length,
+        notes: out.notes,
+      };
+    } catch (e) {
+      dm = {
+        source: 'llm',
+        reason: '',
+        decisions: [],
+        commands: 0,
+        rejected: 0,
+        notes: [],
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
+  submitOrders(s, dmCommands.length ? [...allCommands, ...dmCommands] : allCommands);
   const turn = turnStep(s, { years: opts.years });
 
   const record: Record<string, unknown> = {
@@ -273,6 +312,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     events: turn.events,
     fingerprint: turn.fingerprint,
     briefs: briefs.map((b) => ({ polityId: b.polityId, name: b.name, text: b.text })),
+    ...(dm ? { dm } : {}),
   };
   s.monarch!.rounds.push(record);
   const path = join(s.logDir, `monarch-round-${String(turn.round).padStart(4, '0')}.json`);
@@ -282,6 +322,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     fromYear: turn.fromYear,
     toYear: turn.toYear,
     decisions: decisions.map((d) => ({ polityId: d.polityId, source: d.source, commands: d.commands.length, rejected: d.rejected.length, error: d.error ?? null })),
+    ...(dm ? { dm: { source: dm.source, decisions: dm.decisions.length, commands: dm.commands, error: dm.error ?? null } } : {}),
     fingerprint: turn.fingerprint,
   }) + '\n');
 
@@ -292,6 +333,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     toYear: turn.toYear,
     years: turn.years,
     decisions,
+    ...(dm ? { dm } : {}),
     engineRejected: turn.rejected,
     changes: turn.polities,
     events: turn.events,

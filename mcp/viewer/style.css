@@ -570,3 +570,26 @@ details.llm-row[open] summary { margin-bottom: 10px; }
   .dec-item .dec-country { grid-column: 2; }
   .map-tip { display: none; }
 }
+
+/* DM 小决策(天灾 / 小贸易) */
+.dm-inline {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--line-soft);
+}
+.dm-inline-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.dm-inline-head b {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: #a795ff;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.dm-inline-head span { color: var(--muted); font-size: 11px; }
+.dm-inline .dec-item { grid-template-columns: 10px 96px minmax(0, 1fr); }
