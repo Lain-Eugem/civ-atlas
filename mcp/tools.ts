@@ -72,6 +72,16 @@ export const TOOLS: ToolDef[] = [
           additionalProperties: true,
           description: '可选:DM 预设的单项覆盖(键名见 civ_dm_preset 返回的 items,如 {"war.odds":0.25});只有 dmPreset=true 时有效。',
         },
+        magicField: {
+          type: 'boolean',
+          description: '可选:打开内置「魔力」场(照官方 magic 推演插件:每州一个魔力浓度,从灵脉渗出、向邻州扩散、被人耗散;魔力浓的州城人口上限高,每 50 年存一份图层)。默认 false = 官方规则,逐字节不变。',
+        },
+        magicStrength: {
+          type: 'number',
+          minimum: 0,
+          maximum: 3,
+          description: '可选:魔力对城上限的强度,0 = 只记图层不影响城,1 = 魔力满 100 时城上限翻倍(默认),3 = 四倍;按 0.5 对齐。',
+        },
         mode: { type: 'string', enum: ['auto', 'monarch'], description: '推演模式。auto=内置规则自动推演;monarch=先开好会话,再用 civ_monarch_setup 把国家交给外部君主。两种模式不改变引擎确定性。' },
         civParams: {
           type: 'object',
@@ -362,6 +372,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
         endYear: optNum(args.endYear, 'endYear'),
         mode: typeof args.mode === 'string' ? (args.mode as 'auto') : undefined,
         dmPreset: args.dmPreset === true ? (isObject(args.dmRules) ? (args.dmRules as never) : true) : undefined,
+        magicField: args.magicField === true ? (optNum(args.magicStrength, 'magicStrength') ?? true) : undefined,
         civParams: isObject(args.civParams) ? (args.civParams as never) : undefined,
       });
       return text(opened.summary);

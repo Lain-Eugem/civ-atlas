@@ -46,6 +46,8 @@
         </select>
       </label>
       <label class="field check"><input id="dmPreset" type="checkbox" checked><span>DM 规则预设</span></label>
+      <label class="field check"><input id="magicField" type="checkbox" checked><span>魔力场</span></label>
+      <label class="field"><span>魔力强度</span><input id="magicStrength" type="number" value="1" min="0" max="3" step="0.5"></label>
       <label class="field check"><input id="mock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
     </div>
 
@@ -149,6 +151,22 @@
         <div class="field-legend-bar" id="fieldLegendBar"></div>
         <div class="field-legend-ticks" id="fieldLegendTicks"></div>
         <div class="field-legend-unit">0–1 相对浓度 · 图例刻度为真实数值 · hover 看原始值</div>
+      </div>
+    </details>
+
+    <details class="llm-row" id="magicRow">
+      <summary>本局动态层 · 魔力 <span class="muted">(逐年演化:灵脉渗出 → 邻州扩散 → 人口耗散;每 50 年存一帧,真影响城上限)</span></summary>
+      <div class="control-row">
+        <label class="field check"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
+        <label class="field"><span>图层年份</span><select id="magicYearPick"></select></label>
+        <button id="btnMagicNow" class="btn">回到本回合</button>
+        <span class="hint grow" id="magicStatusLine">开一个带「魔力场」的会话后,这里会出现逐年图层。</span>
+      </div>
+      <div class="field-legend-wrap hidden" id="magicLegendWrap">
+        <div class="field-legend-head"><span id="magicLegendName">魔力浓度</span><span class="field-legend-hash" id="magicLegendHash"></span></div>
+        <div class="field-legend-bar" id="magicLegendBar"></div>
+        <div class="field-legend-ticks" id="magicLegendTicks"></div>
+        <div class="field-legend-unit">按州记的浓度(0–100;图层色带 0–60)· 每像素取所属州的值 · hover 看精确值</div>
       </div>
     </details>
 

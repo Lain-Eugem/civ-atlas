@@ -33,6 +33,7 @@ import {
   exportSession,
   isFinished,
   sessionSummary,
+  magicView,
   type EventView,
   type PolityView,
   type RulerView,
@@ -53,6 +54,7 @@ import {
   type FieldRamp,
   type FieldStyle,
 } from './field-render';
+import { DEFAULT_MAGIC_STYLE, renderMagicMap, magicDataJson, magicLegendOf, magicLayerOf } from './magic-render';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
 
@@ -581,6 +583,8 @@ function stateView(s: Session): Record<string, unknown> {
           };
         })
       : [],
+    // 本局「魔力」场(逐年演化、真实影响城上限);没开 = null
+    magic: magicView(s),
     // 让前端能直接拿到君主信息(与 polities[].ruler 相同,单独列一份方便调试)
     monarchOn: !!s.monarch,
   };
@@ -597,6 +601,8 @@ const chronCache = new Map<string, { fingerprint: string; entries: EventView[]; 
 const fieldFrames = new Map<string, FieldFrame>();
 /** 场的渲染层缓存:键 = frame.hash|样式 JSON;改样式只重画,不动计算层 */
 const fieldPngs = new Map<string, { png: Buffer; legend: unknown }>();
+/** 「魔力」动态图层的 PNG 缓存:键 = sessionId|年份 */
+const magicPngs = new Map<string, { png: Buffer; legend: unknown; frameYear: number | null }>();
 
 function optNum(v: string | null): number | undefined {
   if (v === null || v === '') return undefined;
@@ -849,6 +855,56 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
 
 
 
+  if (method === 'GET' && pathname === '/api/magic/meta') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const view = magicView(s);
+    sendJson(res, 200, {
+      enabled: !!view,
+      strength: view?.strength ?? null,
+      layers: view?.layers ?? [],
+      legend: magicLegendOf(s.civ, s.play.year),
+      year: s.play.year,
+      yearNow: gameYearOf(s.play.year),
+    });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/magic/base') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const layer = magicLayerOf(s.civ);
+    if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const asked = optNum(url.searchParams.get('year'));
+    const lo = layer.years[0];
+    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(lo, asked));
+    const key = `${s.id}|${year}`;
+    const hit = magicPngs.get(key);
+    if (hit) { sendPng(res, hit.png); return true; }
+    const out = renderMagicMap(s.world, s.civ, year, DEFAULT_MAGIC_STYLE);
+    if (!out) { fail(res, 404, '没有魔力图层'); return true; }
+    if (magicPngs.size > 24) magicPngs.clear();
+    magicPngs.set(key, { png: out.png, legend: out.legend, frameYear: out.frameYear });
+    sendPng(res, out.png);
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/magic/data') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const layer = magicLayerOf(s.civ);
+    if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const asked = optNum(url.searchParams.get('year'));
+    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
+    const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)));
+    if (!data) { fail(res, 404, '没有魔力图层'); return true; }
+    sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year) });
+    return true;
+  }
+
   if (method === 'GET' && pathname === '/api/state') {
     const sid = url.searchParams.get('sessionId') ?? '';
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
@@ -899,6 +955,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const stepYears = num(args, 'stepYears', 5);
       const maxRounds = num(args, 'maxRounds', 12);
       const dmPreset = args.dmPreset === true ? true : undefined;
+      const magicField = args.magicField === true
+        ? (Number.isFinite(Number(args.magicStrength)) ? Number(args.magicStrength) : true)
+        : undefined;
       const { session, summary } = openSession({
         worldId,
         startYear,
@@ -906,6 +965,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         maxRounds,
         mode: 'monarch',
         ...(dmPreset ? { dmPreset: true } : {}),
+        ...(magicField !== undefined ? { magicField } : {}),
       });
       ownerCache.delete(session.id);
       chronCache.delete(session.id);

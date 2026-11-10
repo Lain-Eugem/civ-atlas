@@ -35,6 +35,7 @@
     tab: 'decisions',
     toastTimer: 0,
     field: { on: false, img: null, data: null, legend: null, kind: 'magic' },
+    magic: { on: false, img: null, data: null, legend: null, meta: null, year: null },
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -48,6 +49,8 @@
     maxRounds: $('#maxRounds'),
     polities: $('#polities'),
     dmPreset: $('#dmPreset'),
+    magicField: $('#magicField'),
+    magicStrength: $('#magicStrength'),
     mock: $('#mock'),
     provider: $('#provider'),
     baseUrl: $('#baseUrl'),
@@ -91,6 +94,15 @@
     fieldLegendBar: $('#fieldLegendBar'),
     fieldLegendTicks: $('#fieldLegendTicks'),
     fieldTip: $('#fieldTip'),
+    magicEnable: $('#magicEnable'),
+    magicYearPick: $('#magicYearPick'),
+    btnMagicNow: $('#btnMagicNow'),
+    magicStatusLine: $('#magicStatusLine'),
+    magicLegendWrap: $('#magicLegendWrap'),
+    magicLegendName: $('#magicLegendName'),
+    magicLegendHash: $('#magicLegendHash'),
+    magicLegendBar: $('#magicLegendBar'),
+    magicLegendTicks: $('#magicLegendTicks'),
     btnWorld: $('#btnWorld'),
     btnSession: $('#btnSession'),
     btnRound: $('#btnRound'),
@@ -272,6 +284,8 @@
     ctx.drawImage(S.baseImg, ox, oy, S.mapW * k, S.mapH * k);
     // 场叠加层:只把渲染层给的 PNG 贴上去,数值不动
     if (S.field.on && S.field.img) ctx.drawImage(S.field.img, ox, oy, S.mapW * k, S.mapH * k);
+    // 本局动态层(魔力):也是渲染层给的 PNG,贴在底图之上、国界之下
+    if (S.magic.on && S.magic.img) ctx.drawImage(S.magic.img, ox, oy, S.mapW * k, S.mapH * k);
     if (S.ownersImg) ctx.drawImage(S.ownersImg, ox, oy, S.mapW * k, S.mapH * k);
 
     if (S.state) drawLabels(ctx, ox, oy, k);
@@ -468,7 +482,9 @@
   }
 
   function showFieldTip(e) {
-    if (!S.field.on || !S.field.data || !el.map) return setFieldTipVisible(false);
+    const field = S.field.on && S.field.data ? S.field.data : null;
+    const magic = S.magic.on && S.magic.data ? S.magic.data : null;
+    if ((!field && !magic) || !el.map) return setFieldTipVisible(false);
     const rect = el.map.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -476,19 +492,35 @@
     const mx = (x - ox) / k;
     const my = (y - oy) / k;
     if (mx < 0 || my < 0 || mx > S.mapW || my > S.mapH) return setFieldTipVisible(false);
-    const d = S.field.data;
-    const gx = Math.min(d.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * d.gridW)));
-    const gy = Math.min(d.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * d.gridH)));
-    const cell = d.grid[gy * d.gridW + gx];
-    if (typeof cell !== 'number' || cell < 0 || cell >= d.values.length) return setFieldTipVisible(false);
-    const value = d.values[cell];
     const lon = ((mx / S.mapW) * 360 - 180).toFixed(1);
     const lat = (90 - (my / S.mapH) * 180).toFixed(1);
-    el.fieldTip.innerHTML =
-      `<b>${esc(d.label)}</b> <span class="field-tip-value">${value.toFixed(6)}</span><br>` +
-      `<span class="muted">地块 #${cell} · ${lon}°E, ${lat}°N · hash ${short(d.hash, 10)}</span>`;
+    const lines = [];
+    if (field) {
+      const gx = Math.min(field.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * field.gridW)));
+      const gy = Math.min(field.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * field.gridH)));
+      const cell = field.grid[gy * field.gridW + gx];
+      if (typeof cell !== 'number' || cell < 0 || cell >= field.values.length) {
+        if (!magic) return setFieldTipVisible(false);
+      } else {
+        lines.push(`<b>${esc(field.label)}</b> <span class="field-tip-value">${field.values[cell].toFixed(6)}</span>`);
+        lines.push(`<span class="muted">地块 #${cell} · ${lon}°E, ${lat}°N · hash ${short(field.hash, 10)}</span>`);
+      }
+    }
+    if (magic) {
+      const gx = Math.min(magic.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * magic.gridW)));
+      const gy = Math.min(magic.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * magic.gridH)));
+      const region = magic.grid[gy * magic.gridW + gx];
+      if (typeof region === 'number' && region >= 0 && region < magic.values.length) {
+        if (lines.length) lines.push('<span class="muted">——</span>');
+        lines.push(`<b>魔力浓度</b> <span class="field-tip-value">${magic.values[region].toFixed(4)}</span>`);
+        lines.push(`<span class="muted">第 ${fmtInt(magic.frameYear)} 年图层(取不晚于本回合的帧)· 州 #${region} · ${lon}°E, ${lat}°N</span>`);
+      } else if (!lines.length) {
+        return setFieldTipVisible(false);
+      }
+    }
+    el.fieldTip.innerHTML = lines.join('<br>');
     el.fieldTip.classList.remove('hidden');
-    const bx = Math.min(S.cw - 230, Math.max(6, x + 14));
+    const bx = Math.min(S.cw - 250, Math.max(6, x + 14));
     const by = Math.max(6, y - 54);
     el.fieldTip.style.left = `${bx}px`;
     el.fieldTip.style.top = `${by}px`;
@@ -596,6 +628,113 @@
     fieldTimer = window.setTimeout(() => {
       if (S.worldId && el.fieldEnable.checked) void applyField();
     }, 260);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 本局动态层:魔力(引擎逐年演化、真影响城上限)
+   * ------------------------------------------------------------------ */
+
+  function decodeMagicData(d) {
+    const vb = decodeB64(d.values);
+    const gb = decodeB64(d.grid);
+    return {
+      ...d,
+      values: new Float32Array(vb.buffer, vb.byteOffset, vb.byteLength / 4),
+      grid: new Int32Array(gb.buffer, gb.byteOffset, gb.byteLength / 4),
+    };
+  }
+
+  function renderMagicLegend() {
+    const lg = S.magic.legend;
+    if (!lg || !el.magicLegendWrap) return;
+    el.magicLegendWrap.classList.remove('hidden');
+    el.magicLegendName.textContent = `${lg.title || '魔力浓度'} · ${lg.legend || ''}`;
+    el.magicLegendHash.textContent = S.magic.year === null ? '' : `第 ${fmtInt(S.magic.year)} 年 · 图层帧 ${fmtInt(S.magic.data && S.magic.data.frameYear)}`;
+    el.magicLegendBar.style.background = `linear-gradient(90deg, ${(lg.colors || []).map((c, i, a) => `${c} ${((i / Math.max(1, a.length - 1)) * 100).toFixed(1)}%`).join(', ')})`;
+    el.magicLegendTicks.innerHTML = (lg.ticks || [])
+      .map((t, i, a) => `<span style="left:${((i / Math.max(1, a.length - 1)) * 100).toFixed(2)}%"><i></i>${t.value.toFixed(1)}</span>`)
+      .join('');
+  }
+
+  function updateMagicStatus(meta, year) {
+    if (!el.magicStatusLine) return;
+    const d = S.magic.data;
+    if (!d) {
+      el.magicStatusLine.textContent = '开一个带「魔力场」的会话后,这里会出现逐年图层。';
+      return;
+    }
+    el.magicStatusLine.textContent =
+      `魔力强度 ${meta && meta.strength !== null && meta.strength !== undefined ? meta.strength : '?'} · 图层第 ${fmtInt(year)} 年(帧 ${fmtInt(d.frameYear)}) · ` +
+      `${fmtInt(d.regions)} 州 · min ${d.stats.min.toFixed(2)} / mean ${d.stats.mean.toFixed(2)} / max ${d.stats.max.toFixed(2)}`;
+  }
+
+  function resetMagic(quiet) {
+    S.magic.on = false;
+    S.magic.meta = null;
+    S.magic.data = null;
+    S.magic.legend = null;
+    S.magic.year = null;
+    if (S.magic.img && S.magic.img.close) {
+      try { S.magic.img.close(); } catch (_) { /* ignore */ }
+    }
+    S.magic.img = null;
+    if (el.magicLegendWrap) el.magicLegendWrap.classList.add('hidden');
+    if (el.magicYearPick) el.magicYearPick.innerHTML = '';
+    if (el.magicStatusLine && !quiet) el.magicStatusLine.textContent = '这个会话没有开「魔力场」(创建会话时勾「魔力场」)。';
+    draw();
+  }
+
+  /** 拉本局魔力图层;year 省略 = 跟当前回合 */
+  async function refreshMagic(year) {
+    if (!S.sessionId) { resetMagic(true); return; }
+    try {
+      const sid = encodeURIComponent(S.sessionId);
+      const meta = await api(`/api/magic/meta?sessionId=${sid}`);
+      S.magic.meta = meta;
+      if (!meta || !meta.enabled || !meta.layers || !meta.layers.length) { resetMagic(true); return; }
+      const layer = meta.layers[0];
+      const years = layer.years || [];
+      const playYear = yearOf(meta.year);
+      const want = year === undefined ? playYear : Number(year);
+      let pick = years.length ? years[0] : playYear;
+      for (const y of years) if (y <= want) pick = y;
+      if (years.length && want > years[years.length - 1]) pick = years[years.length - 1];
+      if (el.magicYearPick) {
+        el.magicYearPick.innerHTML = years
+          .map((y) => `<option value="${y}"${y === pick ? ' selected' : ''}>第 ${fmtInt(y)} 年</option>`)
+          .join('');
+      }
+      const q = `sessionId=${sid}&year=${encodeURIComponent(String(pick))}`;
+      const pngRes = await fetch(`/api/magic/base?${q}`);
+      if (!pngRes.ok) {
+        let msg = `HTTP ${pngRes.status}`;
+        try { msg = (await pngRes.json()).error || msg; } catch (_) { /* ignore */ }
+        throw new Error(msg);
+      }
+      const blob = await pngRes.blob();
+      const dataRaw = await api(`/api/magic/data?${q}`);
+      if (S.magic.img && S.magic.img.close) {
+        try { S.magic.img.close(); } catch (_) { /* ignore */ }
+      }
+      S.magic.img = await createImageBitmap(blob);
+      S.magic.data = decodeMagicData(dataRaw);
+      S.magic.legend = dataRaw.legend;
+      S.magic.year = pick;
+      S.magic.on = !!(el.magicEnable && el.magicEnable.checked);
+      if (S.magic.on) renderMagicLegend();
+      updateMagicStatus(meta, pick);
+      draw();
+      refreshButtons();
+    } catch (e) {
+      toast(`魔力图层加载失败:${e instanceof Error ? e.message : String(e)}`, true);
+    }
+  }
+
+  function hideMagic() {
+    S.magic.on = false;
+    if (el.magicEnable) el.magicEnable.checked = false;
+    setFieldTipVisible(false);
+    draw();
   }
 
   /* ------------------------------------------------------------------ *
@@ -926,6 +1065,11 @@
     if (el.btnFieldApply) el.btnFieldApply.disabled = !hasWorld || S.busy;
     if (el.btnFieldOff) el.btnFieldOff.disabled = !S.field.on || S.busy;
     if (el.btnFieldData) el.btnFieldData.disabled = !S.field.data || S.busy;
+    if (el.magicField) el.magicField.disabled = S.busy;
+    if (el.magicStrength) el.magicStrength.disabled = S.busy;
+    if (el.magicEnable) el.magicEnable.disabled = !hasSession || S.busy;
+    if (el.magicYearPick) el.magicYearPick.disabled = !S.magic.meta || S.busy;
+    if (el.btnMagicNow) el.btnMagicNow.disabled = !hasSession || S.busy;
     el.btnAuto.textContent = S.autoOn ? '暂停自动播放' : '自动播放';
     el.btnAuto.classList.toggle('playing', S.autoOn);
   }
@@ -951,6 +1095,7 @@
       S.field = { on: false, img: null, data: null, legend: null, kind: 'magic' };
       if (el.fieldEnable) el.fieldEnable.checked = false;
       if (el.fieldLegendWrap) el.fieldLegendWrap.classList.add('hidden');
+      resetMagic(true);
       setFieldTipVisible(false);
       updateFieldStatus();
       el.polityList.innerHTML = '';
@@ -979,6 +1124,8 @@
         stepYears: int(el.stepYears, 5),
         maxRounds: int(el.maxRounds, 12),
         dmPreset: el.dmPreset.checked,
+        magicField: el.magicField.checked,
+        magicStrength: Number(el.magicStrength.value) || 1,
       });
       S.sessionId = d.session.sessionId;
       S.autoOn = false;
@@ -1027,6 +1174,7 @@
     if (!exists) S.sel = state.polities && state.polities.length ? state.polities[0].id : null;
     renderAll();
     await loadOwners();
+    if (state.magic) void refreshMagic();
   }
 
   async function runRound() {
@@ -1243,6 +1391,26 @@
       if (el.fieldEnable.checked) scheduleField();
     });
     el.fieldOpacityVal.textContent = (Number(el.fieldOpacity.value) || 0.85).toFixed(2);
+
+    if (el.magicEnable) {
+      el.magicEnable.addEventListener('change', () => {
+        if (!el.magicEnable.checked) { hideMagic(); return; }
+        S.magic.on = true;
+        if (S.magic.data) {
+          renderMagicLegend();
+          draw();
+          refreshButtons();
+        } else {
+          void refreshMagic();
+        }
+      });
+    }
+    if (el.magicYearPick) {
+      el.magicYearPick.addEventListener('change', () => { void refreshMagic(Number(el.magicYearPick.value)); });
+    }
+    if (el.btnMagicNow) {
+      el.btnMagicNow.addEventListener('click', () => { void refreshMagic(); });
+    }
 
     window.addEventListener('resize', () => resizeCanvas());
     if (window.ResizeObserver && el.mapWrap) {

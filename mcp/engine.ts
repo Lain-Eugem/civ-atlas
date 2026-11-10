@@ -23,6 +23,7 @@ import { rulerAt } from '../src/gen/civ/story/peopleInfo';
 import { buildChronicle, entryInvolves, type ChronicleEntry } from '../src/gen/civ/story/chronicle';
 import { cleanOrders, ORDER_KINDS, KEY_HELP, type CleanedOrders } from './orders';
 import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
+import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
 import type { TuningValues } from '../src/gen/civ/tuning';
 
 /* ------------------------------------------------------------------ *
@@ -119,6 +120,12 @@ export interface SessionOpenInput {
    * 不给 / false = 官方规则,与改造前逐字节一致。
    */
   dmPreset?: boolean | TuningValues;
+  /**
+   * 内置「魔力」场(可选):true = 默认强度 1,数字 = 强度 0–3(0 不影响城)。
+   * 用的是 examples/plugins/magic 的灵脉/扩散/影响口 city.capacity/图层逻辑的原生版;
+   * 不给 = 官方规则,与改造前逐字节一致。
+   */
+  magicField?: boolean | number;
 }
 
 export interface Session {
@@ -127,8 +134,10 @@ export interface Session {
   world: World;
   worldParams: WorldParams;
   civParams: Partial<CivParams>;
-  /** 打开会话时用的 DM 规则预设(生效后的完整 values;没开 = 没有) */
+  /** DM 规则预设(生效后的完整 values;没开 = 没有) */
   dmPreset?: TuningValues;
+  /** 内置「魔力」场(没开 = 没有);强度 0 = 只记图层、不影响城 */
+  magicField?: { strength: number };
   startYear: number;
   stepYears: number;
   maxRounds: number;
@@ -178,6 +187,14 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     if (merged) civParams.knobs = merged;
     else delete civParams.knobs;
   }
+  let magicField: { strength: number } | undefined;
+  if (input.magicField !== undefined && input.magicField !== false) {
+    const raw = input.magicField === true ? undefined : Number(input.magicField);
+    const strength = magicStrengthOf(raw);
+    magicField = { strength };
+    const plugins = [...(civParams.plugins ?? []), magicPlugin(strength)];
+    civParams.plugins = plugins;
+  }
   const civ = playCiv(worldRec.world, civParams, play0);
   sessionSeq += 1;
   const id = `s-${Date.now().toString(36)}-${sessionSeq.toString(36)}`;
@@ -190,6 +207,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     worldParams: worldRec.params,
     civParams,
     dmPreset,
+    magicField,
     startYear,
     stepYears,
     maxRounds,
@@ -212,6 +230,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
         worldParams: worldRec.params,
         civParams,
         dmPreset,
+        magicField,
         startYear,
         stepYears,
         maxRounds,
@@ -347,6 +366,58 @@ function eventView(e: ChronicleEntry): EventView {
 }
 
 /** 一个会话的完整状态快照(给外部模型看的全部数据都在这里) */
+export interface MagicLayerView {
+  id: string;
+  title: string;
+  unit: 'region';
+  keep: number;
+  legend: string;
+  years: number[];
+  frameYear: number | null;
+  stats: { min: number; max: number; mean: number } | null;
+}
+
+export interface MagicView {
+  enabled: true;
+  strength: number;
+  layers: MagicLayerView[];
+}
+
+/** 本局开着的「魔力」场(没开 = null);图层来自 civ.simLayers,只读 */
+export function magicView(s: Session): MagicView | null {
+  if (!s.magicField) return null;
+  const layers: MagicLayerView[] = [];
+  for (const L of s.civ.simLayers ?? []) {
+    if (L.by !== 'magic') continue;
+    const n = L.years.length ? Math.floor(L.values.length / L.years.length) : 0;
+    const last = n ? L.values.subarray(L.values.length - n) : undefined;
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    let k = 0;
+    if (last) {
+      for (const v of last) {
+        if (!Number.isFinite(v)) continue;
+        min = Math.min(min, v);
+        max = Math.max(max, v);
+        sum += v;
+        k++;
+      }
+    }
+    layers.push({
+      id: L.id,
+      title: L.title,
+      unit: 'region',
+      keep: MAGIC_LAYER.keep,
+      legend: MAGIC_LAYER.legend,
+      years: [...L.years],
+      frameYear: L.years.length ? L.years[L.years.length - 1] : null,
+      stats: k ? { min, max, mean: sum / k } : null,
+    });
+  }
+  return { enabled: true, strength: s.magicField.strength, layers };
+}
+
 export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number } = {}): Record<string, unknown> {
   const year = s.play.year;
   const size = sizesNow(s.civ);
@@ -365,6 +436,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     commandQueue: s.queue.length,
     commands: s.play.commands.map((v) => ({ kind: v.kind, from: v.from, time: commandTime(v), ...restOf(v) })),
     fingerprint: civHash(s.civ),
+    magic: magicView(s),
     ...(chronicle ? { chronicle } : {}),
   };
 }

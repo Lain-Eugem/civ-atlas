@@ -50,6 +50,9 @@ node mcp/.build/mcp/selftest-petty-oracle.js
 
 # 自定义场自检(确定性 hash、统计、PNG 逐字节一致、改样式不改数值、数值解码、坏帧)
 node mcp/.build/mcp/selftest-field.js
+
+# 魔力动态层自检(逐年演化 + 影响 city.capacity;强度 0 = 官方指纹;同配置可复现)
+node mcp/.build/mcp/selftest-magic.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -260,6 +263,16 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 - **范围**:目前是生成期静态场(跟世界走,不随历史年份变化)。按州逐年演化(表卡 + 影响口)和地块级逐年演化还没接进引擎,是下一步。
 - **自检**:`node mcp/.build/mcp/selftest-field.js`(43 项:同参数 hash 相同、换样式 PNG 变但数值/hash 不变、统计与数值一致、PNG 逐字节可复现、hover 网格抽样一致、坏帧校验)。
 
+## 魔力动态层(原型:引擎逐年演化 + 真影响数值)
+
+静态场只能看;这一层把「魔脉」做成**跟着历史逐年变化、并且真的影响推演**的场,思路来自引擎自带的官方示例插件 `examples/plugins/magic/`(表卡 + 影响口 + 图层,不依赖 QuickJS,内联成原生 `SimPlugin`,见 `src/gen/civ/magicPlugin.ts`):
+
+- **引擎侧**:三张按州记的表——`vein`(灵脉,约 1/16 的州有,一次生成后不变)、`rural`(接官方乡村人口表)、`magic`(每 5 年按 `spread/seep/fade/drain` 扩散、渗出、衰减、被人口耗散);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(强度 1 时 0–100 浓度≈1–2 倍)。图层每 50 年存一帧(`keep=50`),跟着 `Civ.simLayers` 一起存档/回放。
+- **开关**:`civ_session_open` 加 `magicField: true`(默认强度 1)或 `magicField: number`(0–3,0.5 一档);`civ_state_get` 返回 `magic`(强度 + 图层元数据/统计)。**不给 `magicField` 时,引擎行为和官方规则逐字节一致**;`magicField: 0` 只记图层、不改数值,也拿来做确定性对账。
+- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计)。
+- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与州魔力浓度。
+- **自检**:`node mcp/.build/mcp/selftest-magic.js`(34 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
+
 ## 参数全部可自定义
 
 没有写死的「默认对局」:世界生成参数、起始年、每回合年数、回合数、结束年、引擎参数(`civParams`)、接管的君主数量、每国命令上限、模型/温度/超时都由调用方给。想固定一套配置,就由调用方每次传同样的值,或者自己包一层脚本/MCP 客户端配置。
@@ -287,12 +300,12 @@ node mcp/.build/mcp/viewer.js --port 5190
 
 查看器是**独立进程**(零新依赖,只监听 127.0.0.1),内置前端在 `mcp/viewer/`:
 
-- 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。
+- 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策、**魔力场与强度**;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。
 - 地图:基础地形(海拔 + 雪线 + 光照)与各国疆域两层叠加,滚轮缩放、拖动平移、点击选国、国都标注。
 - 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争)。
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹)。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 注意:查看器进程内的世界/会话表是内存里的,关掉进程就没了;日志仍写在 `mcp/.runs/`。查看器不改变引擎的确定性,只是把同一套 `mcp/engine.ts` / `mcp/monarch.ts` 搬到 HTTP 后面。
 
@@ -306,6 +319,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**共 20 个 MCP 工具**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
 - **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录 26 种、查看器标成「故事事件」。
 - **自定义场原型(已完成)**:`src/gen/field.ts`(计算层,魔脉/矿产/辐射三种、逐字节确定、FNV-1a hash)+ `mcp/field-render.ts`(渲染层,色带/拉伸/等高线/辉光/浮雕/透明度,只读数值)+ `mcp/png.ts` + 查看器「自定义场」面板与 `/api/field/*`;计算与渲染彻底分开,改样式不再重算;自检 43 项。
+- **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/rural/magic 三张表 + `city.capacity` 影响口 + 每 50 年一帧图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,PNG + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 34 项。
 
 ## 目录
 
@@ -332,8 +346,10 @@ mcp/
   selftest-petty-core.ts   小事件核心自检(58 项,不联网)
   selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
   selftest-field.ts        自定义场自检(43 项,确定性/数值/渲染)
+  selftest-magic.ts        魔力动态层自检(34 项,引擎影响/图层/回放)
   png.ts             纯 Node PNG 编码(渲染层共用)
   field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
+  magic-render.ts    魔力图层渲染(按年份选帧/插值,PNG + 图例)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图 + 场叠加)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1
@@ -341,4 +357,4 @@ mcp/
   .runs/             会话日志(不提交)
 ```
 
-`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。
+`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。`src/gen/civ/magicPlugin.ts` 是原生推演插件(表卡 + 影响口 + 图层),不依赖 QuickJS,可以直接传给 `CivParams.plugins`;`mcp/magic-render.ts` 只读它的图层画图。
