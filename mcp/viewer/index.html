@@ -1,0 +1,140 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文明与地图 · 多 Agent 沙盒监视台</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">civ<span class="dot">.</span>atlas</span>
+    <span class="brand-sep">/</span>
+    <span class="brand-sub">多 Agent 沙盒监视台</span>
+  </div>
+  <div class="topbar-right">
+    <span id="status" class="status">未创建世界</span>
+    <span class="topbar-note">本地进程 · 只监听 127.0.0.1</span>
+  </div>
+</header>
+
+<main class="page">
+
+  <!-- 参数栏 -->
+  <section class="panel controls" aria-label="参数">
+    <div class="control-row">
+      <label class="field"><span>种子</span><input id="seed" type="number" value="7" min="0" step="1"></label>
+      <label class="field"><span>地块数</span>
+        <select id="cells">
+          <option value="12000">12,000</option>
+          <option value="20000">20,000</option>
+          <option value="34043" selected>34,043</option>
+          <option value="60000">60,000</option>
+        </select>
+      </label>
+      <label class="field"><span>起始年</span><input id="startYear" type="number" value="2500" min="1" max="60000" step="1"></label>
+      <label class="field"><span>每回合年数</span><input id="stepYears" type="number" value="5" min="1" max="100" step="1"></label>
+      <label class="field"><span>回合数</span><input id="maxRounds" type="number" value="12" min="1" max="200" step="1"></label>
+      <label class="field"><span>君主范围</span>
+        <select id="polities">
+          <option value="all">全部在世国家</option>
+          <option value="8">前 8 大国</option>
+          <option value="5">前 5 大国</option>
+          <option value="2">前 2 大国</option>
+        </select>
+      </label>
+      <label class="field check"><input id="dmPreset" type="checkbox" checked><span>DM 规则预设</span></label>
+      <label class="field check"><input id="mock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
+    </div>
+
+    <details class="llm-row">
+      <summary>真模型设置 <span class="muted">(取消 mock 时使用;Key 只存在这个进程的内存里)</span></summary>
+      <div class="control-row">
+        <label class="field"><span>服务商</span>
+          <select id="provider">
+            <option value="deepseek">DeepSeek</option>
+            <option value="bailian">阿里云百炼</option>
+            <option value="custom">自定义(OpenAI 兼容)</option>
+          </select>
+        </label>
+        <label class="field grow"><span>接口地址</span><input id="baseUrl" type="text" placeholder="留空用服务商默认"></label>
+        <label class="field"><span>模型</span><input id="model" type="text" placeholder="deepseek-chat / qwen-plus"></label>
+        <label class="field grow"><span>API Key</span><input id="apiKey" type="password" placeholder="sk-…" autocomplete="off"></label>
+        <label class="field"><span>温度</span><input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1"></label>
+      </div>
+    </details>
+
+    <div class="control-row actions">
+      <button id="btnWorld" class="btn">① 创建世界</button>
+      <button id="btnSession" class="btn" disabled>② 开始会话</button>
+      <button id="btnRound" class="btn primary" disabled>③ 跑一回合</button>
+      <button id="btnAuto" class="btn" disabled>自动播放</button>
+      <button id="btnVerify" class="btn" disabled>回放对账</button>
+      <button id="btnExport" class="btn" disabled>导出会话</button>
+      <span class="grow"></span>
+      <span class="hint" id="hint">先创建世界。同种子 + 同参数 = 同一个世界,同命令 = 同一段历史。</span>
+    </div>
+  </section>
+
+  <!-- 地图 + 侧栏 -->
+  <section class="main-grid">
+    <section class="panel map-panel" aria-label="地图">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title" id="mapTitle">地图</div>
+          <div class="panel-sub" id="mapSub">还没有世界。创建后可以点击国家查看详情。</div>
+        </div>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="map-wrap" id="mapWrap">
+        <canvas id="map" width="1024" height="512"></canvas>
+        <div class="map-empty" id="mapEmpty">
+          <div class="empty-mark">◍</div>
+          <div class="empty-title">还没有地图</div>
+          <div class="empty-sub">点「创建世界」,这里会画出一张 1024 像素宽的等距圆柱地图</div>
+        </div>
+        <div class="map-loading hidden" id="mapLoading"><span class="spinner"></span><span id="mapLoadingText">地图生成中…</span></div>
+        <div class="map-tip">滚轮缩放 · 拖动平移 · 点击国家</div>
+      </div>
+
+    </section>
+
+  <!-- 底部 -->
+  <section class="panel bottom-panel" aria-label="日志">
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="decisions">AI 决策</button>
+      <button class="tab" data-tab="chronicle">编年史</button>
+      <button class="tab" data-tab="rounds">回合日志</button>
+      <span class="grow"></span>
+      <span class="tab-note" id="tabNote"></span>
+    </nav>
+    <div class="tab-body" id="tabBody">
+      <div class="side-empty">跑一回合后,这里会列出每个君主的理由和命令。</div>
+    </div>
+  </section>
+
+    <aside class="panel side-panel" aria-label="国家">
+      <div class="panel-head side-head">
+        <div>
+          <div class="panel-title">国家</div>
+          <div class="panel-sub" id="polSub">—</div>
+        </div>
+        <span class="chip" id="roundChip">第 0 / 0 回合</span>
+      </div>
+      <div class="polity-list" id="polityList"></div>
+      <div class="polity-detail" id="polityDetail">
+        <div class="side-empty">选中一个国家,看它的君主、邻国和正在打的仗。</div>
+      </div>
+    </aside>
+  </section>
+
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="busy" id="busy"><div class="busy-card"><span class="spinner big"></span><div><div class="busy-title" id="busyTitle">AI 君主思考中…</div><div class="busy-sub" id="busySub"></div></div></div></div>
+
+<script src="./app.js"></script>
+</body>
+</html>

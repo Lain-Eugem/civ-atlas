@@ -133,11 +133,34 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 - 会话只把命令交给引擎,不引入随机;外部模型决策的不可复现性只体现在"下了什么命令",不在引擎内部。把每轮命令按顺序重放,结果可精确复现(`civ_session_verify` 就是干这个的)。
 - 每轮日志写在 `mcp/.runs/<sessionId>/round-XXXX.json` 与 `monarch-round-XXXX.json`,`rounds.jsonl`、`monarch-rounds.jsonl` 是精简流水。
 
+## 浏览器查看器(阶段 4)
+
+不想配 MCP 客户端时,可以直接用浏览器看多 Agent 对局:
+
+```powershell
+# 先构建,再启动(仓库根目录)
+powershell -NoProfile -ExecutionPolicy Bypass -File mcp/build.ps1
+node mcp/.build/mcp/viewer.js --port 5190
+# 浏览器打开 http://127.0.0.1:5190
+```
+
+查看器是**独立进程**(零新依赖,只监听 127.0.0.1),内置前端在 `mcp/viewer/`:
+
+- 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。
+- 地图:基础地形(海拔 + 雪线 + 光照)与各国疆域两层叠加,滚轮缩放、拖动平移、点击选国、国都标注。
+- 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争)。
+- 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹)。
+- 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+
+注意:查看器进程内的世界/会话表是内存里的,关掉进程就没了;日志仍写在 `mcp/.runs/`。查看器不改变引擎的确定性,只是把同一套 `mcp/engine.ts` / `mcp/monarch.ts` 搬到 HTTP 后面。
+
 ## 当前阶段
 
 - **任务一(已完成)**:`mode="auto"` 的引擎工具层,8 个基础工具。
 - **任务二(已完成)**:君主回合循环,新增 5 个君主工具;`mock` 与真 LLM 两条路径;回放对账。
 - **任务三(已完成)**:DM 规则预设(`tuningPatch` 写 `CivParams.knobs`,`civ_dm_preset` 查看/覆盖)+ 新增 `press` 干预(引擎自动议和 vs 君主坚持打);官方世界确定性逐位不变(21/21 对账通过)。
+- **阶段四(已完成)**:本地浏览器查看器(`mcp/viewer.ts` + `mcp/viewer/` 前端),地图/疆域/君主决策/编年史/回合日志可视化,零新依赖。
 
 ## 目录
 
@@ -155,6 +178,8 @@ mcp/
   selftest-monarch.ts   君主回合自检(29 项,mock)
   selftest-press.ts     press 干预自检(16 项)
   selftest-dm.ts        DM 规则预设自检(17 项)
+  viewer.ts             本地浏览器查看器(HTTP + PNG 地图)
+  viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1
   .build/            产物(不提交)
   .runs/             会话日志(不提交)

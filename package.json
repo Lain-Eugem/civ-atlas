@@ -23,7 +23,8 @@
     "mcp:selftest:monarch": "node mcp/.build/mcp/selftest-monarch.js",
     "mcp:selftest:press": "node mcp/.build/mcp/selftest-press.js",
     "mcp:selftest:dm": "node mcp/.build/mcp/selftest-dm.js",
-    "mcp:serve": "node mcp/.build/mcp/server.js"
+    "mcp:serve": "node mcp/.build/mcp/server.js",
+    "mcp:viewer": "node mcp/.build/mcp/viewer.js --port 5190"
   },
   "dependencies": {
     "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
