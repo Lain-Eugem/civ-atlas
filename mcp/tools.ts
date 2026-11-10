@@ -10,6 +10,7 @@ import {
   createWorld,
   exportSession,
   getSession,
+  getWorldRecord,
   openSession,
   stateGet,
   submitOrders,
@@ -22,6 +23,7 @@ import { fieldInfluenceCatalog } from '../src/gen/civ/fieldPlugin';
 import { monarchBriefList, monarchRound, monarchStatus, setupMonarch, verifySession } from './monarch';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyDigest, pettyRound, pettySetup, pettyStatus } from './petty';
+import { loadSimPlugins, type LoadedSimPlugins } from './plugin-loader';
 
 export interface ToolDef {
   name: string;
@@ -89,6 +91,13 @@ export const TOOLS: ToolDef[] = [
           description:
             '可选:0–4 份「自定义场」(玩家自己造设定;格式见 civ_field_catalog)。每份可设生成密度、扩散/衰减/人口耗散、影响哪些官方数值(每点影响多少)、图层颜色与存帧间隔。不传 = 不加任何场,官方规则逐字节不变。',
           items: { type: 'object', additionalProperties: true },
+        },
+        plugins: {
+          type: 'array',
+          maxItems: 4,
+          description:
+            '可选:装上官方 .civplugin 推演插件(阶段B)。每项是插件文件路径或源码目录,例如 "examples/plugins/magic/magic.civplugin";相对路径按 MCP 进程的当前工作目录解析。插件按自己的清单声明表卡/图层/影响口,和网页里装插件一样跑(QuickJS,离线)。最多 4 个;不传 = 不装。',
+          items: { type: 'string' },
         },
         mode: { type: 'string', enum: ['auto', 'monarch'], description: '推演模式。auto=内置规则自动推演;monarch=先开好会话,再用 civ_monarch_setup 把国家交给外部君主。两种模式不改变引擎确定性。' },
         civParams: {
@@ -378,18 +387,33 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     case 'civ_session_open': {
       const worldId = String(args.worldId ?? '');
       const startYear = numArg(args.startYear, 'startYear');
-      const opened = openSession({
-        worldId,
-        startYear,
-        stepYears: optNum(args.stepYears, 'stepYears'),
-        maxRounds: optNum(args.maxRounds, 'maxRounds'),
-        endYear: optNum(args.endYear, 'endYear'),
-        mode: typeof args.mode === 'string' ? (args.mode as 'auto') : undefined,
-        dmPreset: args.dmPreset === true ? (isObject(args.dmRules) ? (args.dmRules as never) : true) : undefined,
-        magicField: args.magicField === true ? (optNum(args.magicStrength, 'magicStrength') ?? true) : undefined,
-        fields: Array.isArray(args.fields) ? args.fields : undefined,
-        civParams: isObject(args.civParams) ? (args.civParams as never) : undefined,
-      });
+      const paths = Array.isArray(args.plugins)
+        ? args.plugins.filter((p): p is string => typeof p === 'string' && p.trim() !== '')
+        : [];
+      let loaded: LoadedSimPlugins | undefined;
+      if (paths.length > 0) {
+        const rec = getWorldRecord(worldId);
+        loaded = await loadSimPlugins(paths, rec.world.params.seed);
+      }
+      let opened;
+      try {
+        opened = openSession({
+          worldId,
+          startYear,
+          stepYears: optNum(args.stepYears, 'stepYears'),
+          maxRounds: optNum(args.maxRounds, 'maxRounds'),
+          endYear: optNum(args.endYear, 'endYear'),
+          mode: typeof args.mode === 'string' ? (args.mode as 'auto') : undefined,
+          dmPreset: args.dmPreset === true ? (isObject(args.dmRules) ? (args.dmRules as never) : true) : undefined,
+          magicField: args.magicField === true ? (optNum(args.magicStrength, 'magicStrength') ?? true) : undefined,
+          fields: Array.isArray(args.fields) ? args.fields : undefined,
+          civParams: isObject(args.civParams) ? (args.civParams as never) : undefined,
+          ...(loaded ? { simPlugins: loaded.plugins, pluginIds: loaded.ids, pluginDispose: loaded.dispose } : {}),
+        });
+      } catch (e) {
+        loaded?.dispose();
+        throw e;
+      }
       return text(opened.summary);
     }
     case 'civ_state_get': {

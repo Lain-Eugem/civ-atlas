@@ -132,6 +132,14 @@ export interface SessionOpenInput {
    * 玩家自己设生成密度/扩散/衰减/影响哪些官方数值;参数与魔力场同一套机制,不写死具体设定。
    */
   fields?: readonly unknown[];
+  /**
+   * 已加载好的官方推演插件(`mcp/plugin-loader.ts` 装好再传;openSession 本身是同步的)。
+   * 插件实例带 QuickJS 状态,一局一份;不给 = 不装官方插件。
+   */
+  simPlugins?: readonly unknown[];
+  /** 上面这些插件的 id 与 dispose(会话结束时由调用方决定何时卸) */
+  pluginIds?: readonly string[];
+  pluginDispose?: () => void;
 }
 
 export interface Session {
@@ -146,6 +154,10 @@ export interface Session {
   magicField?: { strength: number };
   /** 玩家自定义的场(没开 = 没有);每份 spec 原样存着,便于导出/回看 */
   fields?: FieldSpec[];
+  /** 装上的官方推演插件(.civplugin)id;世界清单里只记 id/sum */
+  plugins?: { id: string }[];
+  /** 卸载这些官方插件(QuickJS 运行时) */
+  pluginDispose?: () => void;
   startYear: number;
   stepYears: number;
   maxRounds: number;
@@ -216,8 +228,17 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     const plugins = [...(civParams.plugins ?? []), ...fields.map((f) => fieldPlugin(f))];
     civParams.plugins = plugins;
   }
-  const civ = playCiv(worldRec.world, civParams, play0);
-  sessionSeq += 1;
+  if (input.simPlugins !== undefined) {
+    if (!Array.isArray(input.simPlugins) || input.simPlugins.length === 0 || input.simPlugins.length > 4) {
+      throw new Error('simPlugins 要是 1–4 个已加载的推演插件');
+    }
+    const plugins = [
+      ...(civParams.plugins ?? []),
+      ...(input.simPlugins as unknown as NonNullable<Partial<CivParams>['plugins']>),
+    ];
+    civParams.plugins = plugins;
+  }
+  const civ = playCiv(worldRec.world, civParams, play0);  sessionSeq += 1;
   const id = `s-${Date.now().toString(36)}-${sessionSeq.toString(36)}`;
   const logDir = join(runsRoot(), id);
   mkdirSync(logDir, { recursive: true });
@@ -230,6 +251,8 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     dmPreset,
     magicField,
     fields,
+    plugins: input.pluginIds?.map((id) => ({ id })),
+    pluginDispose: input.pluginDispose,
     startYear,
     stepYears,
     maxRounds,
@@ -254,6 +277,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
         dmPreset,
         magicField,
         fields,
+        plugins: input.pluginIds ?? [],
         startYear,
         stepYears,
         maxRounds,
@@ -322,6 +346,8 @@ export interface SessionSummary {
   logDir: string;
   /** 本局玩家自定义场(没开 = 不给这个字段) */
   fields?: string[];
+  /** 装上的官方推演插件 id(没装 = 没有) */
+  plugins?: string[];
   /** 本局内置魔力场强度(没开 = 不给) */
   magicField?: number;
 }
@@ -342,6 +368,7 @@ export function sessionSummary(s: Session): SessionSummary {
     fingerprint: civHash(s.civ),
     logDir: s.logDir,
     ...(s.fields?.length ? { fields: s.fields.map((f) => f.id) } : {}),
+    ...(s.plugins?.length ? { plugins: s.plugins.map((p) => p.id) } : {}),
     ...(s.magicField ? { magicField: s.magicField.strength } : {}),
   };
 }
