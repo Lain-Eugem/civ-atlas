@@ -39,7 +39,7 @@ function log(...args: unknown[]): void {
 }
 
 /** 处理一条已解析的 JSON-RPC 消息(导出给测试用) */
-export function handleMessage(msg: unknown): void {
+export async function handleMessage(msg: unknown): Promise<void> {
   if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
     replyError(null, -32600, 'Invalid Request: 顶层必须是对象');
     return;
@@ -93,7 +93,7 @@ export function handleMessage(msg: unknown): void {
       const args = params.arguments;
       const argv: Record<string, unknown> = typeof args === 'object' && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
       try {
-        const result = callTool(name, argv);
+        const result = await callTool(name, argv);
         reply(id, result);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
@@ -129,26 +129,32 @@ export function handleMessage(msg: unknown): void {
 function main(): void {
   log('server started (stdio JSON-RPC 2.0)');
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  // 请求串行处理:一行一个,前一个没处理完(例如君主回合正在等 LLM)不处理下一行
+  let chain: Promise<void> = Promise.resolve();
   rl.on('line', (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    let msg: unknown;
-    try {
-      msg = JSON.parse(trimmed);
-    } catch {
-      replyError(null, -32700, 'Parse error: 不是合法 JSON');
-      return;
-    }
-    try {
-      handleMessage(msg);
-    } catch (e) {
-      log('unhandled', e instanceof Error ? e.stack ?? e.message : String(e));
-      replyError(null, -32603, 'Internal error');
-    }
+    chain = chain.then(async () => {
+      let msg: unknown;
+      try {
+        msg = JSON.parse(trimmed);
+      } catch {
+        replyError(null, -32700, 'Parse error: 不是合法 JSON');
+        return;
+      }
+      try {
+        await handleMessage(msg);
+      } catch (e) {
+        log('unhandled', e instanceof Error ? e.stack ?? e.message : String(e));
+        replyError(null, -32603, 'Internal error');
+      }
+    });
   });
   rl.on('close', () => {
-    log('stdin closed, exiting');
-    process.exit(0);
+    void chain.finally(() => {
+      log('stdin closed, exiting');
+      process.exit(0);
+    });
   });
   process.on('SIGINT', () => process.exit(0));
   process.on('SIGTERM', () => process.exit(0));

@@ -73,7 +73,13 @@ export function getWorldRecord(id: string): WorldRecord {
  * 推演会话
  * ------------------------------------------------------------------ */
 
-export type SessionMode = 'auto';
+export type SessionMode = 'auto' | 'monarch';
+
+/** 君主模式在会话上的状态(配置 + 每回合日志;具体结构由 mcp/monarch.ts 解释) */
+export interface MonarchState {
+  config: Record<string, unknown>;
+  rounds: Record<string, unknown>[];
+}
 
 export interface SessionOpenInput {
   worldId: string;
@@ -109,6 +115,8 @@ export interface Session {
   queue: Intervention[];
   logDir: string;
   createdAt: number;
+  /** 君主模式的状态(先用 civ_monarch_setup 配置) */
+  monarch?: MonarchState;
 }
 
 const sessions = new Map<string, Session>();
@@ -126,7 +134,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
   const maxRounds = Math.round(clampNum(input.maxRounds ?? 1, 1, 200, 'maxRounds'));
   const endYear = input.endYear === undefined ? undefined : Math.round(clampNum(input.endYear, startYear + 1, 65535, 'endYear'));
   const mode: SessionMode = input.mode ?? 'auto';
-  if (mode !== 'auto') throw new Error(`本版本只支持 mode="auto"(君主模式在下一阶段加入),收到 ${String(mode)}`);
+  if (mode !== 'auto' && mode !== 'monarch') throw new Error(`mode 只能是 "auto"(内置规则自动推演) 或 "monarch"(外部君主接管),收到 ${String(mode)}`);
 
   const started = Date.now();
   const play0: PlayState = { year: startYear, commands: [] };

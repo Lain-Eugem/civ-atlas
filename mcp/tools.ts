@@ -16,6 +16,8 @@ import {
   turnStep,
   worldIdOf,
 } from './engine';
+import { compileMonarchOrders, MONARCH_MAX_ORDERS } from '../src/gen/civ/monarch';
+import { monarchBriefList, monarchRound, monarchStatus, setupMonarch, verifySession } from './monarch';
 
 export interface ToolDef {
   name: string;
@@ -61,7 +63,7 @@ export const TOOLS: ToolDef[] = [
         stepYears: { type: 'integer', description: '一个回合推几年(默认 1,1–1000)', minimum: 1, maximum: 1000 },
         maxRounds: { type: 'integer', description: '最多几个回合(默认 1,1–200)', minimum: 1, maximum: 200 },
         endYear: { type: 'integer', description: '可选:推到这一年就停(必须 > startYear)' },
-        mode: { type: 'string', enum: ['auto'], description: '推演模式。当前版本只有 auto(规则自动推演);君主模式下一阶段加入。' },
+        mode: { type: 'string', enum: ['auto', 'monarch'], description: '推演模式。auto=内置规则自动推演;monarch=先开好会话,再用 civ_monarch_setup 把国家交给外部君主。两种模式不改变引擎确定性。' },
         civParams: {
           type: 'object',
           description:
@@ -94,16 +96,17 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'civ_orders_submit',
     description:
-      '提交本回合的命令(0–N 条,引擎只收下在"现在"这一刻的命令,from 省略时自动填当前年份)。命令不会立刻生效,要再调 civ_turn_step。返回被拒收的命令及原因。',
+      '提交本回合的命令(0–N 条,引擎只收下在"现在"这一刻的命令,from 省略时自动填当前年份)。命令不会立刻生效,要再调 civ_turn_step。返回被拒收的命令及原因。若给 polityId,则 orders 可以写成"以该国为主语"的君主命令(不带 a/from,目标国家用编号 b)。',
     inputSchema: {
       type: 'object',
       properties: {
         sessionId: SESSION_ID,
         orders: {
           type: 'array',
-          description: '命令数组,每条形如 {"kind":"policy","a":"polity:c32577#0","preset":"expand"}',
+          description: '命令数组。原始格式:{"kind":"policy","a":"polity:c32577#0","preset":"expand"};君主格式:{"kind":"declare","b":6}',
           items: { type: 'object', additionalProperties: true },
         },
+        polityId: { type: 'integer', description: '可选:按"这个国家的君主"口吻编译命令(自动补 a/from,校验目标国家)' },
       },
       required: ['sessionId', 'orders'],
     },
@@ -153,6 +156,59 @@ export const TOOLS: ToolDef[] = [
       required: ['sessionId'],
     },
   },
+  {
+    name: 'civ_brief_get',
+    description:
+      '只读君主简报:返回本回合每个在世国家的完整中文简报(不调 LLM、不推演)。可以用于自己编排外部君主(让 MCP 客户端模型直接看简报、用 civ_orders_submit 带 polityId 交命令),或检查提示词质量。',
+    inputSchema: { type: 'object', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
+  },
+  {
+    name: 'civ_monarch_setup',
+    description:
+      '配置君主模式:选哪些国家由外部 LLM 接管,以及服务商/模型/Key/每回合最多命令数。Key 只存在当前进程内存,不写日志、不写导出;mock=true 时不联网,用确定性规则模拟君主。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        polities: {
+          description: '可选:"all"=全部在世国家;数字=前 N 个大国;数组=指定国家编号(如 [6,2,7])。默认 "all"。',
+        },
+        maxOrders: { type: 'integer', minimum: 1, maximum: MONARCH_MAX_ORDERS, description: `每个国家每回合最多几条命令(默认 ${MONARCH_MAX_ORDERS})` },
+        mock: { type: 'boolean', description: '不联网,用确定性 mock 君主(默认 false)' },
+        provider: { type: 'string', enum: ['deepseek', 'bailian', 'custom'], description: '服务商;默认 deepseek' },
+        baseUrl: { type: 'string', description: 'OpenAI 兼容服务地址;provider=custom 时必填,其他 provider 有默认值' },
+        model: { type: 'string', description: '模型名;默认 deepseek-chat / qwen-plus' },
+        apiKey: { type: 'string', description: 'API Key;也可以设置环境变量 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY' },
+        temperature: { type: 'number', minimum: 0, maximum: 2 },
+        timeoutMs: { type: 'integer', description: '单次 LLM 请求超时毫秒(默认 120000,5000–600000)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_monarch_round',
+    description:
+      '跑一个君主回合:给每个被接管国家发简报 → 并发调用外部 LLM(或 mock)→ 把决策编译成引擎命令 → 统一推演 stepYears 年。返回每个君主的理由/命令/被拒原因、各国州数变化和本回合大事。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        years: { type: 'integer', minimum: 1, maximum: 1000, description: '可选:本回合推几年(默认用会话的 stepYears)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_monarch_status',
+    description: '查看当前会话的君主模式配置(不含 Key)和已跑回合数。',
+    inputSchema: { type: 'object', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
+  },
+  {
+    name: 'civ_session_verify',
+    description:
+      '确定性回放对账:用会话自己的世界参数和命令历史从第 0 年重推,比较 civ 指纹与年份。ok=true 说明君主回合只是把同一串命令分批交给引擎,没有改变引擎结果。',
+    inputSchema: { type: 'object', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
+  },
 ];
 
 function text(value: unknown): ToolResult {
@@ -160,7 +216,7 @@ function text(value: unknown): ToolResult {
 }
 
 /** 执行一个工具。业务错误抛出 Error,由 server 转成 isError 结果。 */
-export function callTool(name: string, args: Record<string, unknown>): ToolResult {
+export async function callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name) {
     case 'civ_world_create': {
       const seed = args.seed;
@@ -199,6 +255,12 @@ export function callTool(name: string, args: Record<string, unknown>): ToolResul
       const s = getSession(String(args.sessionId ?? ''));
       const orders = args.orders;
       if (!Array.isArray(orders)) throw new Error('orders 必须是数组');
+      const polityId = optNum(args.polityId, 'polityId');
+      if (polityId !== undefined) {
+        const compiled = compileMonarchOrders(s.civ, s.play.year, Math.round(polityId), orders);
+        submitOrders(s, compiled.commands);
+        return text({ ...compiled, queued: s.queue.length, note: '君主格式已按国家编号编译;要生效请再调 civ_turn_step' });
+      }
       return text(submitOrders(s, orders));
     }
     case 'civ_turn_step': {
@@ -220,6 +282,39 @@ export function callTool(name: string, args: Record<string, unknown>): ToolResul
     case 'civ_session_export': {
       const s = getSession(String(args.sessionId ?? ''));
       return text(exportSession(s, typeof args.path === 'string' ? args.path : undefined));
+    }
+    case 'civ_brief_get': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(monarchBriefList(s));
+    }
+    case 'civ_monarch_setup': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(
+        setupMonarch(s, {
+          polities: args.polities as 'all' | number | number[] | undefined,
+          maxOrders: optNum(args.maxOrders, 'maxOrders'),
+          mock: typeof args.mock === 'boolean' ? args.mock : undefined,
+          provider: typeof args.provider === 'string' ? args.provider : undefined,
+          baseUrl: typeof args.baseUrl === 'string' ? args.baseUrl : undefined,
+          model: typeof args.model === 'string' ? args.model : undefined,
+          apiKey: typeof args.apiKey === 'string' ? args.apiKey : undefined,
+          temperature: optNum(args.temperature, 'temperature'),
+          timeoutMs: optNum(args.timeoutMs, 'timeoutMs'),
+        }),
+      );
+    }
+    case 'civ_monarch_round': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(await monarchRound(s, { years: optNum(args.years, 'years') }));
+    }
+    case 'civ_monarch_status': {
+      const s = getSession(String(args.sessionId ?? ''));
+      const status = monarchStatus(s);
+      return text(status ?? { sessionId: s.id, configured: false, note: '还没有配置君主模式;先调用 civ_monarch_setup' });
+    }
+    case 'civ_session_verify': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(verifySession(s));
     }
     default:
       throw Object.assign(new Error(`未知工具 ${name}`), { code: -32602 });

@@ -97,7 +97,7 @@ function main(): void {
 
       const list = await request('tools/list', {});
       const tools = (list.result as { tools: { name: string }[] }).tools;
-      ok(tools.length === 8, 'tools/list 返回 8 个工具', tools.length);
+      ok(tools.length === 13, 'tools/list 返回 13 个工具', tools.length);
       ok(tools.every((t) => typeof t.name === 'string' && t.name.startsWith('civ_')), '工具名统一 civ_ 前缀');
 
       const world = payload(await call('civ_world_create', { seed: 7, params: { cells: 12000 } }));

@@ -20,6 +20,7 @@
     "mcp:build": "powershell -NoProfile -ExecutionPolicy Bypass -File mcp/build.ps1",
     "mcp:selftest": "node mcp/.build/mcp/selftest.js",
     "mcp:selftest:protocol": "node mcp/.build/mcp/selftest-protocol.js",
+    "mcp:selftest:monarch": "node mcp/.build/mcp/selftest-monarch.js",
     "mcp:serve": "node mcp/.build/mcp/server.js"
   },
   "dependencies": {
