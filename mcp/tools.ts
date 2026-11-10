@@ -1,0 +1,244 @@
+/**
+ * MCP 工具定义与分发。
+ *
+ * 每个工具都是「无头引擎」的一层薄包装:参数进来 → 调 engine.ts → 返回 JSON 文本。
+ * 工具名统一用 civ_ 前缀,避免和其他 MCP Server 撞名。
+ */
+import {
+  catalog,
+  chronicleGet,
+  createWorld,
+  exportSession,
+  getSession,
+  openSession,
+  stateGet,
+  submitOrders,
+  turnStep,
+  worldIdOf,
+} from './engine';
+
+export interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface ToolResult {
+  content: { type: 'text'; text: string }[];
+  isError?: boolean;
+}
+
+const SESSION_ID = { type: 'string', description: '会话 id(civ_session_open 返回的 sessionId)' } as const;
+
+export const TOOLS: ToolDef[] = [
+  {
+    name: 'civ_world_create',
+    description:
+      '生成一颗新的星球(纯计算,不联网)。返回 worldId 和参数摘要,之后用 worldId 开会话。seed 相同、参数相同则世界逐位一致。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        seed: { type: 'integer', description: '世界种子(必填)' },
+        params: {
+          type: 'object',
+          description:
+            '可选:覆盖默认生成参数。常用:cells(地块数,1000–200000,越大越细越慢)、landFraction(陆地比例 0–1)、plates、mountains、temperature、rainfall、continents、gather、rugged、hardness、north。',
+          additionalProperties: true,
+        },
+      },
+      required: ['seed'],
+    },
+  },
+  {
+    name: 'civ_session_open',
+    description:
+      '打开一个推演会话:把世界推到 startYear 年初并停在那里。之后每回合先 civ_state_get 看局势、civ_orders_submit 交命令、civ_turn_step 推 stepYears 年。会话只存在于当前 MCP 进程内存里。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        worldId: { type: 'string', description: 'civ_world_create 返回的 worldId' },
+        startYear: { type: 'integer', description: '起始年(必填,1–60000)' },
+        stepYears: { type: 'integer', description: '一个回合推几年(默认 1,1–1000)', minimum: 1, maximum: 1000 },
+        maxRounds: { type: 'integer', description: '最多几个回合(默认 1,1–200)', minimum: 1, maximum: 200 },
+        endYear: { type: 'integer', description: '可选:推到这一年就停(必须 > startYear)' },
+        mode: { type: 'string', enum: ['auto'], description: '推演模式。当前版本只有 auto(规则自动推演);君主模式下一阶段加入。' },
+        civParams: {
+          type: 'object',
+          description:
+            '可选:传给引擎的 CivParams 覆盖项,例如 tempo、regionArea、names、knobs(每个世界一套旋钮)。interventions 可放起始年之前的历史命令。',
+          additionalProperties: true,
+        },
+      },
+      required: ['worldId', 'startYear'],
+    },
+  },
+  {
+    name: 'civ_state_get',
+    description:
+      '读当前回合的完整状态:年份、在世国家(编号/国名/州数/国都/君主与倾向/稳定键)、已下命令、指纹(用于确定性对账)。可选带最近编年史。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        chronicle: { type: 'boolean', description: '是否附带最近编年史(默认 false)' },
+        limit: { type: 'integer', description: '附带编年史条数(默认 40)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_orders_catalog',
+    description: '列出引擎认的全部命令种类(23 种)、字段格式与稳定键写法。下命令前先看它。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'civ_orders_submit',
+    description:
+      '提交本回合的命令(0–N 条,引擎只收下在"现在"这一刻的命令,from 省略时自动填当前年份)。命令不会立刻生效,要再调 civ_turn_step。返回被拒收的命令及原因。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        orders: {
+          type: 'array',
+          description: '命令数组,每条形如 {"kind":"policy","a":"polity:c32577#0","preset":"expand"}',
+          items: { type: 'object', additionalProperties: true },
+        },
+      },
+      required: ['sessionId', 'orders'],
+    },
+  },
+  {
+    name: 'civ_turn_step',
+    description:
+      '把已提交的命令交给引擎,再推 stepYears 年(或指定 years 年)。返回年份变化、各国州数增减、本回合大事、引擎拒收的命令。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        years: { type: 'integer', description: '可选:本回合推几年(默认用会话的 stepYears)', minimum: 1, maximum: 1000 },
+        orders: {
+          type: 'array',
+          description: '可选:本次临时附加的命令(等价于先 civ_orders_submit 再 step)',
+          items: { type: 'object', additionalProperties: true },
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_chronicle_get',
+    description: '读编年史(可按年份区间和类型过滤),给模型作"上一回合大事记"用。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        from: { type: 'integer', description: '起始年(含)' },
+        to: { type: 'integer', description: '结束年(含)' },
+        kind: { type: 'string', description: '类型过滤,如 war / fall / split / dynasty / plague / collapse' },
+        limit: { type: 'integer', description: '最多返回几条(默认 50,最多 5000)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_session_export',
+    description: '把会话导出成 JSON 文件(含会话参数、世界参数、命令历史、状态、编年史),便于复盘/对账。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        path: { type: 'string', description: '可选:输出路径(默认写到会话日志目录的 export.json)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+];
+
+function text(value: unknown): ToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
+
+/** 执行一个工具。业务错误抛出 Error,由 server 转成 isError 结果。 */
+export function callTool(name: string, args: Record<string, unknown>): ToolResult {
+  switch (name) {
+    case 'civ_world_create': {
+      const seed = args.seed;
+      if (typeof seed !== 'number') throw new Error('缺少 seed(整数)');
+      const params = args.params;
+      const rec = createWorld({ seed, params: isObject(params) ? params : undefined });
+      return text({
+        worldId: rec.id,
+        seed: rec.params.seed,
+        cells: rec.params.cells,
+        params: rec.params,
+        generatedMs: rec.generatedMs,
+      });
+    }
+    case 'civ_session_open': {
+      const worldId = String(args.worldId ?? '');
+      const startYear = numArg(args.startYear, 'startYear');
+      const opened = openSession({
+        worldId,
+        startYear,
+        stepYears: optNum(args.stepYears, 'stepYears'),
+        maxRounds: optNum(args.maxRounds, 'maxRounds'),
+        endYear: optNum(args.endYear, 'endYear'),
+        mode: typeof args.mode === 'string' ? (args.mode as 'auto') : undefined,
+        civParams: isObject(args.civParams) ? (args.civParams as never) : undefined,
+      });
+      return text(opened.summary);
+    }
+    case 'civ_state_get': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(stateGet(s, { chronicle: !!args.chronicle, limit: optNum(args.limit, 'limit') ?? undefined }));
+    }
+    case 'civ_orders_catalog':
+      return text(catalog());
+    case 'civ_orders_submit': {
+      const s = getSession(String(args.sessionId ?? ''));
+      const orders = args.orders;
+      if (!Array.isArray(orders)) throw new Error('orders 必须是数组');
+      return text(submitOrders(s, orders));
+    }
+    case 'civ_turn_step': {
+      const s = getSession(String(args.sessionId ?? ''));
+      const orders = Array.isArray(args.orders) ? args.orders : undefined;
+      return text(turnStep(s, { years: optNum(args.years, 'years'), orders }));
+    }
+    case 'civ_chronicle_get': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(
+        chronicleGet(s, {
+          from: optNum(args.from, 'from'),
+          to: optNum(args.to, 'to'),
+          kind: typeof args.kind === 'string' ? args.kind : undefined,
+          limit: optNum(args.limit, 'limit'),
+        }),
+      );
+    }
+    case 'civ_session_export': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(exportSession(s, typeof args.path === 'string' ? args.path : undefined));
+    }
+    default:
+      throw Object.assign(new Error(`未知工具 ${name}`), { code: -32602 });
+  }
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function numArg(v: unknown, name: string): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`${name} 必须是数字`);
+  return v;
+}
+
+function optNum(v: unknown, name: string): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  return numArg(v, name);
+}
+
+/** 供 selftest 用:世界 id 的纯函数版本 */
+export { worldIdOf };

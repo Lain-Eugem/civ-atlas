@@ -16,7 +16,11 @@
     "smoke": "tsx scripts/replay-check.ts",
     "test:visual": "tsx scripts/visual-check.ts",
     "test:sandbox": "tsx scripts/sandbox-check.ts",
-    "size": "tsx scripts/first-load.ts"
+    "size": "tsx scripts/first-load.ts",
+    "mcp:build": "powershell -NoProfile -ExecutionPolicy Bypass -File mcp/build.ps1",
+    "mcp:selftest": "node mcp/.build/mcp/selftest.js",
+    "mcp:selftest:protocol": "node mcp/.build/mcp/selftest-protocol.js",
+    "mcp:serve": "node mcp/.build/mcp/server.js"
   },
   "dependencies": {
     "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
