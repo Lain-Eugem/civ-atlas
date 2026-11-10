@@ -53,6 +53,9 @@ node mcp/.build/mcp/selftest-field.js
 
 # 魔力动态层自检(逐年演化 + 影响 city.capacity;强度 0 = 官方指纹;同配置可复现)
 node mcp/.build/mcp/selftest-magic.js
+
+# 可配置场自检(玩家自设影响口/强度;强度 0 = 官方指纹;同 spec 可复现;MCP 工具)
+node mcp/.build/mcp/selftest-field-plugin.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -80,9 +83,10 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | 工具 | 作用 |
 | --- | --- |
 | `civ_world_create` | 生成世界:`seed`(必填)+ `params`(可选:cells/landFraction/plates/…) |
-| `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules` |
+| `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules`/`magicField`/`fields`(最多 4 份自定义场) |
 | `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹 |
 | `civ_orders_catalog` | 列出 26 种命令的字段与稳定键写法 |
+| `civ_field_catalog` | 列出自定义场能接的影响口(按州/按政治体)、强度档位与一份示例 spec |
 | `civ_orders_submit` | 提交本回合命令(`from` 省略即填当前年;给 `polityId` 时按该国君主口吻编译),返回被拒收的命令及原因 |
 | `civ_turn_step` | 推 `stepYears` 年(或指定 `years`),返回年份、各国增减、事件、拒收 |
 | `civ_chronicle_get` | 按年份/类型读编年史 |
@@ -273,6 +277,34 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 - **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与州魔力浓度。
 - **自检**:`node mcp/.build/mcp/selftest-magic.js`(34 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
 
+## 可配置场(阶段A:玩家自己造「铲子」)
+
+魔力层是内置的**一个**设定;这一层把同一套机制做成工厂:玩家自己填一份 `FieldSpec`,`civ_session_open` 最多带 4 份,每份都会在引擎里生成一张逐年演化的州级表、挂一个图层、并接到玩家选的影响口上。**影响哪些数值不做预设,由玩家在 `influences` 里写。**
+
+```jsonc
+// civ_session_open 的 fields 里可以放这样的对象(或直接用 civ_field_catalog 的 example)
+{
+  "id": "mana", "name": "魔脉浓度",
+  "density": 0.06,                 // 有多少比例的州有灵脉(0–1)
+  "sourceMin": 40, "sourceMax": 100,
+  "spread": 0.05, "seep": 0.02, "fade": 0.002, "drain": 0.01, "crowd": 100,
+  "max": 100, "every": 5,          // every 只能取 0.5/1/5/10/20/100/1000
+  "strength": 1,                   // 0–3(0.5 一档);0 = 只记图层、不影响数值
+  "influences": [                  // 1–6 条,端口来自 civ_field_catalog
+    { "target": "city.capacity", "perPoint": 0.01 },
+    { "target": "war.odds", "perPoint": -0.02 },
+    { "target": "unrest.add", "perPoint": 0.03 }
+  ],
+  "layer": { "title": "魔脉浓度", "keep": 50 }
+}
+```
+
+- **能接哪些口**:`civ_field_catalog` 返回全部单栏影响口(`city.capacity`、`rural.capacity`、`war.odds`、`war.power`、`split.odds`、`unrest.add`、`assim.rate`、`control.reach`、`plague.odds`、`plague.loss` 等,按州或按政治体)。`region` 口逐州乘/加;`polity` 口按该政治体治下州的平均值换算。
+- **校验**:`fieldSpecProblems` / `cleanFieldSpec` 做中文校验与默认值补全(坏的 id、保留名 `vein`/`rural`、缺 `density`、未知端口、超过 6 条影响口、坏颜色/`keep` 都会被拒);`civ_session_open` 会逐份报 `fields[i]:…`。
+- **不乱改默认**:不带 `fields`、或每份 `strength: 0` 时,引擎指纹与官方逐字节一致;同 spec 两个会话逐位一致。
+- **工具**:`civ_field_catalog` 列端口 + 一份可直接抄的示例;`civ_state_get` 返回 `fields`(id/name/spec)与 `layers`(by/id/unit/年份/帧数/统计),图层可以拿这个做显示。
+- **自检**:`node mcp/.build/mcp/selftest-field-plugin.js`(46 项:spec 校验、强度 0 = 官方指纹、强度 1 影响人口、同 spec 复现、多影响口、图层元数据、回合新帧、回放对账、MCP 工具)。
+
 ## 参数全部可自定义
 
 没有写死的「默认对局」:世界生成参数、起始年、每回合年数、回合数、结束年、引擎参数(`civParams`)、接管的君主数量、每国命令上限、模型/温度/超时都由调用方给。想固定一套配置,就由调用方每次传同样的值,或者自己包一层脚本/MCP 客户端配置。
@@ -320,6 +352,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录 26 种、查看器标成「故事事件」。
 - **自定义场原型(已完成)**:`src/gen/field.ts`(计算层,魔脉/矿产/辐射三种、逐字节确定、FNV-1a hash)+ `mcp/field-render.ts`(渲染层,色带/拉伸/等高线/辉光/浮雕/透明度,只读数值)+ `mcp/png.ts` + 查看器「自定义场」面板与 `/api/field/*`;计算与渲染彻底分开,改样式不再重算;自检 43 项。
 - **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/rural/magic 三张表 + `city.capacity` 影响口 + 每 50 年一帧图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,PNG + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 34 项。
+- **可配置场(阶段A,已完成)**:`src/gen/civ/fieldPlugin.ts` 把玩家给的 `FieldSpec`(密度/源强/扩散/渗出/衰减/人口耗散/强度/图层 + 1–6 条 `influences`)变成本地 `SimPlugin`;`civ_session_open` 的 `fields`(最多 4 份)、`civ_field_catalog` 列出可接的影响口(`city.capacity`/`war.odds`/`unrest.add` 等)与示例 spec;`civ_state_get` 返回 `fields`/`layers`;玩家自己决定影响哪些数值;不给 `fields` 或强度 0 时官方指纹逐字节不变;自检 46 项。
 
 ## 目录
 
@@ -335,10 +368,10 @@ mcp/
   petty-budget.ts    token 估算 + P0/P1/P2 预算打包
   petty-queue.ts     严格串行优先队列(超时/背压/熔断/降级)
   petty.ts           小事件裁决层编排(扫描/上下文/请求/抽签/落效果/日志/摘要)
-  tools.ts           20 个 MCP 工具定义与分发
+  tools.ts           21 个 MCP 工具定义与分发
   server.ts          JSON-RPC 2.0 over stdio(逐行串行处理)
   selftest.ts        引擎自检(31 项)
-  selftest-protocol.ts  协议自检(16 项,20 工具)
+  selftest-protocol.ts  协议自检(16 项,21 工具)
   selftest-monarch.ts   君主回合自检(29 项,mock)
   selftest-press.ts     press 干预自检(16 项)
   selftest-dm.ts        DM 规则预设自检(17 项)
@@ -347,6 +380,7 @@ mcp/
   selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
   selftest-field.ts        自定义场自检(43 项,确定性/数值/渲染)
   selftest-magic.ts        魔力动态层自检(34 项,引擎影响/图层/回放)
+  selftest-field-plugin.ts 可配置场自检(46 项,spec 校验/影响口/确定性)
   png.ts             纯 Node PNG 编码(渲染层共用)
   field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
   magic-render.ts    魔力图层渲染(按年份选帧/插值,PNG + 图例)
@@ -357,4 +391,7 @@ mcp/
   .runs/             会话日志(不提交)
 ```
 
-`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。`src/gen/civ/magicPlugin.ts` 是原生推演插件(表卡 + 影响口 + 图层),不依赖 QuickJS,可以直接传给 `CivParams.plugins`;`mcp/magic-render.ts` 只读它的图层画图。
+`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。`src/gen/civ/fieldPlugin.ts` 是「可配置场」工厂:把一份玩家给的 `FieldSpec` 变成表卡 + 影响口 + 图层的原生插件,影响哪些官方数值由 spec 的 `influences` 决定。`src/gen/civ/magicPlugin.ts` 是原生推演插件(表卡 + 影响口 + 图层),不依赖 QuickJS,可以直接传给 `CivParams.plugins`;`mcp/magic-render.ts` 只读它的图层画图。
+
+
+

@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "civ-atlas",
   "private": true,
   "license": "AGPL-3.0-only",
@@ -28,6 +28,7 @@
     "mcp:selftest:petty-oracle": "node mcp/.build/mcp/selftest-petty-oracle.js",
     "mcp:selftest:field": "node mcp/.build/mcp/selftest-field.js",
     "mcp:selftest:magic": "node mcp/.build/mcp/selftest-magic.js",
+    "mcp:selftest:field-plugin": "node mcp/.build/mcp/selftest-field-plugin.js",
     "mcp:serve": "node mcp/.build/mcp/server.js",
     "mcp:viewer": "node mcp/.build/mcp/viewer.js --port 5190"
   },
@@ -62,3 +63,4 @@
     "node": ">=22"
   }
 }
+

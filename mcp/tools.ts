@@ -18,6 +18,7 @@ import {
 } from './engine';
 import { compileMonarchOrders, MONARCH_MAX_ORDERS } from '../src/gen/civ/monarch';
 import { dmPresetInfo } from '../src/gen/civ/dm';
+import { fieldInfluenceCatalog } from '../src/gen/civ/fieldPlugin';
 import { monarchBriefList, monarchRound, monarchStatus, setupMonarch, verifySession } from './monarch';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyDigest, pettyRound, pettySetup, pettyStatus } from './petty';
@@ -82,6 +83,13 @@ export const TOOLS: ToolDef[] = [
           maximum: 3,
           description: '可选:魔力对城上限的强度,0 = 只记图层不影响城,1 = 魔力满 100 时城上限翻倍(默认),3 = 四倍;按 0.5 对齐。',
         },
+        fields: {
+          type: 'array',
+          maxItems: 4,
+          description:
+            '可选:0–4 份「自定义场」(玩家自己造设定;格式见 civ_field_catalog)。每份可设生成密度、扩散/衰减/人口耗散、影响哪些官方数值(每点影响多少)、图层颜色与存帧间隔。不传 = 不加任何场,官方规则逐字节不变。',
+          items: { type: 'object', additionalProperties: true },
+        },
         mode: { type: 'string', enum: ['auto', 'monarch'], description: '推演模式。auto=内置规则自动推演;monarch=先开好会话,再用 civ_monarch_setup 把国家交给外部君主。两种模式不改变引擎确定性。' },
         civParams: {
           type: 'object',
@@ -109,7 +117,13 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: 'civ_orders_catalog',
-    description: '列出引擎认的全部命令种类(24 种)、字段格式与稳定键写法。下命令前先看它。',
+    description: '列出引擎认的全部命令种类(26 种)、字段格式与稳定键写法。下命令前先看它。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'civ_field_catalog',
+    description:
+      '「造铲子」用:列出可配置场(custom field)的完整格式、可接的官方影响口(每点影响什么)、强度档位与一份可抄的示例 spec。把 spec 放进 civ_session_open 的 fields 数组即可造出玩家自己的场(生成密度、扩散/衰减/人口耗散、影响哪些数值都由 spec 决定,不写死)。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -373,6 +387,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
         mode: typeof args.mode === 'string' ? (args.mode as 'auto') : undefined,
         dmPreset: args.dmPreset === true ? (isObject(args.dmRules) ? (args.dmRules as never) : true) : undefined,
         magicField: args.magicField === true ? (optNum(args.magicStrength, 'magicStrength') ?? true) : undefined,
+        fields: Array.isArray(args.fields) ? args.fields : undefined,
         civParams: isObject(args.civParams) ? (args.civParams as never) : undefined,
       });
       return text(opened.summary);
@@ -383,6 +398,8 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     }
     case 'civ_orders_catalog':
       return text(catalog());
+    case 'civ_field_catalog':
+      return text(fieldInfluenceCatalog());
     case 'civ_dm_preset': {
       const overrides = isObject(args.overrides) ? (args.overrides as never) : undefined;
       return text(dmPresetInfo(overrides));

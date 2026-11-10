@@ -24,6 +24,7 @@ import { buildChronicle, entryInvolves, type ChronicleEntry } from '../src/gen/c
 import { cleanOrders, ORDER_KINDS, KEY_HELP, type CleanedOrders } from './orders';
 import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
 import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
+import { cleanFieldSpec, fieldPlugin, type FieldSpec } from '../src/gen/civ/fieldPlugin';
 import type { TuningValues } from '../src/gen/civ/tuning';
 
 /* ------------------------------------------------------------------ *
@@ -126,6 +127,11 @@ export interface SessionOpenInput {
    * 不给 = 官方规则,与改造前逐字节一致。
    */
   magicField?: boolean | number;
+  /**
+   * 自定义场(可选,0–4 份;每份是 src/gen/civ/fieldPlugin.ts 的 FieldSpec)。
+   * 玩家自己设生成密度/扩散/衰减/影响哪些官方数值;参数与魔力场同一套机制,不写死具体设定。
+   */
+  fields?: readonly unknown[];
 }
 
 export interface Session {
@@ -138,6 +144,8 @@ export interface Session {
   dmPreset?: TuningValues;
   /** 内置「魔力」场(没开 = 没有);强度 0 = 只记图层、不影响城 */
   magicField?: { strength: number };
+  /** 玩家自定义的场(没开 = 没有);每份 spec 原样存着,便于导出/回看 */
+  fields?: FieldSpec[];
   startYear: number;
   stepYears: number;
   maxRounds: number;
@@ -195,6 +203,19 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     const plugins = [...(civParams.plugins ?? []), magicPlugin(strength)];
     civParams.plugins = plugins;
   }
+  let fields: FieldSpec[] | undefined;
+  if (input.fields !== undefined) {
+    if (!Array.isArray(input.fields) || input.fields.length > 4) throw new Error('fields 要是 0–4 份的数组');
+    fields = input.fields.map((raw, i) => {
+      try {
+        return cleanFieldSpec(raw);
+      } catch (e) {
+        throw new Error(`fields[${i}]:${e instanceof Error ? e.message : String(e)}`);
+      }
+    });
+    const plugins = [...(civParams.plugins ?? []), ...fields.map((f) => fieldPlugin(f))];
+    civParams.plugins = plugins;
+  }
   const civ = playCiv(worldRec.world, civParams, play0);
   sessionSeq += 1;
   const id = `s-${Date.now().toString(36)}-${sessionSeq.toString(36)}`;
@@ -208,6 +229,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     civParams,
     dmPreset,
     magicField,
+    fields,
     startYear,
     stepYears,
     maxRounds,
@@ -231,6 +253,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
         civParams,
         dmPreset,
         magicField,
+        fields,
         startYear,
         stepYears,
         maxRounds,
@@ -297,6 +320,10 @@ export interface SessionSummary {
   polities: number;
   fingerprint: string;
   logDir: string;
+  /** 本局玩家自定义场(没开 = 不给这个字段) */
+  fields?: string[];
+  /** 本局内置魔力场强度(没开 = 不给) */
+  magicField?: number;
 }
 
 export function sessionSummary(s: Session): SessionSummary {
@@ -314,6 +341,8 @@ export function sessionSummary(s: Session): SessionSummary {
     polities: aliveCount(s.civ, s.play.year),
     fingerprint: civHash(s.civ),
     logDir: s.logDir,
+    ...(s.fields?.length ? { fields: s.fields.map((f) => f.id) } : {}),
+    ...(s.magicField ? { magicField: s.magicField.strength } : {}),
   };
 }
 
@@ -418,6 +447,72 @@ export function magicView(s: Session): MagicView | null {
   return { enabled: true, strength: s.magicField.strength, layers };
 }
 
+/** 任意插件存的图层(按州或按地块),给查看器/工具用;不带具体数值,只给元信息 */
+export interface LayerView {
+  by: string;
+  id: string;
+  unit: 'region' | 'tile';
+  title: string;
+  ramp?: { colors: string[]; min?: number; max?: number };
+  classes?: { value: number; color: string; label: string }[];
+  legend?: string;
+  opacity?: number;
+  years: number[];
+  frameYear: number | null;
+  frameCount: number;
+  cells: number;
+  stats: { min: number; max: number; mean: number } | null;
+}
+
+export function layerViews(s: Session): LayerView[] {
+  const out: LayerView[] = [];
+  for (const L of s.civ.simLayers ?? []) {
+    const frames = L.years.length;
+    const cells = frames ? Math.floor(L.values.length / frames) : 0;
+    const last = frames ? L.values.subarray(L.values.length - cells) : undefined;
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    let k = 0;
+    if (last) {
+      for (const v of last) {
+        if (!Number.isFinite(v)) continue;
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+        k++;
+      }
+    }
+    out.push({
+      by: L.by,
+      id: L.id,
+      unit: L.unit as 'region' | 'tile',
+      title: L.title,
+      ...(L.ramp ? { ramp: { colors: [...L.ramp.colors], min: L.ramp.min, max: L.ramp.max } } : {}),
+      ...(L.classes ? { classes: L.classes.map((c) => ({ ...c })) } : {}),
+      ...(L.legend !== undefined ? { legend: L.legend } : {}),
+      ...(L.opacity !== undefined ? { opacity: L.opacity } : {}),
+      years: [...L.years],
+      frameYear: frames ? L.years[frames - 1] : null,
+      frameCount: frames,
+      cells,
+      stats: k ? { min, max, mean: sum / k } : null,
+    });
+  }
+  return out;
+}
+
+/** 本局玩家自定义的场(spec 原样带出) */
+export interface FieldView {
+  id: string;
+  name: string;
+  spec: FieldSpec;
+}
+
+export function fieldViews(s: Session): FieldView[] {
+  return (s.fields ?? []).map((spec) => ({ id: spec.id, name: spec.name, spec }));
+}
+
 export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number } = {}): Record<string, unknown> {
   const year = s.play.year;
   const size = sizesNow(s.civ);
@@ -437,6 +532,8 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     commands: s.play.commands.map((v) => ({ kind: v.kind, from: v.from, time: commandTime(v), ...restOf(v) })),
     fingerprint: civHash(s.civ),
     magic: magicView(s),
+    fields: fieldViews(s),
+    layers: layerViews(s),
     ...(chronicle ? { chronicle } : {}),
   };
 }
