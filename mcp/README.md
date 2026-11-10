@@ -5,7 +5,7 @@
 - 生成世界(纯计算,不联网)
 - 把世界推到任意起始年并停住
 - 读当前回合的完整状态(国家、君主、州数、国都、编年史)
-- 提交外部命令(24 种干预:宣战/结盟/国策/迁都/天灾/立约/坚持打……)
+- 提交外部命令(26 种干预:宣战/结盟/国策/迁都/天灾/立约/坚持打/小事件/故事事件……)
 - 单步或多年推演,返回各国增减与本回合大事
 - **君主模式**:每回合暂停,给每个在世国家发局势简报,并发调用外部 LLM(或 mock)当君主,把决策编译成引擎命令,再统一推演一回合
 - **DM 规则预设**(可选):降低引擎自动开战/自动议和/自动分裂的强度,把历史更多交给外部君主
@@ -76,7 +76,7 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | `civ_world_create` | 生成世界:`seed`(必填)+ `params`(可选:cells/landFraction/plates/…) |
 | `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules` |
 | `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹 |
-| `civ_orders_catalog` | 列出 25 种命令的字段与稳定键写法 |
+| `civ_orders_catalog` | 列出 26 种命令的字段与稳定键写法 |
 | `civ_orders_submit` | 提交本回合命令(`from` 省略即填当前年;给 `polityId` 时按该国君主口吻编译),返回被拒收的命令及原因 |
 | `civ_turn_step` | 推 `stepYears` 年(或指定 `years`),返回年份、各国增减、事件、拒收 |
 | `civ_chronicle_get` | 按年份/类型读编年史 |
@@ -146,8 +146,39 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 - `mock: true` 用离线确定性 mock,不联网,适合演示/自检。
 - `civ_dm_oracle_status`:看是否连上、模式、每回合上限、已跑回合(返回值不含 Key)。
 - `civ_dm_round`:单独跑一个 DM 回合(只做小决策);配置好 DM 后,君主回合会自动把 DM 决策合并进同一批命令,通常不用单独调。
-- 能决定的只有 `disaster`(plague / famine / quake / pandemic,需要城/州/国家目标)与 `trade`(a/b 两个国家、货物、赚/赔/平,仅叙事);其它决策会被拒收。
+- 能决定的只有 `disaster`(plague / famine / quake / pandemic,需要城/州/国家目标)、`trade`(a/b 两个国家、货物、赚/赔/平,仅叙事)与 `story`(故事事件,见下);其它决策会被拒收。
 - 天灾的 `from` 必须是当前回合年,所以 DM 只能在整个推演"当下"制造灾祸;所有命令都会写进命令日志和 `dm-round-*.jsonl`,回放对账仍然逐位一致。
+
+### DM 故事事件(story)
+
+除了白名单里的天灾/贸易,DM 还能**根据当前故事自己写一件小事**,并让它真的影响推演。命令会长成:
+
+```json
+{
+  "kind": "story",
+  "from": 2510,
+  "title": "河谷决堤",          // ≤40 字,必填
+  "text": "连日暴雨冲垮了河堤,城外的田被淹。",   // ≤160 字,可选
+  "a": "polity:c1234#0",       // 可选:事件主角国家
+  "effects": [                 // ≤3 条
+    { "type": "sack", "city": "settlement:c1234#0", "loss": 2 },
+    { "type": "capacity", "city": "settlement:c1234#0", "delta": -15 },
+    { "type": "dev", "years": 3 },
+    { "type": "note", "text": "民间传为凶兆" }
+  ]
+}
+```
+
+四类效果都落到引擎真实状态:
+
+- `sack`:城市折损(1 最轻 / 3 最重),写进 `Settlement.sacks`,人口下滑后按引擎原有节奏恢复。
+- `capacity`:改城市人口上限(−20%…+20%)。写进 `Settlement.reshaped` 的时间线:**降当即生效,升 60 年线性涨**,事件之前的历史人口上限不变。
+- `dev`:委托引擎 `boost`(发展速度 ×3,管 1–5 年),需要 `a`。
+- `note`:纯叙事,只进日志/DM 摘要。
+
+限制:不能改国界、战争/结盟、灭国、换君主、地形(这些仍是君主命令或引擎规则的事);每条事件最多 3 条效果;未知效果/坏键会被拒收并写进 rejected。命令进日志、回放逐位一致;不启用 DM 时官方世界完全不受影响。
+
+使用:真模型时 DM 只要在 JSON 里返回 `{"kind":"story", ...}` 即可;`mock: true` 不会自动编故事(保持自检的确定性)。查看器的 AI 决策页会把这类命令标成「故事事件」。
 
 浏览器查看器里也有对应面板:展开「DM 小决策」→ 勾选「本局启用 DM」→(假模型就勾 mock;真模型填地址/模型)→ 点「连接 / 测试 DM」;之后「跑一回合」时 DM 小决策会随君主命令一起提交,AI 决策页会显示每条天灾/贸易。
 
@@ -259,6 +290,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **阶段四(已完成)**:本地浏览器查看器(`mcp/viewer.ts` + `mcp/viewer/` 前端),地图/疆域/君主决策/编年史/回合日志可视化,零新依赖。
 - **DM 小决策接口(已完成)**:`mcp/dm.ts` + `civ_dm_oracle_setup/status/round` 三个工具 + 查看器 DM 面板;OpenAI 兼容(OpenJEV / Ollama / LM Studio / vLLM),天灾写成 `disaster` 命令真改历史,小贸易只记叙事;命令照常进日志,回放对账仍一致。
 - **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**共 20 个 MCP 工具**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
+- **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录 26 种、查看器标成「故事事件」。
 
 ## 目录
 
@@ -269,7 +301,7 @@ mcp/
   monarch.ts         君主回合编排(setup/brief/round/status/verify)
   prompt.ts          君主系统提示词
   llm.ts             DeepSeek/百炼/自定义 OpenAI 兼容 + mock 决策
-  dm.ts              DM 小决策(OpenAI 兼容 oracle + 天灾/小贸易编译 + 日志)
+  dm.ts              DM 小决策(OpenAI 兼容 oracle + 天灾/小贸易/故事事件编译 + 日志)
   petty-client.ts    官方 Jev 客户端(POST /api/v1/decisions,鉴权/解析/错误映射)
   petty-budget.ts    token 估算 + P0/P1/P2 预算打包
   petty-queue.ts     严格串行优先队列(超时/背压/熔断/降级)
@@ -281,8 +313,8 @@ mcp/
   selftest-monarch.ts   君主回合自检(29 项,mock)
   selftest-press.ts     press 干预自检(16 项)
   selftest-dm.ts        DM 规则预设自检(17 项)
-  selftest-dm-oracle.ts DM 小决策自检(34 项,mock)
-  selftest-petty-core.ts   小事件核心自检(57 项,不联网)
+  selftest-dm-oracle.ts DM 小决策自检(45 项,mock;含故事事件)
+  selftest-petty-core.ts   小事件核心自检(58 项,不联网)
   selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图)
   viewer/               index.html / style.css / app.js

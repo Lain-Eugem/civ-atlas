@@ -198,6 +198,8 @@
       case 'protect': return '保护本国';
       case 'boost': return `发展加速 ×${c.mul || '?'}`;
       case 'press': return `坚持打${c.b ? ' → ' + kn(c.b) : ''}`;
+      case 'petty': return '小事件';
+      case 'story': return `故事「${c.title || ''}」`;
       case 'treaty': return '立约';
       case 'cede': return `割让 → ${kn(c.b)}`;
       case 'destroy': return `灭国 → ${kn(c.b)}`;
@@ -530,7 +532,7 @@
         const cmd = d.command
           ? `<span class="cmd-chip">${esc(cmdText(d.command, keyNames))}</span>`
           : '<span class="muted" style="font-size:11px">叙事(不产生引擎命令)</span>';
-        const label = d.kind === 'trade' ? '小贸易' : d.kind === 'disaster' ? '天灾' : 'DM';
+        const label = d.kind === 'trade' ? '小贸易' : d.kind === 'disaster' ? '天灾' : d.kind === 'story' ? '故事事件' : 'DM';
         return `
           <div class="dec-item">
             <span class="pol-dot" style="background:#8a7cff"></span>

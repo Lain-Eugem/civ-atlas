@@ -11,7 +11,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { createWorld, getSession, openSession, stateGet } from './engine';
-import { capitalAt, polityAlive } from '../src/gen/civ/growth';
+import { capitalAt, capacityAt, polityAlive } from '../src/gen/civ/growth';
 import { polityKey, regionKey, settlementKey } from '../src/gen/edits';
 import { compileDmDecisions, dmRound, dmSetup, dmStatus, hasDm } from './dm';
 import { verifySession } from './monarch';
@@ -103,6 +103,43 @@ async function main(): Promise<void> {
   ], 2);
   ok(over.decisions.length === 2 && over.rejected.length === 1, '超过每回合上限只收前 2 条', { d: over.decisions.length, r: over.rejected.length });
 
+  // 故事事件(story):DM 自由写的新事件 → 白名单效果
+  const storyGood = compileDmDecisions(
+    civ,
+    year,
+    [
+      {
+        kind: 'story',
+        title: '河谷丰收',
+        text: '今年雨水顺,河谷收成好,人口涨了些。',
+        a: `P${top.id}`,
+        effects: [
+          { type: 'capacity', city: capitalKey, delta: 15 },
+          { type: 'sack', city: capitalKey, loss: 2 },
+          { type: 'note', text: '民间传为吉兆' },
+        ],
+      },
+    ],
+    2,
+  );
+  ok(storyGood.decisions.length === 1 && storyGood.commands.length === 1, '故事事件编译成 1 条 story 干预', storyGood.rejected);
+  ok(storyGood.commands[0]!.kind === 'story', '故事事件命令 kind=story');
+  const storyBad = compileDmDecisions(
+    civ,
+    year,
+    [
+      { kind: 'story' }, // 缺 title
+      { kind: 'story', title: '怪事', effects: [{ type: 'meteor', city: capitalKey }] }, // 不认识的效果
+      { kind: 'story', title: '怪事2', effects: [{ type: 'capacity', city: capitalKey, delta: 99 }] }, // 超上限
+      { kind: 'story', title: '怪事3', effects: [{ type: 'sack', city: 'settlement:oops', loss: 2 }] }, // 坏键
+      { kind: 'story', title: '太多', effects: [{ type: 'note', text: 'a' }, { type: 'note', text: 'b' }, { type: 'note', text: 'c' }, { type: 'note', text: 'd' }] }, // 超过 3 条
+    ],
+    10,
+  );
+  ok(storyBad.commands.length === 0 && storyBad.rejected.length === 5, '坏故事事件逐条拒收', storyBad.rejected.map((r) => r.reason));
+  const storyDev = compileDmDecisions(civ, year, [{ kind: 'story', title: '工匠来投', a: `P${top.id}`, effects: [{ type: 'dev', years: 3 }] }], 2);
+  ok(storyDev.commands.length === 1 && storyDev.commands[0]!.kind === 'story', 'dev 效果(需要国家)编译成功', storyDev.rejected);
+
   // 配置 mock oracle
   const status0 = await dmSetup(s, { mock: true, maxDecisions: 2 });
   ok(status0.configured && status0.mode === 'mock' && status0.maxDecisions === 2, 'mock oracle 配置成功', status0);
@@ -158,6 +195,38 @@ async function main(): Promise<void> {
   await dmRound(s3);
   const fp2 = (stateGet(s3).fingerprint as string) ?? '';
   ok(fp1 === fp2 && fp1.length > 0, '两次独立 mock 会话两回合后指纹一致', { fp1, fp2 });
+
+  // 故事事件真落引擎:容量写 reshaped 时间线、折损进 sacks、事件前历史不变、回放一致
+  const opened5 = openSession({ worldId: world.id, startYear: 1200, stepYears: 5, maxRounds: 4 });
+  const s5 = getSession(opened5.summary.sessionId);
+  await dmSetup(s5, { mock: true, maxDecisions: 2 });
+  const cap5 = capitalAt(s5.civ.polities[top.id]!, 1200);
+  const capKey5 = cap5 >= 0 ? settlementKey(s5.civ, cap5) : null;
+  ok(!!capKey5, '找到国都用于故事效果', capKey5);
+  const year5 = Math.floor(s5.play.year);
+  const capBefore = cap5 >= 0 ? capacityAt(s5.civ.settlements[cap5]!, year5) : 0;
+  const sacksBefore = cap5 >= 0 ? s5.civ.settlements[cap5]!.sacks?.length ?? 0 : 0;
+  const rs = await dmRound(s5, {
+    decisions: [
+      {
+        kind: 'story',
+        title: '大河改道',
+        text: '河水冲了城外的田。',
+        effects: [
+          { type: 'capacity', city: capKey5, delta: -15 },
+          { type: 'sack', city: capKey5, loss: 2 },
+        ],
+      },
+    ],
+  });
+  ok(rs.commands.length === 1 && rs.commands[0]!.kind === 'story', '故事事件作为引擎命令执行', rs.engineRejected);
+  const st5 = cap5 >= 0 ? s5.civ.settlements[cap5]! : null;
+  ok(!!st5 && (st5.sacks?.length ?? 0) === sacksBefore + 1, '故事折损落进 Settlement.sacks', st5?.sacks?.length);
+  ok(!!st5 && (st5.reshaped?.length ?? 0) > 0, '故事改上限写进 reshaped 时间线', st5?.reshaped?.length);
+  ok(!!st5 && capacityAt(st5, year5 + 5) < capBefore, '上限降了(当即生效)');
+  ok(!!st5 && Math.abs(capacityAt(st5, year5 - 1) - capBefore) < 1e-9, '事件之前的人口上限不变');
+  const replay5 = verifySession(s5);
+  ok(replay5.ok, '故事事件回放一致(命令 → 同一结果)', { expected: replay5.expected, actual: replay5.actual });
 
   // 配置校验:没有 baseUrl 的 custom 服务应报错
   const opened4 = openSession({ worldId: world.id, startYear: 1300, stepYears: 5, maxRounds: 1 });

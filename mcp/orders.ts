@@ -82,6 +82,11 @@ export const ORDER_KINDS: { kind: string; fields: string; note: string }[] = [
     fields: 'a(国键), effect: { type: "sack", loss: 1|2|3, city 或 region } | { type: "dev", years: 1..20 }',
     note: '小事件落地的既有事实:sack = 某城折损(人口下滑,之后会恢复),dev = 推一把发展;一般由小事件裁决层自动生成,君主不要手填',
   },
+  {
+    kind: 'story',
+    fields: 'from, title, text?, a?(国键), effects?[≤3]: {type:"sack",city,loss}|{type:"capacity",city,delta:-20..20}|{type:"dev",years:1..5}|{type:"note",text}',
+    note: 'DM 故事事件:自由写一件小事并改真实状态(折损/人口上限/发展);一般由 DM 小决策通道生成,君主不要手填',
+  },
   { kind: 'neutral', fields: 'a', note: '中立地' },
   { kind: 'crown', fields: 'a, char, born, leanings?, until?, ...', note: '立君(需要作者人物字段)' },
   { kind: 'regent', fields: 'a, char, ...', note: '设摄政(需要作者人物字段)' },

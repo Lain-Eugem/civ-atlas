@@ -88,6 +88,7 @@ import { addPolity, bookOf, endPolity, foundCity, moveCapital, polityModelOf, re
 import { IV_NOT_HIM, IV_PEOPLE, IV_PROTECTED, IV_WAIT, crownOf, reignBorn } from './rulers';
 import { strikeDisaster } from './disaster';
 import { strikePetty, type PettyIv } from './pettyEngine';
+import { strikeStory, type StoryIv } from './storyEngine';
 import { segAt } from './policy';
 import { bestCapital, polityBorders, warModelOf, type War } from './wars';
 import { politicsModelOf } from './politics';
@@ -717,6 +718,12 @@ export function installInterventions(sim: CivSim, iv: InterventionModel): void {
       const cultures = assimModelOf(sim)?.cultures ?? pm.cultures;
       const c = iv.resolveCulture(v.folk, cultures);
       if (c >= 0) sim.record('intervene', { a: -1, b: cultures[c].ended !== undefined ? -3 : -1, war: i, n: c });
+      return;
+    }
+    if (v.kind === 'story') {
+      // DM 故事事件(v2 故事通道):a 可有可无，效果只落在城镇/发展上(storyEngine.ts)
+      const story: StoryIv = v;
+      strikeStory(sim, iv, story, i, t);
       return;
     }
     const a = iv.resolve(v.a);

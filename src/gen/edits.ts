@@ -83,6 +83,7 @@
  * | `boost`   | 推一把发展 | a = 国家;mul = 快几倍(3 / 10;不给 = 直接进下一个时代) | 快几倍:从这一年起到 until(不含)那些州四样能力的"自己长"和"向邻居学"都 × mul(卡在时代门口时自己长不乘),到期照常长、长上去的不退;直接进:这一年年初以 a 的国都所在州为准进它的下一个时代,那些州四样能力都拉到那个时代开头(不看物产等门槛;国都已在最后一个时代 = 不生效)。a 那年已亡 = 不生效(civ/boost.ts) | until:快几倍管到哪一年(不给 = from + 50);regions = 只推这几州(最多 BOOST_REGIONS_MAX 州,换了主也照推;不给 = 整国,每一刻归 a 的州) |
  * | `trek`    | 大迁徙   | folk = 民族(`culture:…`);region = 从哪一州出发(可选);to = 往哪一州去(可选,不给 = 推演挑) | 这一年年初这一族分出一支(约三成的人,到了能占 3–8 州)举族远走,沿陆路(草原快,林地、山地慢,不过海)走到那一州,路上洗劫,到了立国、开战,和推演自己起的大迁徙一样(civ/migration.ts)。出发:给了 region、那年那州还是这一族的就从那州走,不然从本族离目的地最近的一州走。推演挑 = 走得到的、不是本族的、有城的州里"地好 × 守得弱"最高的那一州。不管全世界同时几支在路上、这个世界已经走过几次、这一族多久前走过。这一族那年已消亡 / 走不到(陆路不通、推演挑没有可去的地方)= 不生效 | reach:推演挑时走多远(near 近 / far 远;不给 = 中,见 TREK_REACHES);dir:推演挑时只挑这个方位上的地方(east 东 / south 南 / west 西 / north 北;按整条路线在地图上的走向,同 Civ.migrations 的 dir;那一档没有就依次放宽到中、近、远里别的几档。照大纲推演硬改「大迁徙」情节时下的) |
  * | `stay`    | 不许迁   | folk = 民族                       | 从这一年起推演不让这一族大迁徙(已经在路上的照走;避兵外迁、随征服而来的移民这类小股的照旧;作者下令的大迁徙照走) | until:到这一年止(不含;不给 = 一直) |
+ * | `story`   | 故事事件 | title = 事件短标题;text = 一两句叙事;a = 牵涉的国家(可选);effects = 最多 3 条真实效果(见下) | 这一年年初把这件事写进编年史,并按 effects 改真实状态(折损 / 人口上限 / 发展) | effects: `sack` 城折损 {city,loss:1 轻/2 中/3 重};`capacity` 城人口上限 {city,delta:−20…20 百分数(涨要 60 年、降是当即)};`dev` 推发展 {years:1…5}(要 a);`note` 纯叙事 {text} |
  *
  * 即位(crown)的几样字段都抄进干预,不在推演时去读人物卡:"种子 + 干预串"自己就推得出同一个世界(读档、换设备都一样)。
  * char 是作者人物的编号(AuthorCharacter.id,1–1e9 的整数);born、until 是年份(同 from 的清理);
@@ -739,6 +740,7 @@ export type InterventionKind =
   | 'halt'
   | 'press'
   | 'petty'
+  | 'story'
   | 'crown'
   | 'policy'
   | 'destroy'
@@ -857,6 +859,20 @@ export type PettyIvEffect =
   | { type: 'sack'; loss: 1 | 2 | 3; city?: string; region?: string }
   | { type: 'dev'; years: number };
 
+/**
+ * DM 故事事件(story 干预)能改的真实效果。只允许这几种基础量，幅度有上限：
+ *   - sack：某座城记一次折损(Settlement.sacks，和 petty 一样慢慢恢复)；
+ *   - capacity：某座城的人口上限按百分比增减(push 一段 reshaped，过去的历史一点不变)；
+ *   - dev：委托引擎 boost 推一把发展(快 3 倍，管 years 年；需要事件带 a)；
+ *   - note：纯叙事，不改引擎。
+ * 只由 story 干预携带；不写进作者的手动干预面板。
+ */
+export type StoryIvEffect =
+  | { type: 'sack'; city: string; loss: 1 | 2 | 3 }
+  | { type: 'capacity'; city: string; delta: number }
+  | { type: 'dev'; years: number }
+  | { type: 'note'; text: string };
+
 export type Intervention = (
   | { kind: 'protect'; a: string; from: number; until?: number }
   | { kind: 'ally'; a: string; b: string; from: number; until?: number }
@@ -868,6 +884,7 @@ export type Intervention = (
   | { kind: 'halt'; a: string; from: number; until?: number }
   | { kind: 'press'; a: string; b?: string; from: number; until?: number }
   | { kind: 'petty'; a: string; from: number; effect: PettyIvEffect }
+  | { kind: 'story'; from: number; title: string; text?: string; a?: string; effects?: StoryIvEffect[] }
   | { kind: 'crown'; a: string; char: number; from: number; born: number; until?: number; abdicate?: true; after?: true; keep?: true; leanings: RulerLeanings }
   | { kind: 'keep'; a: string; from: number; until?: number }
   | { kind: 'destroy'; a: string; from: number; b?: string }
@@ -1979,7 +1996,7 @@ function folkRenamed(civ: Civ, f: Faith, cultures: readonly Culture[]): string |
 /** 干预年份的上限(推演引擎能预约的最远时刻) */
 export const INTERVENTION_YEAR_MAX = 65535;
 
-export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'petty', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
+export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'petty', 'story', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
 
 /** 人物键的几段(格式见 personKey):国家键、身份、生成时的名字、生年(取整)、同名同年的第几个(0 起);格式不对 = null */
 export interface PersonKeyParts {
@@ -2324,6 +2341,45 @@ export function tidyIntervention(x: unknown): Intervention | null {
     const t = cleanTrek(o, kind, from, untilOf());
     if (!t) return null;
     v = t;
+  } else if (kind === 'story') {
+    const title = typeof o.title === 'string' ? o.title.trim().slice(0, 40) : '';
+    if (title === '') return null;
+    const text = typeof o.text === 'string' ? o.text.trim().slice(0, 160) : '';
+    const a = o.a === undefined ? null : isPolityKey(o.a) ? o.a : undefined;
+    if (a === undefined) return null;
+    const raw = Array.isArray(o.effects) ? o.effects : [];
+    if (raw.length > 3) return null;
+    const effects: StoryIvEffect[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') return null;
+      const e = item as Record<string, unknown>;
+      if (e.type === 'sack') {
+        const city = e.city;
+        const loss = e.loss;
+        if (!isCityKey(city) || (loss !== 1 && loss !== 2 && loss !== 3)) return null;
+        effects.push({ type: 'sack', city, loss });
+      } else if (e.type === 'capacity') {
+        const city = e.city;
+        const delta = e.delta;
+        if (!isCityKey(city)) return null;
+        if (typeof delta !== 'number' || !Number.isFinite(delta) || delta < -20 || delta > 20) return null;
+        effects.push({ type: 'capacity', city, delta: Math.round(delta * 10) / 10 });
+      } else if (e.type === 'dev') {
+        if (a === null) return null;
+        const years = e.years === undefined ? 3 : e.years;
+        if (typeof years !== 'number' || !Number.isFinite(years)) return null;
+        effects.push({ type: 'dev', years: Math.min(5, Math.max(1, Math.round(years))) });
+      } else if (e.type === 'note') {
+        const noteText = typeof e.text === 'string' ? e.text.trim().slice(0, 120) : '';
+        if (noteText === '') return null;
+        effects.push({ type: 'note', text: noteText });
+      } else return null;
+    }
+    const story: Extract<Intervention, { kind: 'story' }> = { kind: 'story', from, title };
+    if (text !== '') story.text = text;
+    if (a !== null) story.a = a;
+    if (effects.length > 0) story.effects = effects;
+    v = story;
   } else {
     if (!isPolityKey(o.a)) return null;
     const a = o.a;
@@ -2745,6 +2801,7 @@ export function sameFollow(a: unknown, b: unknown): boolean {
 export function interventionKeys(v: Intervention): string[] {
   if (v.kind === 'found' || v.kind === 'trek' || v.kind === 'stay') return [];
   if (v.kind === 'disaster') return v.a ? [v.a] : [];
+  if (v.kind === 'story') return v.a ? [v.a] : [];
   if (v.kind === 'destroy') return v.b ? [v.a, v.b] : [v.a];
   if (v.kind === 'treaty') return v.by ? [v.a, ...v.ps, v.by] : [v.a, ...v.ps];
   if (v.kind === 'neutral') return [v.a, ...v.ps];

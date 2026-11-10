@@ -290,6 +290,10 @@ function ivText(civ: Civ, v: Intervention, i: number, a: string | undefined): st
   }
   if (v.kind === 'disaster') return disasterText(civ, v, i, a);
   if (v.kind === 'trek' || v.kind === 'stay') return trekText(civ, v);
+  if (v.kind === 'story') {
+    const who = v.a !== undefined ? `${a ?? keyName(civ, v.a, v.from)}:` : '';
+    return `${who}故事「${v.title}」${v.effects?.length ? `(${v.effects.length} 条效果)` : ''}`;
+  }
   const A = a ?? keyName(civ, v.a, v.from);
   if (v.kind === 'boost') return boostText(civ, v, i, A, getEdits().era);
   switch (v.kind) {
@@ -403,7 +407,7 @@ function authorName(civ: Civ, char: number): string {
  * a = 下令的国家怎么称呼:国家面板下的令用面板标题上的名字(用户点的那个),不给 = 生效那年的名字
  */
 export function interventionDoneText(civ: Civ, v: Intervention, i = -1, a?: string): string {
-  if (v.kind === 'found' || v.kind === 'disaster' || v.kind === 'trek' || v.kind === 'stay') return interventionText(civ, v, i, a);
+  if (v.kind === 'found' || v.kind === 'disaster' || v.kind === 'trek' || v.kind === 'stay' || v.kind === 'story') return interventionText(civ, v, i, a);
   const A = a ?? keyName(civ, v.a, v.from);
   switch (v.kind) {
     case 'protect':

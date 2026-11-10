@@ -25,6 +25,7 @@ import {
   type DisasterKind,
   type DisasterLevel,
   type Intervention,
+  type StoryIvEffect,
 } from '../src/gen/edits';
 import { buildChronicle } from '../src/gen/civ/story/chronicle';
 import { capitalAt, polityAlive } from '../src/gen/civ/growth';
@@ -72,14 +73,19 @@ export interface DmStatus {
 }
 
 const DM_SYSTEM_PROMPT = `你在给一个文明推演沙盒当"DM 小决策"助手。
-你只决定小事:天灾、小贸易的结果。不要决定战争、结盟、灭国、换君主、改地形。
+你只决定小事:天灾、小贸易的结果,以及"故事里发生的一件小事"。不要决定战争、结盟、灭国、换君主、改地形。
 只输出一个 JSON 对象,不要解释:
 {"reason":"一句话理由","decisions":[...]}
 decisions 里每一项只能是:
 {"kind":"disaster","type":"plague|famine|quake|pandemic","level":1|2|3,"target":{"city?":"城编号或城名","polity?":"P6","region?":"R12","regions?":["R12","R15"]},"note":"中文描述"}
 {"kind":"trade","a":"P6","b":"P9","goods":"货物","outcome":"profit|loss|neutral","note":"中文描述"}
+{"kind":"story","title":"事件短标题","text":"一两句叙事","a":"P6","effects":[{"type":"sack","city":"C12","loss":1|2|3},{"type":"capacity","city":"C12","delta":-20到20},{"type":"dev","years":1到5},{"type":"note","text":"叙事"}]}
 瘟疫/全球大疫必须给 target.city;地震水旱必须给 target.region;饥荒给 target.polity 或 target.regions。
-小贸易 a、b 是两个国家编号,可不填其中一个。`;
+小贸易 a、b 是两个国家编号,可不填其中一个。
+story 用来写"故事里发生、但只影响局部小事"的事件(如蝗灾、丰收、商队遇劫、工匠迁徙、小地震):
+title 必填,text 可选;effects 最多 3 条,只能是 sack(某城折损,loss 1/2/3)、
+capacity(某城人口上限增减,delta −20…20,涨要几十年、降是当即)、dev(推发展,years 1…5,需要 a)、note(纯叙事);
+不要用它改国界、战争、结盟、灭国、换君主、迁都。城用 C12 或城名,国家用 P6。`;
 
 function dmConfigOf(s: Session): DmConfig | null {
   if (!s.dm) return null;
@@ -337,11 +343,12 @@ function renderDmPrompt(ctx: DmContext): string {
  * ------------------------------------------------------------------ */
 
 export interface DmDecisionView {
-  kind: 'disaster' | 'trade';
+  kind: 'disaster' | 'trade' | 'story';
   summary: string;
   note?: string;
   command?: Intervention;
   trade?: { a?: string; b?: string; goods?: string; outcome: string };
+  story?: { title: string; text?: string; effects: StoryIvEffect[] };
 }
 
 export interface DmDecisionOutcome {
@@ -539,8 +546,98 @@ export function compileDmDecisions(
           note,
           trade: { ...(a ? { a } : {}), ...(b ? { b } : {}), ...(goods ? { goods } : {}), outcome },
         });
+      } else if (kind === 'story') {
+        const title = typeof item.title === 'string' ? item.title.trim().slice(0, 40) : '';
+        if (!title) {
+          rejected.push({ decision: item, reason: '故事事件需要 title(短标题)' });
+          continue;
+        }
+        const text = typeof item.text === 'string' ? item.text.trim().slice(0, 160) : '';
+        const a = asPolityKey(civ, item.a ?? target.polity, year);
+        const rawEffects = Array.isArray(item.effects) ? item.effects : [];
+        if (rawEffects.length > 3) {
+          rejected.push({ decision: item, reason: '故事事件最多 3 条效果' });
+          continue;
+        }
+        const effects: StoryIvEffect[] = [];
+        let bad = '';
+        for (const ef of rawEffects) {
+          if (!isObject(ef)) {
+            bad = '效果必须是对象';
+            break;
+          }
+          if (ef.type === 'sack') {
+            const city = asCityKey(civ, ef.city, year);
+            const loss = ef.loss;
+            if (!city) {
+              bad = 'sack 需要 city(城键或城名)';
+              break;
+            }
+            if (loss !== 1 && loss !== 2 && loss !== 3) {
+              bad = 'sack 的 loss 只能是 1/2/3';
+              break;
+            }
+            effects.push({ type: 'sack', city, loss });
+          } else if (ef.type === 'capacity') {
+            const city = asCityKey(civ, ef.city, year);
+            const delta = ef.delta;
+            if (!city) {
+              bad = 'capacity 需要 city(城键或城名)';
+              break;
+            }
+            if (typeof delta !== 'number' || !Number.isFinite(delta) || delta < -20 || delta > 20) {
+              bad = 'capacity 的 delta 要在 -20 到 20 之间';
+              break;
+            }
+            effects.push({ type: 'capacity', city, delta: Math.round(delta * 10) / 10 });
+          } else if (ef.type === 'dev') {
+            if (!a) {
+              bad = 'dev 需要事件给 a(国家编号)';
+              break;
+            }
+            const years = ef.years === undefined ? 3 : ef.years;
+            if (typeof years !== 'number' || !Number.isFinite(years)) {
+              bad = 'dev 的 years 必须是数字';
+              break;
+            }
+            effects.push({ type: 'dev', years: Math.min(5, Math.max(1, Math.round(years))) });
+          } else if (ef.type === 'note') {
+            const noteText = typeof ef.text === 'string' ? ef.text.trim().slice(0, 120) : '';
+            if (!noteText) {
+              bad = 'note 需要 text';
+              break;
+            }
+            effects.push({ type: 'note', text: noteText });
+          } else {
+            bad = `不认识的效果 ${String(ef.type)};只能是 sack / capacity / dev / note`;
+            break;
+          }
+        }
+        if (bad) {
+          rejected.push({ decision: item, reason: bad });
+          continue;
+        }
+        const fields: Record<string, unknown> = { kind: 'story', from: year, title };
+        if (text) fields.text = text;
+        if (a) fields.a = a;
+        if (effects.length) fields.effects = effects;
+        const command = cleanIntervention(fields);
+        if (!command) {
+          rejected.push({ decision: item, reason: '引擎不接受这条故事事件(键或参数不合法)' });
+          continue;
+        }
+        const summary = `故事「${title}」${effects.length ? `(${effects.length} 条效果)` : ''}`;
+        const storyNote = text || (typeof item.note === 'string' ? item.note.slice(0, 160) : undefined);
+        decisions.push({
+          kind: 'story',
+          summary,
+          note: storyNote,
+          command,
+          story: { title, ...(text ? { text } : {}), effects },
+        });
+        commands.push(command);
       } else {
-        rejected.push({ decision: item, reason: `不认识的 kind ${String(kind)};只能是 disaster / trade` });
+        rejected.push({ decision: item, reason: `不认识的 kind ${String(kind)};只能是 disaster / trade / story` });
       }
     } catch (e) {
       rejected.push({ decision: item, reason: e instanceof Error ? e.message : String(e) });
