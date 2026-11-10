@@ -1,0 +1,12 @@
+﻿{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": ".build",
+    "rootDir": "..",
+    "types": ["node"]
+  },
+  "include": ["probe.ts", "run.ts", "lib/**/*.ts"]
+}

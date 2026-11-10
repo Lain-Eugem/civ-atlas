@@ -4,3 +4,13 @@ snaps
 *.log
 .DS_Store
 .claude/
+
+mcp/.build/
+mcp/.runs/
+.baseline/
+ai-ruler/.build/
+ai-ruler/out/
+.tmp/
+.pnpm-store/
+.pnpm-home/
+.npm-cache/
