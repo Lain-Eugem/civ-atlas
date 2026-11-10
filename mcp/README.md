@@ -47,6 +47,9 @@ node mcp/.build/mcp/selftest-petty-core.js
 
 # 小事件裁决层端到端自检(v2 引擎效果、mock 回合、君主合流、降级、回放)
 node mcp/.build/mcp/selftest-petty-oracle.js
+
+# 自定义场自检(确定性 hash、统计、PNG 逐字节一致、改样式不改数值、数值解码、坏帧)
+node mcp/.build/mcp/selftest-field.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -246,6 +249,17 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 - **v2 引擎效果**:小事不是纯叙事——`petty` 干预会把「折损」写进城市 `sacks`(人口下滑,之后自然恢复),或「发展」委托给引擎 `boost`;道路类(修路/断路)目前只记叙事(道路是推演结束统一算的,途中没有逐条增删入口)。
 - **确定性**:概率→抽样用引擎统一随机流,种子 `petty:<事件ID>:<年份>:<国家ID>`;同一串决策重放结果逐位一致。DM 只会看到「某国某城折损一级」这类已结算摘要,看不到概率/选项/置信度/队列。
 
+## 自定义场(原型:计算层 / 渲染层分开)
+
+这个原型回答一个具体问题:能不能给地图加「自己带生成公式、能影响数值」的场(魔脉浓度、矿产、辐射)?当前版本先把**计算和显示彻底分开**:
+
+- **计算层** `src/gen/field.ts`:纯函数,产出一个 `FieldFrame{ kind, cells, seed, values: Float32Array, stats, hash }`,每个地块一个精确数(0–1 相对浓度)。同 world+kind+seed+scale+version **逐字节一致**;`hash` 是 FNV-1a,只覆盖数值,和渲染样式无关。三种场:魔脉(灵脉状)、矿产(团簇状)、辐射(热点状)。
+- **渲染层** `mcp/field-render.ts`:只读 `values`,自己决定色带/拉伸/等高线/辉光/浮雕/透明度;绝不回写数值,改样式只重画 PNG,不重算、不重跑推演。显示平滑只影响 PNG,hover/导出仍是原始值。
+- **接口**:`GET /api/field/meta|base|data|legend`;`base` 是 1024×512 透明底 PNG(叠在底图上),`data` 返回 base64 原始 Float32 值 + hover 索引网格 + `hash` + 图例。查询参数:`kind=magic|ore|radiation`、`seed`、`scale`、`ramp=ember|viridis|magma|ice`、`stretch=p1p99|minmax`、`opacity`、`contour=0|2..16`、`glow`、`hillshade`、`smooth`。
+- **查看器**:展开「自定义场 · 原型」→ 勾「显示场叠加层」→ 选场/色带/拉伸 →「生成 / 刷新场」;地图上出现半透明热力层,鼠标悬停显示该地块原始值与 `hash`;「导出数值 JSON」导出全部地块的计算层原值(8 位小数)。
+- **范围**:目前是生成期静态场(跟世界走,不随历史年份变化)。按州逐年演化(表卡 + 影响口)和地块级逐年演化还没接进引擎,是下一步。
+- **自检**:`node mcp/.build/mcp/selftest-field.js`(43 项:同参数 hash 相同、换样式 PNG 变但数值/hash 不变、统计与数值一致、PNG 逐字节可复现、hover 网格抽样一致、坏帧校验)。
+
 ## 参数全部可自定义
 
 没有写死的「默认对局」:世界生成参数、起始年、每回合年数、回合数、结束年、引擎参数(`civParams`)、接管的君主数量、每国命令上限、模型/温度/超时都由调用方给。想固定一套配置,就由调用方每次传同样的值,或者自己包一层脚本/MCP 客户端配置。
@@ -278,7 +292,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争)。
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹)。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 注意:查看器进程内的世界/会话表是内存里的,关掉进程就没了;日志仍写在 `mcp/.runs/`。查看器不改变引擎的确定性,只是把同一套 `mcp/engine.ts` / `mcp/monarch.ts` 搬到 HTTP 后面。
 
@@ -291,6 +305,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **DM 小决策接口(已完成)**:`mcp/dm.ts` + `civ_dm_oracle_setup/status/round` 三个工具 + 查看器 DM 面板;OpenAI 兼容(OpenJEV / Ollama / LM Studio / vLLM),天灾写成 `disaster` 命令真改历史,小贸易只记叙事;命令照常进日志,回放对账仍一致。
 - **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**共 20 个 MCP 工具**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
 - **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录 26 种、查看器标成「故事事件」。
+- **自定义场原型(已完成)**:`src/gen/field.ts`(计算层,魔脉/矿产/辐射三种、逐字节确定、FNV-1a hash)+ `mcp/field-render.ts`(渲染层,色带/拉伸/等高线/辉光/浮雕/透明度,只读数值)+ `mcp/png.ts` + 查看器「自定义场」面板与 `/api/field/*`;计算与渲染彻底分开,改样式不再重算;自检 43 项。
 
 ## 目录
 
@@ -316,11 +331,14 @@ mcp/
   selftest-dm-oracle.ts DM 小决策自检(45 项,mock;含故事事件)
   selftest-petty-core.ts   小事件核心自检(58 项,不联网)
   selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
-  viewer.ts             本地浏览器查看器(HTTP + PNG 地图)
+  selftest-field.ts        自定义场自检(43 项,确定性/数值/渲染)
+  png.ts             纯 Node PNG 编码(渲染层共用)
+  field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
+  viewer.ts             本地浏览器查看器(HTTP + PNG 地图 + 场叠加)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1
   .build/            产物(不提交)
   .runs/             会话日志(不提交)
 ```
 
-`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。
+`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。

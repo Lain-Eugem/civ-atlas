@@ -34,6 +34,7 @@
     busy: false,
     tab: 'decisions',
     toastTimer: 0,
+    field: { on: false, img: null, data: null, legend: null, kind: 'magic' },
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -68,6 +69,28 @@
     pettyKey: $('#pettyKey'),
     btnPettyConnect: $('#btnPettyConnect'),
     pettyStatusLine: $('#pettyStatusLine'),
+    fieldEnable: $('#fieldEnable'),
+    fieldKind: $('#fieldKind'),
+    fieldRamp: $('#fieldRamp'),
+    fieldStretch: $('#fieldStretch'),
+    fieldOpacity: $('#fieldOpacity'),
+    fieldOpacityVal: $('#fieldOpacityVal'),
+    fieldContour: $('#fieldContour'),
+    fieldGlow: $('#fieldGlow'),
+    fieldHillshade: $('#fieldHillshade'),
+    fieldSmooth: $('#fieldSmooth'),
+    fieldSeed: $('#fieldSeed'),
+    fieldScale: $('#fieldScale'),
+    btnFieldApply: $('#btnFieldApply'),
+    btnFieldOff: $('#btnFieldOff'),
+    btnFieldData: $('#btnFieldData'),
+    fieldStatusLine: $('#fieldStatusLine'),
+    fieldLegendWrap: $('#fieldLegendWrap'),
+    fieldLegendName: $('#fieldLegendName'),
+    fieldLegendHash: $('#fieldLegendHash'),
+    fieldLegendBar: $('#fieldLegendBar'),
+    fieldLegendTicks: $('#fieldLegendTicks'),
+    fieldTip: $('#fieldTip'),
     btnWorld: $('#btnWorld'),
     btnSession: $('#btnSession'),
     btnRound: $('#btnRound'),
@@ -247,6 +270,8 @@
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(S.baseImg, ox, oy, S.mapW * k, S.mapH * k);
+    // 场叠加层:只把渲染层给的 PNG 贴上去,数值不动
+    if (S.field.on && S.field.img) ctx.drawImage(S.field.img, ox, oy, S.mapW * k, S.mapH * k);
     if (S.ownersImg) ctx.drawImage(S.ownersImg, ox, oy, S.mapW * k, S.mapH * k);
 
     if (S.state) drawLabels(ctx, ox, oy, k);
@@ -311,7 +336,11 @@
       el.map.classList.add('dragging');
     });
     el.map.addEventListener('pointermove', (e) => {
-      if (!drag) return;
+      if (!drag) {
+        showFieldTip(e);
+        return;
+      }
+      setFieldTipVisible(false);
       const dx = e.clientX - drag.x;
       const dy = e.clientY - drag.y;
       drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
@@ -330,6 +359,7 @@
       drag = null;
       el.map.classList.remove('dragging');
     });
+    el.map.addEventListener('pointerleave', () => setFieldTipVisible(false));
     el.map.addEventListener('wheel', (e) => {
       if (!S.baseImg) return;
       e.preventDefault();
@@ -388,6 +418,184 @@
     } catch (e) {
       toast(`疆域图生成失败:${e instanceof Error ? e.message : String(e)}`, true);
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 自定义场(原型:计算层给数值,渲染层只上色)
+   * ------------------------------------------------------------------ */
+
+  const FIELD_KIND_CN = { magic: '魔脉浓度', ore: '矿产资源', radiation: '辐射本底' };
+
+  function fieldQuery() {
+    const q = new URLSearchParams();
+    q.set('worldId', S.worldId || '');
+    q.set('kind', el.fieldKind ? el.fieldKind.value : 'magic');
+    const seed = el.fieldSeed && el.fieldSeed.value.trim();
+    if (seed) q.set('seed', seed);
+    const scale = Number(el.fieldScale && el.fieldScale.value);
+    if (Number.isFinite(scale)) q.set('scale', String(scale));
+    q.set('ramp', el.fieldRamp.value);
+    q.set('stretch', el.fieldStretch.value);
+    q.set('opacity', String(Number(el.fieldOpacity.value) || 0.85));
+    q.set('contour', el.fieldContour.checked ? '6' : '0');
+    q.set('glow', el.fieldGlow.checked ? '1' : '0');
+    q.set('hillshade', el.fieldHillshade.checked ? '1' : '0');
+    q.set('smooth', el.fieldSmooth.checked ? '1' : '0');
+    return q;
+  }
+
+  function decodeB64(s) {
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function decodeFieldData(d) {
+    const vb = decodeB64(d.values);
+    const gb = decodeB64(d.grid);
+    return {
+      ...d,
+      values: new Float32Array(vb.buffer, vb.byteOffset, vb.byteLength / 4),
+      grid: new Int32Array(gb.buffer, gb.byteOffset, gb.byteLength / 4),
+    };
+  }
+
+  function setFieldTipVisible(on) {
+    if (!el.fieldTip) return;
+    el.fieldTip.classList.toggle('hidden', !on);
+    if (!on) el.fieldTip.textContent = '';
+  }
+
+  function showFieldTip(e) {
+    if (!S.field.on || !S.field.data || !el.map) return setFieldTipVisible(false);
+    const rect = el.map.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const { k, ox, oy } = S.draw;
+    const mx = (x - ox) / k;
+    const my = (y - oy) / k;
+    if (mx < 0 || my < 0 || mx > S.mapW || my > S.mapH) return setFieldTipVisible(false);
+    const d = S.field.data;
+    const gx = Math.min(d.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * d.gridW)));
+    const gy = Math.min(d.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * d.gridH)));
+    const cell = d.grid[gy * d.gridW + gx];
+    if (typeof cell !== 'number' || cell < 0 || cell >= d.values.length) return setFieldTipVisible(false);
+    const value = d.values[cell];
+    const lon = ((mx / S.mapW) * 360 - 180).toFixed(1);
+    const lat = (90 - (my / S.mapH) * 180).toFixed(1);
+    el.fieldTip.innerHTML =
+      `<b>${esc(d.label)}</b> <span class="field-tip-value">${value.toFixed(6)}</span><br>` +
+      `<span class="muted">地块 #${cell} · ${lon}°E, ${lat}°N · hash ${short(d.hash, 10)}</span>`;
+    el.fieldTip.classList.remove('hidden');
+    const bx = Math.min(S.cw - 230, Math.max(6, x + 14));
+    const by = Math.max(6, y - 54);
+    el.fieldTip.style.left = `${bx}px`;
+    el.fieldTip.style.top = `${by}px`;
+  }
+
+  function renderFieldLegend() {
+    const lg = S.field.legend;
+    if (!lg || !el.fieldLegendWrap) return;
+    el.fieldLegendWrap.classList.remove('hidden');
+    el.fieldLegendName.textContent = `${lg.label} · ${lg.rampLabel || ''}`;
+    el.fieldLegendHash.textContent = S.field.data ? `hash ${S.field.data.hash}` : '';
+    el.fieldLegendBar.style.background = `linear-gradient(90deg, ${(lg.stops || []).map((s) => `${s.hex} ${(s.t * 100).toFixed(1)}%`).join(', ')})`;
+    el.fieldLegendTicks.innerHTML = (lg.ticks || [])
+      .map((t) => `<span style="left:${(t.t * 100).toFixed(2)}%"><i></i>${t.value.toFixed(3)}</span>`)
+      .join('');
+  }
+
+  function updateFieldStatus() {
+    if (!el.fieldStatusLine) return;
+    if (!S.field.data) {
+      el.fieldStatusLine.textContent = '先创建世界,再生成场。PNG 只是上色;数值以计算层和 hover 为准。';
+      return;
+    }
+    const d = S.field.data;
+    el.fieldStatusLine.textContent =
+      `${d.label} · ${fmtInt(d.cells)} 地块 · hash ${short(d.hash, 12)} · ` +
+      `min ${d.stats.min.toFixed(4)} / mean ${d.stats.mean.toFixed(4)} / max ${d.stats.max.toFixed(4)} · ` +
+      `改样式不会重算数值`;
+  }
+
+  async function applyField() {
+    if (!S.worldId || S.busy) return;
+    const q = fieldQuery();
+    const kind = q.get('kind');
+    try {
+      setBusy(true, '正在生成场…', '计算层先算出一格一个数;渲染层再按样式上色。');
+      const pngRes = await fetch(`/api/field/base?${q}`);
+      if (!pngRes.ok) {
+        let msg = `HTTP ${pngRes.status}`;
+        try { msg = (await pngRes.json()).error || msg; } catch (_) { /* ignore */ }
+        throw new Error(msg);
+      }
+      const blob = await pngRes.blob();
+      const dataRaw = await api(`/api/field/data?${q}`);
+      if (S.field.img && S.field.img.close) {
+        try { S.field.img.close(); } catch (_) { /* ImageBitmap.close 在部分环境不存在 */ }
+      }
+      S.field.img = await createImageBitmap(blob);
+      S.field.data = decodeFieldData(dataRaw);
+      S.field.legend = dataRaw.legend;
+      S.field.kind = kind;
+      S.field.on = true;
+      el.fieldEnable.checked = true;
+      renderFieldLegend();
+      updateFieldStatus();
+      draw();
+      toast(`场已生成:${dataRaw.label} · ${fmtInt(dataRaw.cells)} 地块 · hash ${short(dataRaw.hash, 12)}`);
+    } catch (e) {
+      toast(`生成场失败:${e instanceof Error ? e.message : String(e)}`, true);
+    } finally {
+      setBusy(false);
+      refreshButtons();
+    }
+  }
+
+  function hideField() {
+    S.field.on = false;
+    if (el.fieldEnable) el.fieldEnable.checked = false;
+    setFieldTipVisible(false);
+    draw();
+    refreshButtons();
+  }
+
+  async function exportFieldData() {
+    if (!S.field.data) {
+      toast('先生成场,才能导出数值', true);
+      return;
+    }
+    const d = S.field.data;
+    const values = Array.from(d.values, (v) => Number(v.toFixed(8)));
+    const payload = {
+      note: '每个地块一个值;索引对应 1024 宽地图最近地块。计算层数值,未经渲染修改。',
+      kind: d.kind,
+      label: d.label,
+      cells: d.cells,
+      version: d.version,
+      hash: d.hash,
+      stats: d.stats,
+      values,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `field-${d.kind}-${String(d.hash).slice(0, 8)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast(`已导出 ${d.label} 数值:${fmtInt(d.cells)} 个地块,${fmtInt(blob.size)} 字节`);
+  }
+
+  let fieldTimer = 0;
+  function scheduleField() {
+    window.clearTimeout(fieldTimer);
+    fieldTimer = window.setTimeout(() => {
+      if (S.worldId && el.fieldEnable.checked) void applyField();
+    }, 260);
   }
 
   /* ------------------------------------------------------------------ *
@@ -715,6 +923,9 @@
     el.btnExport.disabled = !hasSession || S.busy;
     el.btnDmConnect.disabled = !hasSession || S.busy;
     el.btnPettyConnect.disabled = !hasSession || S.busy;
+    if (el.btnFieldApply) el.btnFieldApply.disabled = !hasWorld || S.busy;
+    if (el.btnFieldOff) el.btnFieldOff.disabled = !S.field.on || S.busy;
+    if (el.btnFieldData) el.btnFieldData.disabled = !S.field.data || S.busy;
     el.btnAuto.textContent = S.autoOn ? '暂停自动播放' : '自动播放';
     el.btnAuto.classList.toggle('playing', S.autoOn);
   }
@@ -737,6 +948,11 @@
       S.sel = null;
       S.baseImg = null;
       S.autoOn = false;
+      S.field = { on: false, img: null, data: null, legend: null, kind: 'magic' };
+      if (el.fieldEnable) el.fieldEnable.checked = false;
+      if (el.fieldLegendWrap) el.fieldLegendWrap.classList.add('hidden');
+      setFieldTipVisible(false);
+      updateFieldStatus();
       el.polityList.innerHTML = '';
       el.polityDetail.innerHTML = '<div class="side-empty">世界建好了,点「开始会话」让 AI 君主接管。</div>';
       setStatus(`${d.worldId} · ${fmtInt(d.cells)} 地块 · 生成 ${d.generatedMs} ms`);
@@ -1003,6 +1219,30 @@
     el.pettyMock.addEventListener('change', () => {
       el.pettyKey.disabled = el.pettyMock.checked;
     });
+
+    el.btnFieldApply.addEventListener('click', () => { void applyField(); });
+    el.btnFieldOff.addEventListener('click', hideField);
+    el.btnFieldData.addEventListener('click', () => { void exportFieldData(); });
+
+    el.fieldEnable.addEventListener('change', () => {
+      if (!el.fieldEnable.checked) { hideField(); return; }
+      if (S.field.img) {
+        S.field.on = true;
+        renderFieldLegend();
+        updateFieldStatus();
+        draw();
+        refreshButtons();
+      } else {
+        void applyField();
+      }
+    });
+    [el.fieldKind, el.fieldRamp, el.fieldStretch, el.fieldContour, el.fieldGlow, el.fieldHillshade, el.fieldSmooth, el.fieldSeed, el.fieldScale]
+      .forEach((ctl) => ctl && ctl.addEventListener('change', () => { if (el.fieldEnable.checked) scheduleField(); }));
+    el.fieldOpacity.addEventListener('input', () => {
+      el.fieldOpacityVal.textContent = (Number(el.fieldOpacity.value) || 0.85).toFixed(2);
+      if (el.fieldEnable.checked) scheduleField();
+    });
+    el.fieldOpacityVal.textContent = (Number(el.fieldOpacity.value) || 0.85).toFixed(2);
 
     window.addEventListener('resize', () => resizeCanvas());
     if (window.ResizeObserver && el.mapWrap) {

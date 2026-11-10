@@ -43,6 +43,16 @@ import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
 import { polityName } from '../src/gen/civ/growth';
+import { fieldFrame, FIELD_KINDS, FIELD_LABEL, type FieldFrame, type FieldKind } from '../src/gen/field';
+import {
+  renderFieldMap,
+  fieldDataJson,
+  fieldLegend,
+  DEFAULT_FIELD_STYLE,
+  FIELD_RAMPS,
+  type FieldRamp,
+  type FieldStyle,
+} from './field-render';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
 
@@ -583,6 +593,57 @@ function stateView(s: Session): Record<string, unknown> {
 const baseCache = new Map<string, Buffer>();
 const ownerCache = new Map<string, { fingerprint: string; json: Record<string, unknown> }>();
 const chronCache = new Map<string, { fingerprint: string; entries: EventView[]; total: number }>();
+/** 场的计算层帧缓存:键 = worldId|kind|seed|scale;同世界同参数只算一次 */
+const fieldFrames = new Map<string, FieldFrame>();
+/** 场的渲染层缓存:键 = frame.hash|样式 JSON;改样式只重画,不动计算层 */
+const fieldPngs = new Map<string, { png: Buffer; legend: unknown }>();
+
+function optNum(v: string | null): number | undefined {
+  if (v === null || v === '') return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function fieldKindOf(v: string | null): FieldKind {
+  const kind = (v ?? 'magic') as FieldKind;
+  if (!FIELD_KINDS.includes(kind)) throw new Error('kind 只能是 magic / ore / radiation');
+  return kind;
+}
+
+function getFieldFrameCached(world: World, worldId: string, kind: FieldKind, seed?: number, scale?: number): FieldFrame {
+  const key = `${worldId}|${kind}|${seed ?? ''}|${scale ?? ''}`;
+  const hit = fieldFrames.get(key);
+  if (hit) return hit;
+  const frame = fieldFrame(world, kind, { seed, scale });
+  if (fieldFrames.size > 32) fieldFrames.clear();
+  fieldFrames.set(key, frame);
+  return frame;
+}
+
+function fieldStyleOf(url: URL): FieldStyle {
+  const q = url.searchParams;
+  const ramp = q.get('ramp') ?? DEFAULT_FIELD_STYLE.ramp;
+  const stretch = q.get('stretch') === 'minmax' ? 'minmax' : 'p1p99';
+  const opacity = Math.min(1, Math.max(0.05, optNum(q.get('opacity')) ?? DEFAULT_FIELD_STYLE.opacity));
+  let contour: boolean | number = q.get('contour') !== '0';
+  const levels = optNum(q.get('contour'));
+  if (contour && levels !== undefined) contour = Math.max(2, Math.min(16, Math.round(levels)));
+  return {
+    ramp: (FIELD_RAMPS.includes(ramp as FieldRamp) ? ramp : DEFAULT_FIELD_STYLE.ramp) as FieldRamp,
+    stretch,
+    opacity,
+    contour,
+    glow: q.get('glow') !== '0',
+    hillshade: q.get('hillshade') !== '0',
+    smooth: q.get('smooth') !== '0',
+  };
+}
+
+function sendPng(res: ServerResponse, png: Buffer): void {
+  res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store' });
+  res.end(png);
+}
+
 
 function getBasePng(worldId: string): Buffer {
   const hit = baseCache.get(worldId);
@@ -719,6 +780,74 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     });
     return true;
   }
+
+  if (method === 'GET' && pathname === '/api/field/meta') {
+    sendJson(res, 200, {
+      kinds: FIELD_KINDS.map((kind) => ({ kind, label: FIELD_LABEL[kind] })),
+      ramps: FIELD_RAMPS,
+      defaults: DEFAULT_FIELD_STYLE,
+    });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/field/base') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    const rec = getWorldRecord(worldId);
+    if (!rec) { fail(res, 400, '世界不存在(先创建世界)'); return true; }
+    const q = url.searchParams;
+    const kind = fieldKindOf(q.get('kind'));
+    const seed = optNum(q.get('seed'));
+    const scale = optNum(q.get('scale'));
+    const frame = getFieldFrameCached(rec.world, worldId, kind, seed, scale);
+    const style = fieldStyleOf(url);
+    const key = `${frame.hash}|${JSON.stringify(style)}`;
+    const hit = fieldPngs.get(key);
+    if (hit) { sendPng(res, hit.png); return true; }
+    const out = renderFieldMap(rec.world, frame, style);
+    if (fieldPngs.size > 48) fieldPngs.clear();
+    fieldPngs.set(key, { png: out.png, legend: out.legend });
+    sendPng(res, out.png);
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/field/data') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    const rec = getWorldRecord(worldId);
+    if (!rec) { fail(res, 400, '世界不存在(先创建世界)'); return true; }
+    const q = url.searchParams;
+    const kind = fieldKindOf(q.get('kind'));
+    const seed = optNum(q.get('seed'));
+    const scale = optNum(q.get('scale'));
+    const frame = getFieldFrameCached(rec.world, worldId, kind, seed, scale);
+    const style = fieldStyleOf(url);
+    const data = fieldDataJson(rec.world, frame, Math.max(16, Math.min(1024, optNum(q.get('gridW')) ?? 256)));
+    // 图例随数据返回(只算色带/刻度,不重画 PNG),前端显示真实刻度
+    sendJson(res, 200, {
+      ...data,
+      style,
+      legend: fieldLegend(frame, style),
+      kinds: FIELD_KINDS.map((k) => ({ kind: k, label: FIELD_LABEL[k] })),
+    });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/field/legend') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    const rec = getWorldRecord(worldId);
+    if (!rec) { fail(res, 400, '世界不存在(先创建世界)'); return true; }
+    const q = url.searchParams;
+    const kind = fieldKindOf(q.get('kind'));
+    const seed = optNum(q.get('seed'));
+    const scale = optNum(q.get('scale'));
+    const frame = getFieldFrameCached(rec.world, worldId, kind, seed, scale);
+    sendJson(res, 200, fieldLegend(frame, fieldStyleOf(url)));
+    return true;
+  }
+
+
 
   if (method === 'GET' && pathname === '/api/state') {
     const sid = url.searchParams.get('sessionId') ?? '';

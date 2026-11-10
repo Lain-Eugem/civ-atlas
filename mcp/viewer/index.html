@@ -103,6 +103,55 @@
       </div>
     </details>
 
+    <details class="llm-row" id="fieldRow">
+      <summary>自定义场 · 原型 <span class="muted">(魔脉 / 矿产 / 辐射:计算层给精确数值,渲染层只上色;改样式不重算)</span></summary>
+      <div class="control-row">
+        <label class="field check"><input id="fieldEnable" type="checkbox"><span>显示场叠加层</span></label>
+        <label class="field"><span>场</span>
+          <select id="fieldKind">
+            <option value="magic" selected>魔脉浓度</option>
+            <option value="ore">矿产资源</option>
+            <option value="radiation">辐射本底</option>
+          </select>
+        </label>
+        <label class="field"><span>色带</span>
+          <select id="fieldRamp">
+            <option value="ember" selected>余烬</option>
+            <option value="viridis">青绿</option>
+            <option value="magma">岩浆</option>
+            <option value="ice">寒冰</option>
+          </select>
+        </label>
+        <label class="field"><span>拉伸</span>
+          <select id="fieldStretch">
+            <option value="p1p99" selected>1%–99%</option>
+            <option value="minmax">最小–最大</option>
+          </select>
+        </label>
+        <label class="field"><span>透明度 <b id="fieldOpacityVal">0.85</b></span><input id="fieldOpacity" type="range" min="0.05" max="1" step="0.05" value="0.85"></label>
+      </div>
+      <div class="control-row">
+        <label class="field check"><input id="fieldContour" type="checkbox" checked><span>等高线</span></label>
+        <label class="field check"><input id="fieldGlow" type="checkbox" checked><span>辉光</span></label>
+        <label class="field check"><input id="fieldHillshade" type="checkbox" checked><span>地形浮雕</span></label>
+        <label class="field check"><input id="fieldSmooth" type="checkbox" checked><span>显示平滑(只影响图)</span></label>
+        <label class="field"><span>变体种子(可空)</span><input id="fieldSeed" type="number" placeholder="默认" min="0" max="999999" step="1"></label>
+        <label class="field"><span>尺度</span><input id="fieldScale" type="number" value="1" min="0.25" max="4" step="0.25"></label>
+      </div>
+      <div class="control-row">
+        <button id="btnFieldApply" class="btn" disabled>生成 / 刷新场</button>
+        <button id="btnFieldOff" class="btn" disabled>关闭叠加</button>
+        <button id="btnFieldData" class="btn" disabled>导出数值 JSON</button>
+        <span class="hint grow" id="fieldStatusLine">先创建世界,再生成场。PNG 只是上色;数值以计算层和 hover 为准。</span>
+      </div>
+      <div class="field-legend-wrap hidden" id="fieldLegendWrap">
+        <div class="field-legend-head"><span id="fieldLegendName">魔脉浓度</span><span class="field-legend-hash" id="fieldLegendHash"></span></div>
+        <div class="field-legend-bar" id="fieldLegendBar"></div>
+        <div class="field-legend-ticks" id="fieldLegendTicks"></div>
+        <div class="field-legend-unit">0–1 相对浓度 · 图例刻度为真实数值 · hover 看原始值</div>
+      </div>
+    </details>
+
     <div class="control-row actions">
       <button id="btnWorld" class="btn">① 创建世界</button>
       <button id="btnSession" class="btn" disabled>② 开始会话</button>
@@ -134,6 +183,7 @@
         </div>
         <div class="map-loading hidden" id="mapLoading"><span class="spinner"></span><span id="mapLoadingText">地图生成中…</span></div>
         <div class="map-tip">滚轮缩放 · 拖动平移 · 点击国家</div>
+        <div class="field-tip hidden" id="fieldTip"></div>
       </div>
 
     </section>
