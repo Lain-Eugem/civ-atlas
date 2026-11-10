@@ -273,6 +273,14 @@ const spec = (key: string, priority: 0 | 1 | 2, extra: Partial<PettyQuestionSpec
     badScore = e instanceof JevError && e.kind === 'request';
   }
   ok(badScore, 'score 少于 2 档被拒');
+  // 官方 API 实测：noul 的 criteria 不能是字符串，必须是 { true, false } 对象。
+  let badNoul = false;
+  try {
+    checkQuestions({ q: { type: 'noul', instructions: '是否旱灾', criteria: 'true=是,false=否' } as never });
+  } catch (e) {
+    badNoul = e instanceof JevError && e.kind === 'request';
+  }
+  ok(badNoul, 'noul 字符串 criteria 被拒');
 }
 
 // 成功解析：noul/choice/score 三种答案

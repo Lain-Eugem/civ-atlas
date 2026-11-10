@@ -176,7 +176,12 @@ function checkQuestion(key: string, q: JevQuestion): void {
     }
     if (criteria.some((c) => typeof c !== 'string' || !c.trim())) throw new JevError('request', `${where} 的档位说明为空`);
   } else if (q.type === 'noul') {
-    const criteria = asRecord((q as JevNoulQuestion).criteria);
+    const raw = (q as JevNoulQuestion).criteria;
+    const criteria = asRecord(raw);
+    // 官方 API 实测：noul 的 criteria 如果给，必须是 { true, false } 对象，字符串会 400。
+    if (raw !== undefined && !criteria) {
+      throw new JevError('request', `${where}（noul）的 criteria 如果给，必须是 { true, false } 对象；官方 API 不接受字符串`);
+    }
     if (criteria && criteria.true !== undefined && typeof criteria.true !== 'string') throw new JevError('request', `${where} 的 criteria.true 必须是字符串`);
     if (criteria && criteria.false !== undefined && typeof criteria.false !== 'string') throw new JevError('request', `${where} 的 criteria.false 必须是字符串`);
   } else {

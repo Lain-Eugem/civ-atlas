@@ -168,6 +168,26 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 - 官方请求体没有 `temperature` / `top_p` 字段,温度由服务端固定;确定性靠「记录每回合概率与抽样结果 + 命令进日志 + 回放对账」保证,不靠固定客户端参数。
 - 成本按官方计价:输入 $0.084 / 百万 token(以官方文档为准);离线演示用 `mock: true`。
 
+### 真实 API 实测(2026-11-10)
+
+用官方 Key(环境变量 `JEV_API_KEY`)跑过一轮真实小事件回合,参数:seed 7 / 12,000 地块 / 第 1,200 年 / 每回合 5 年 / 画像 L2 / 每批最多 8 问:
+
+- 扫描 19 件小事 → 打包 2 批(P0 8 问、P1 8 问)→ **串行 2 次请求,合计约 1.2 秒** → 16 条决定 → 6 条引擎命令 → 0 条降级;`civ_session_verify` 回放一致。
+- 实际用量:**input 2,912 / output 450 tokens,cost `$0.000244608`**(输出计费为 0);客户端估算 2,625 tokens,比实际少约 11%,仍在 4,250 预算内。
+- 响应里 `model` 回显为 `typesafe/jev-1.14-20261014`(请求写 `typesafe/jev-1.14.0` 也接受),`provider` 为 `TypeSafe`;单次请求约 1.2 秒。
+- 君主回合(petty 真 Jev + DM/君主 mock)也跑通:`petty.source='jev'`、6 条 petty 命令 + 1 条 DM 命令、回放一致。
+- 实测注意:
+  - `noul` 问题的 `criteria` 如果给,必须是对象 `{ true: "...", false: "..." }`;传字符串会 400(客户端已提前拦截)。内置 20 个模式都不带 criteria,不受影响。
+  - 请求没有 `temperature` / `top_p`,不要试图在客户端固定温度;复现性靠记录概率+抽样结果+命令回放。
+  - Key 只从环境变量或工具参数进内存,不写盘、不进日志;不要把 Key 写进 README、配置或仓库文件。
+
+PowerShell 里临时设 Key(只对当前窗口生效):
+
+```powershell
+$env:JEV_API_KEY = (Get-Content -Raw C:\Users\26612\Documents\key.txt).Trim()
+```
+
+
 ### 用法
 
 ```
