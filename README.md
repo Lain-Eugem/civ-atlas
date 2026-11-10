@@ -141,4 +141,3 @@ UPSTREAM.md          上游 civ-atlas 原 README
 - 本项目基于 [guaner-334/civ-atlas](https://github.com/guaner-334/civ-atlas)（AGPL-3.0），保留其全部历史与许可证。
 - 本仓库的修改同样以 **AGPL-3.0** 发布；如果把它改完挂到网上给别人用，需要按 AGPL 公开修改。
 - 引擎、星球生成、历史推演、原网站的所有功劳归上游作者与贡献者；这里新增的是多 Agent 编排、场系统、查看器与工具层。
-- 仓库里没有任何真实 API Key：Key 只从工具参数或环境变量进内存，不写盘、不进日志。
