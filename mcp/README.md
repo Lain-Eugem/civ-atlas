@@ -184,7 +184,11 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 PowerShell 里临时设 Key(只对当前窗口生效):
 
 ```powershell
-$env:JEV_API_KEY = (Get-Content -Raw C:\Users\26612\Documents\key.txt).Trim()
+# 临时（只对当前 PowerShell 窗口生效）
+$env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
+
+# 持久（写入当前 Windows 用户的环境变量，新开窗口生效）
+[Environment]::SetEnvironmentVariable('JEV_API_KEY', (Get-Content -Raw C:\path\to\jev-key.txt).Trim(), 'User')
 ```
 
 
