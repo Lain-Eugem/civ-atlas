@@ -22,6 +22,8 @@ import { polityAlive, capitalAt, polityName } from '../src/gen/civ/growth';
 import { rulerAt } from '../src/gen/civ/story/peopleInfo';
 import { buildChronicle, entryInvolves, type ChronicleEntry } from '../src/gen/civ/story/chronicle';
 import { cleanOrders, ORDER_KINDS, KEY_HELP, type CleanedOrders } from './orders';
+import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
+import type { TuningValues } from '../src/gen/civ/tuning';
 
 /* ------------------------------------------------------------------ *
  * 世界注册表
@@ -97,6 +99,12 @@ export interface SessionOpenInput {
    * 注意:interventions 可以放"起始年之前的历史命令",引擎会照它们从第 0 年重推。
    */
   civParams?: Partial<CivParams>;
+  /**
+   * DM 规则预设(可选):true = 用默认预设,对象 = 在预设上覆盖单项(键名见 src/gen/civ/dm.ts)。
+   * 预设改的是引擎自动战争/议和/结盟/分裂的劲头,经 tuningPatch 写进 CivParams.knobs 随世界存;
+   * 不给 / false = 官方规则,与改造前逐字节一致。
+   */
+  dmPreset?: boolean | TuningValues;
 }
 
 export interface Session {
@@ -105,6 +113,8 @@ export interface Session {
   world: World;
   worldParams: WorldParams;
   civParams: Partial<CivParams>;
+  /** 打开会话时用的 DM 规则预设(生效后的完整 values;没开 = 没有) */
+  dmPreset?: TuningValues;
   startYear: number;
   stepYears: number;
   maxRounds: number;
@@ -139,6 +149,17 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
   const started = Date.now();
   const play0: PlayState = { year: startYear, commands: [] };
   const civParams: Partial<CivParams> = { ...(input.civParams ?? {}) };
+  let dmPreset: TuningValues | undefined;
+  if (input.dmPreset !== undefined && input.dmPreset !== false) {
+    if (input.dmPreset !== true && (!input.dmPreset || typeof input.dmPreset !== 'object' || Array.isArray(input.dmPreset))) {
+      throw new Error('dmPreset 只能是 true/false,或一个覆盖项对象(键名见 civ_dm_preset 工具)');
+    }
+    const overrides = input.dmPreset === true ? {} : input.dmPreset;
+    dmPreset = dmTuningValues(overrides);
+    const merged = mergeKnobs(dmKnobs(overrides), civParams.knobs);
+    if (merged) civParams.knobs = merged;
+    else delete civParams.knobs;
+  }
   const civ = playCiv(worldRec.world, civParams, play0);
   sessionSeq += 1;
   const id = `s-${Date.now().toString(36)}-${sessionSeq.toString(36)}`;
@@ -150,6 +171,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     world: worldRec.world,
     worldParams: worldRec.params,
     civParams,
+    dmPreset,
     startYear,
     stepYears,
     maxRounds,
@@ -171,6 +193,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
         worldId: worldRec.id,
         worldParams: worldRec.params,
         civParams,
+        dmPreset,
         startYear,
         stepYears,
         maxRounds,

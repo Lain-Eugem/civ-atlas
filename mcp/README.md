@@ -5,9 +5,10 @@
 - 生成世界(纯计算,不联网)
 - 把世界推到任意起始年并停住
 - 读当前回合的完整状态(国家、君主、州数、国都、编年史)
-- 提交外部命令(23 种干预:宣战/结盟/国策/迁都/天灾/立约……)
+- 提交外部命令(24 种干预:宣战/结盟/国策/迁都/天灾/立约/坚持打……)
 - 单步或多年推演,返回各国增减与本回合大事
 - **君主模式**:每回合暂停,给每个在世国家发局势简报,并发调用外部 LLM(或 mock)当君主,把决策编译成引擎命令,再统一推演一回合
+- **DM 规则预设**(可选):降低引擎自动开战/自动议和/自动分裂的强度,把历史更多交给外部君主
 - 导出会话 JSON 供复盘/对账,并提供回放对账工具
 
 这一层**不修改**网页、不改现有内置 AI 助手、不改引擎源码;它只是复用 `src/gen` 下的纯计算模块。
@@ -31,6 +32,12 @@ node mcp/.build/mcp/selftest-protocol.js
 
 # 君主回合自检(全程 mock,不联网)
 node mcp/.build/mcp/selftest-monarch.js
+
+# press 干预自检(引擎自动议和 vs 君主坚持打)
+node mcp/.build/mcp/selftest-press.js
+
+# DM 规则预设自检(预设生效、可复现、不改官方世界)
+node mcp/.build/mcp/selftest-dm.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -51,16 +58,16 @@ Claude Code(`.mcp.json` 或用户级配置)、Cursor(`mcp.json`)都类似:
 }
 ```
 
-Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能看到 13 个 `civ_*` 工具。
+Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能看到 14 个 `civ_*` 工具。
 
 ## 工具一览
 
 | 工具 | 作用 |
 | --- | --- |
 | `civ_world_create` | 生成世界:`seed`(必填)+ `params`(可选:cells/landFraction/plates/…) |
-| `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams` |
+| `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules` |
 | `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹 |
-| `civ_orders_catalog` | 列出 23 种命令的字段与稳定键写法 |
+| `civ_orders_catalog` | 列出 24 种命令的字段与稳定键写法 |
 | `civ_orders_submit` | 提交本回合命令(`from` 省略即填当前年;给 `polityId` 时按该国君主口吻编译),返回被拒收的命令及原因 |
 | `civ_turn_step` | 推 `stepYears` 年(或指定 `years`),返回年份、各国增减、事件、拒收 |
 | `civ_chronicle_get` | 按年份/类型读编年史 |
@@ -69,6 +76,7 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | `civ_monarch_setup` | 配置君主模式:哪些国家由外部君主接管(`polities`:all / 前 N 大国 / 编号数组)、每国每回合最多几条命令、`mock`、服务商/模型/Key/温度/超时 |
 | `civ_monarch_round` | 跑一个君主回合:简报 → 并发 LLM/mock → 编译命令 → 统一推演 → 写日志 |
 | `civ_monarch_status` | 看君主模式配置与已跑回合数(不含 Key) |
+| `civ_dm_preset` | 看 DM 规则预设的默认值(7 项)、换算后的旋钮、每项说明;可传 `overrides` 预览自定义 |
 | `civ_session_verify` | 回放对账:用同一世界 + 命令史重推,比较 16 位 civ 指纹与年份 |
 
 ## 君主模式(任务二)
@@ -94,12 +102,23 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 
 - `polities`: `"all"` = 所有在世国家(上限 12);数字 = 前 N 个大国;数组 = 指定 `[6, 54, 61]`。
 - `polities` 里的国家才会被外部君主接管;其余国家仍由引擎规则自动行为。
-- 君主命令以「我们国家」为主语:不写 `from`/`a`,目标国写 `b`(编号或 `"P6"`)。支持 `policy` / `declare` / `ally` / `halt` / `boost` / `protect`,每国每回合默认最多 3 条。
+- 君主命令以「我们国家」为主语:不写 `from`/`a`,目标国写 `b`(编号或 `"P6"`)。支持 `policy` / `declare` / `ally` / `halt` / `boost` / `protect` / `press`,每国每回合默认最多 3 条。
 - 命令编译会逐条校验(目标是否在世、宣战是否接壤、参数是否合法),坏的只拒自己,并把中文原因写进 `decisions[].rejected`,方便下一轮喂回模型。
 - 同一回合的命令按国家编号升序落地,和模型返回快慢无关;整回合只调一次 `playTurn`,不打断引擎的确定性。
 - LLM 请求在会话层异步并发等待,引擎调用是同步且快的;推演线程/进程不在等网络。
 - `mock: true` 时不联网,用确定性规则模拟每个君主的决策,适合跑通流程、做回放对账和 CI。
 - 真模型 Key 只在本次进程内存里;日志与导出都不含 Key。DeepSeek 默认 `https://api.deepseek.com` + `deepseek-chat`(环境变量 `DEEPSEEK_API_KEY`);百炼默认 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus`(环境变量 `DASHSCOPE_API_KEY`);也可 `provider: "custom"` + `baseUrl` 接本地 Ollama 等 OpenAI 兼容服务。
+
+## DM 规则预设与 press(任务三)
+
+- **DM 规则预设**(`civ_session_open` 的可选参数):
+  - `dmPreset: true` 启用默认 7 项:`war.odds` ×½(自动开战减半)、`war.truce` 10 年、`war.length` [8,30]、`war.rest` 2 年(更不容易自动议和)、`diplo.pact` ×½、`diplo.betray` 关、`split.odds` ×½。
+  - `dmRules: { "war.odds": 0.25 }` 可只覆盖其中几项;`civ_dm_preset` 工具能看每项的官方值与换算后的旋钮。
+  - 预设通过 `tuningPatch()` 换算成 `CivParams.knobs`,随世界保存;不启用 = 不放 `knobs`,与官方世界逐字节一致。
+- **press(第 24 种干预)**:外部君主「坚持打」。
+  - 从 `from` 那年起,这一仗的引擎自动议和、僵持罢兵、攻方受降都不再生效,直到一方亡国、`until` 到期,或君主自己再下 `ally` / `halt` / `destroy` 等强制结束。
+  - `b` 可省略(= 跟谁都继续打);给了 `b` 就只管跟这一国的仗。
+  - 讨伐民变的战争不吃 `press`(民变由 `split` 规则管,和对外命令分开)。
 
 ## 参数全部可自定义
 
@@ -118,7 +137,7 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 
 - **任务一(已完成)**:`mode="auto"` 的引擎工具层,8 个基础工具。
 - **任务二(已完成)**:君主回合循环,新增 5 个君主工具;`mock` 与真 LLM 两条路径;回放对账。
-- **任务三(进行中)**:DM 规则预设(`tuningPatch` 写 `CivParams.knobs`)+ 新增 `press` 干预(引擎自动议和 vs 君主坚持打)。
+- **任务三(已完成)**:DM 规则预设(`tuningPatch` 写 `CivParams.knobs`,`civ_dm_preset` 查看/覆盖)+ 新增 `press` 干预(引擎自动议和 vs 君主坚持打);官方世界确定性逐位不变(21/21 对账通过)。
 
 ## 目录
 
@@ -129,11 +148,13 @@ mcp/
   monarch.ts         君主回合编排(setup/brief/round/status/verify)
   prompt.ts          君主系统提示词
   llm.ts             DeepSeek/百炼/自定义 OpenAI 兼容 + mock 决策
-  tools.ts           13 个 MCP 工具定义与分发
+  tools.ts           14 个 MCP 工具定义与分发
   server.ts          JSON-RPC 2.0 over stdio(逐行串行处理)
   selftest.ts        引擎自检(31 项)
   selftest-protocol.ts  协议自检(16 项)
   selftest-monarch.ts   君主回合自检(29 项,mock)
+  selftest-press.ts     press 干预自检(16 项)
+  selftest-dm.ts        DM 规则预设自检(17 项)
   tsconfig.build.json / build.ps1
   .build/            产物(不提交)
   .runs/             会话日志(不提交)

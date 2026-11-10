@@ -21,6 +21,8 @@
     "mcp:selftest": "node mcp/.build/mcp/selftest.js",
     "mcp:selftest:protocol": "node mcp/.build/mcp/selftest-protocol.js",
     "mcp:selftest:monarch": "node mcp/.build/mcp/selftest-monarch.js",
+    "mcp:selftest:press": "node mcp/.build/mcp/selftest-press.js",
+    "mcp:selftest:dm": "node mcp/.build/mcp/selftest-dm.js",
     "mcp:serve": "node mcp/.build/mcp/server.js"
   },
   "dependencies": {

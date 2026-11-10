@@ -61,6 +61,11 @@ export const ORDER_KINDS: { kind: string; fields: string; note: string }[] = [
   { kind: 'declare', fields: 'a, b(两国国键), lead?', note: '强制开战;不接壤/已在交战/一方已亡时打不成' },
   { kind: 'ally', fields: 'a, b, until?', note: '结盟,从起年互不宣战;正在交战会当即议和' },
   { kind: 'halt', fields: 'a, until?', note: '停止扩张、不主动宣战、不援盟;自己挑起的战争当即议和' },
+  {
+    kind: 'press',
+    fields: 'a, b?, until?',
+    note: '坚持打:这一仗不许引擎自己议和(打满年限、僵持、国库窘迫、受降罢兵都不算;b 给了只管跟该国);君主自己下的 ally/halt/destroy 和一方亡国照旧',
+  },
   { kind: 'protect', fields: 'a, until?', note: '受保护,不许被灭/被并' },
   { kind: 'boost', fields: 'a, mul?: 3|10, until?, regions?', note: '推一把发展;不给 mul = 直接进下一个时代' },
   { kind: 'treaty', fields: 'a, ps?[1..3], term?, keep?, by?, zone?, ask?', note: '强制立约' },

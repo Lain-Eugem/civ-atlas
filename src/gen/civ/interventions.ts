@@ -40,6 +40,10 @@
  *   不许扩张 halt    polities.ts 的"国家到达"不去(不进无主的州);wars.ts 看邻国时不宣战、不援盟;politics.ts 不合并别国;
  *                   from 那一刻它挑起的(它是攻方的)战争当即议和。被打时照常防守、反攻夺回自己的州(守方的反攻本来就只打丢掉的州)。
  *                   有 until 的:until 那一刻(Ev.HaltEnd,同一刻里比干预事件还早)从现有国土重新预约扩张(polities.ts 的 respread)
+ *   坚持打 press     from 那一刻起这一仗不许引擎自己议和(wars.ts 的厌战、僵持、国用不足、受降罢兵都不算数);
+ *                   b 给了就只管跟 b 打的仗,不给管 a 参与的所有仗(不含讨伐民变)。a 那时已亡 = 不生效。
+ *                   君主自己下的 ally / halt / destroy、以及一方亡国等强制结束照旧(那些不走这条判定)。
+ *                   有 until 的到那一刻止(议和判定时现查,不用预约结束事件)
  *   即位   crown     from 那一刻作者的人物成为 a 的君主:a 那时已亡 / 他还没出生 = 不生效(史事照记,b 列写原因);
  *                   生效了在位表跟着改(polities.ts 的 crownRuler、rulers.ts):此刻在位的那一位让位,他从下一刻起按自己的倾向
  *                   扩张、打仗、议和,在位到 until(不给 = 寻常君主的在位年数)、改朝换代或亡国,之后照常继位。
@@ -104,6 +108,7 @@ import { civApi } from './api';
 
 type Ally = Extract<Intervention, { kind: 'ally' }>;
 type Halt = Extract<Intervention, { kind: 'halt' }>;
+type Press = Extract<Intervention, { kind: 'press' }>;
 type Cede = Extract<Intervention, { kind: 'cede' }>;
 type Found = Extract<Intervention, { kind: 'found' }>;
 type Move = Extract<Intervention, { kind: 'move' }>;
@@ -133,6 +138,7 @@ export class InterventionModel {
   private readonly unityRules: Extract<Intervention, { kind: 'unity' }>[] = [];
   private readonly allyRules: Ally[] = [];
   private readonly haltRules: Halt[] = [];
+  private readonly pressRules: Press[] = [];
   private readonly stayRules: Stay[] = [];
   /** 保住王室:开关(keep)的下标;即位带 keep 的有没有 */
   private readonly keepRules: number[] = [];
@@ -186,6 +192,7 @@ export class InterventionModel {
     else if (v.kind === 'unity') this.unityRules.push(v);
     else if (v.kind === 'ally') this.allyRules.push(v);
     else if (v.kind === 'halt') this.haltRules.push(v);
+    else if (v.kind === 'press') this.pressRules.push(v);
     else if (v.kind === 'stay') this.stayRules.push(v);
     else if (v.kind === 'keep') this.keepRules.push(i);
     else if (v.kind === 'crown' && v.keep === true) this.crownKeeps = true;
@@ -351,6 +358,15 @@ export class InterventionModel {
     return false;
   }
 
+  /** 国家 p 此刻"坚持打"这一仗:q 是交战的另一国(b 没给的命令管它所有的仗) */
+  pressing(p: number, t: number, q: number): boolean {
+    for (const v of this.pressRules) {
+      if (!pressActive(v, t) || this.resolve(v.a) !== p) continue;
+      if (v.b === undefined || this.resolve(v.b) === q) return true;
+    }
+    return false;
+  }
+
   /** 州 r 此刻是"永久划给"它现在的主人的(战争、分裂、复国、议和割地都拿不走) */
   locked(r: number, t: number): boolean {
     if (!this.lockRegions.has(r)) return false;
@@ -401,6 +417,7 @@ export class InterventionModel {
 
 const allyActive = (v: Ally, t: number) => t >= v.from && (v.until === undefined || t < v.until);
 const haltActive = (v: Halt, t: number) => t >= v.from && (v.until === undefined || t < v.until);
+const pressActive = (v: Press, t: number) => t >= v.from && (v.until === undefined || t < v.until);
 
 const models = new WeakMap<CivSim, InterventionModel>();
 

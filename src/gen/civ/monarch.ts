@@ -25,7 +25,7 @@ export const MONARCH_MAX_COUNTRIES = 12;
 export const MONARCH_MAX_ORDERS = 3;
 
 /** 君主能下的命令(和 compileMonarchOrders 一一对应) */
-export const MONARCH_KINDS = ['policy', 'declare', 'ally', 'halt', 'boost', 'protect'] as const;
+export const MONARCH_KINDS = ['policy', 'declare', 'ally', 'halt', 'boost', 'protect', 'press'] as const;
 export type MonarchKind = (typeof MONARCH_KINDS)[number];
 
 /** 第 y 年各国几州(y≥civ.endYear 时直接用 civ.polity) */
@@ -131,7 +131,10 @@ const COMMAND_HELP = `## 你能下的命令(每回合 0–${MONARCH_MAX_ORDERS} 
 - {"kind":"boost","mul":3}
   推一把发展:mul 只能是 3 或 10(不写 = 直接进下一个时代)。
 - {"kind":"protect"}
-  保护自己:别的国家不能把你灭掉(但仍可能丢州)。`;
+  保护自己:别的国家不能把你灭掉(但仍可能丢州)。
+- {"kind":"press","b":国家编号}
+  坚持打:这一仗以后不许引擎自己议和(打满年限、僵持、国库窘迫、对方求和都不算数),直到你下 ally/halt、对方亡国或 until 到期。
+  b 可省略;不写 b 就管你参与的所有仗。`;
 
 /** 一次为多个国家写简报(编年史只算一遍) */
 export function buildMonarchBriefs(
@@ -367,6 +370,36 @@ export function compileMonarchOrders(civ: Civ, year: number, polityId: number, r
       const v = cleanIntervention(built);
       if (!v) {
         rejected.push({ order, reason: `${kind} 参数不合法(boost 的 mul 只能是 3 或 10;until 要是不早于今年的年份)` });
+        continue;
+      }
+      commands.push(v);
+      taken += 1;
+      continue;
+    }
+    if (kind === 'press') {
+      const rawTarget = order.b ?? order.target;
+      const built: Record<string, unknown> = { kind: 'press', from: Y, a: myKey };
+      if (rawTarget !== undefined) {
+        const target = asPolityId(rawTarget);
+        if (target === null) {
+          rejected.push({ order, reason: 'press 的 b 要是简报里的国家编号(如 6);不写 b 就管你参与的所有仗' });
+          continue;
+        }
+        if (target === polityId) {
+          rejected.push({ order, reason: '不能对自己下这条命令' });
+          continue;
+        }
+        const tp = civ.polities[target];
+        if (!tp || !polityAlive(tp, Y) || (size.get(target) ?? 0) === 0) {
+          rejected.push({ order, reason: `P${target} 今年不在世` });
+          continue;
+        }
+        built.b = polityKey(civ, target);
+      }
+      if (order.until !== undefined) built.until = order.until;
+      const v = cleanIntervention(built);
+      if (!v) {
+        rejected.push({ order, reason: 'press 参数不合法(until 要是不早于今年的年份)' });
         continue;
       }
       commands.push(v);

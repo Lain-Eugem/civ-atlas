@@ -17,6 +17,7 @@ import {
   worldIdOf,
 } from './engine';
 import { compileMonarchOrders, MONARCH_MAX_ORDERS } from '../src/gen/civ/monarch';
+import { dmPresetInfo } from '../src/gen/civ/dm';
 import { monarchBriefList, monarchRound, monarchStatus, setupMonarch, verifySession } from './monarch';
 
 export interface ToolDef {
@@ -63,6 +64,12 @@ export const TOOLS: ToolDef[] = [
         stepYears: { type: 'integer', description: '一个回合推几年(默认 1,1–1000)', minimum: 1, maximum: 1000 },
         maxRounds: { type: 'integer', description: '最多几个回合(默认 1,1–200)', minimum: 1, maximum: 200 },
         endYear: { type: 'integer', description: '可选:推到这一年就停(必须 > startYear)' },
+        dmPreset: { type: 'boolean', description: '可选:true = 打开 DM 规则预设(把引擎自动战争/议和/结盟/分裂压低,给外部君主留操作空间)。默认 false = 官方规则,与改造前逐字节一致。单项覆盖见 dmRules 或 civ_dm_preset。' },
+        dmRules: {
+          type: 'object',
+          additionalProperties: true,
+          description: '可选:DM 预设的单项覆盖(键名见 civ_dm_preset 返回的 items,如 {"war.odds":0.25});只有 dmPreset=true 时有效。',
+        },
         mode: { type: 'string', enum: ['auto', 'monarch'], description: '推演模式。auto=内置规则自动推演;monarch=先开好会话,再用 civ_monarch_setup 把国家交给外部君主。两种模式不改变引擎确定性。' },
         civParams: {
           type: 'object',
@@ -90,7 +97,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: 'civ_orders_catalog',
-    description: '列出引擎认的全部命令种类(23 种)、字段格式与稳定键写法。下命令前先看它。',
+    description: '列出引擎认的全部命令种类(24 种)、字段格式与稳定键写法。下命令前先看它。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -209,6 +216,21 @@ export const TOOLS: ToolDef[] = [
       '确定性回放对账:用会话自己的世界参数和命令历史从第 0 年重推,比较 civ 指纹与年份。ok=true 说明君主回合只是把同一串命令分批交给引擎,没有改变引擎结果。',
     inputSchema: { type: 'object', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
   },
+  {
+    name: 'civ_dm_preset',
+    description:
+      '查看/预览 DM 规则预设。预设把引擎自动战争、议和、结盟、分裂的劲头压低,给外部君主留操作空间;换算成每个世界的旋钮后随世界保存,不改变确定性。打开方式:civ_session_open 传 dmPreset:true(可再用 dmRules 覆盖单项)。不打开 = 官方规则,与改造前逐字节一致。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        overrides: {
+          type: 'object',
+          additionalProperties: true,
+          description: '可选:覆盖预设里的单项(键名见返回的 items,如 {"war.odds":0.25})',
+        },
+      },
+    },
+  },
 ];
 
 function text(value: unknown): ToolResult {
@@ -241,6 +263,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
         maxRounds: optNum(args.maxRounds, 'maxRounds'),
         endYear: optNum(args.endYear, 'endYear'),
         mode: typeof args.mode === 'string' ? (args.mode as 'auto') : undefined,
+        dmPreset: args.dmPreset === true ? (isObject(args.dmRules) ? (args.dmRules as never) : true) : undefined,
         civParams: isObject(args.civParams) ? (args.civParams as never) : undefined,
       });
       return text(opened.summary);
@@ -251,6 +274,10 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     }
     case 'civ_orders_catalog':
       return text(catalog());
+    case 'civ_dm_preset': {
+      const overrides = isObject(args.overrides) ? (args.overrides as never) : undefined;
+      return text(dmPresetInfo(overrides));
+    }
     case 'civ_orders_submit': {
       const s = getSession(String(args.sessionId ?? ''));
       const orders = args.orders;

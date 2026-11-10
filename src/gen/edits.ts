@@ -67,6 +67,7 @@
  * | `found`   | 立国     | region = 州                       | 这一年年初以这州的城为国都立一个新国家(州里没城就先建城;民族 = 当地民族;州原来有主的,算从原主分出来) | name:国名(国名词根,同改名) |
  * | `move`    | 迁都     | a = 国家,city = 城                | 这一年年初迁都到这座城(城要在 a 的国土里、没被毁) | —                            |
  * | `halt`    | 不许扩张 | a = 国家                          | 从这一年起不进无主的州、不主动宣战、不援盟、不并小国;那一刻它挑起的战争当即议和。被打时照常防守、反攻夺回自己的州 | until:到这一年止(不含;不给 = 一直) |
+ * | `press`   | 坚持打   | a = 国家,b = 另一国(可选)         | 从这一年起这一仗不许引擎自己议和(打满年限、僵持、国用不足、攻方受降罢兵都不算数);b 给了就只管跟这一国打的仗。君主自己下的 ally / halt / destroy / 一方亡国等强制结束照旧 | until:到这一年止(不含;不给 = 一直) |
  * | `keep`    | 保住王室 | a = 国家                          | 从这一年起不改朝换代、君主不被篡位(豪强起兵代之、权臣篡位、掌实权的人篡位都挡下,编年史记一句未遂;有人掌实权照旧;共和国没有王室,不起作用) | until:到这一年止(不含;不给 = 一直) |
  * | `crown`   | 即位     | a = 国家,char = 作者人物的编号,born = 他的生年,leanings = 他的倾向 | 这一年年初作者的人物成为这国君主:此刻在位的那位让位,他按自己的倾向在位;他下台后照常有人继位(这国那年已亡 / 他还没出生 = 不生效) | until:这一年年初下台(不含;不给 = 按寻常君主的在位年数,到 88 岁为止,至少一年);abdicate: true = until 是作者填的退位年份(推演不看,只管说法:没有 = 到卒年) |
  * | `policy`  | 方针     | a = 国家;war 打仗胆量、expand 开拓、coast 沿海(负 = 偏内陆)、peace 和谈底线(各 −50…50 的整数,不给 = 0 = 照君主的倾向);foes 仇国、friends 亲国(国家键,各最多 3 国);focus 发展重点(production / transport / information / administration / mobilization);preset 是一键选的哪一种(expand 扩张 / hold 守成 / trade 商贸 / peace 和平发展,只管说法) | 从这一年起这国照方针走,直到这国的下一条方针换掉它(什么都不给 = 罢方针,照君主的倾向;这国那年已亡 = 不生效) | — |
@@ -736,6 +737,7 @@ export type InterventionKind =
   | 'found'
   | 'move'
   | 'halt'
+  | 'press'
   | 'crown'
   | 'policy'
   | 'destroy'
@@ -853,6 +855,7 @@ export type Intervention = (
   | { kind: 'found'; region: string; from: number; name?: string }
   | { kind: 'move'; a: string; city: string; from: number }
   | { kind: 'halt'; a: string; from: number; until?: number }
+  | { kind: 'press'; a: string; b?: string; from: number; until?: number }
   | { kind: 'crown'; a: string; char: number; from: number; born: number; until?: number; abdicate?: true; after?: true; keep?: true; leanings: RulerLeanings }
   | { kind: 'keep'; a: string; from: number; until?: number }
   | { kind: 'destroy'; a: string; from: number; b?: string }
@@ -1964,7 +1967,7 @@ function folkRenamed(civ: Civ, f: Faith, cultures: readonly Culture[]): string |
 /** 干预年份的上限(推演引擎能预约的最远时刻) */
 export const INTERVENTION_YEAR_MAX = 65535;
 
-export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
+export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
 
 /** 人物键的几段(格式见 personKey):国家键、身份、生成时的名字、生年(取整)、同名同年的第几个(0 起);格式不对 = null */
 export interface PersonKeyParts {
@@ -2316,6 +2319,12 @@ export function tidyIntervention(x: unknown): Intervention | null {
     else if (kind === 'protect' || kind === 'halt' || kind === 'keep') {
       const until = untilOf();
       v = until !== null ? { kind, a, from, until } : { kind, a, from };
+    } else if (kind === 'press') {
+      const until = untilOf();
+      const b = o.b === undefined ? null : isPolityKey(o.b) && o.b !== a ? o.b : undefined;
+      if (b === undefined) return null;
+      const base = b === null ? { kind, a, from } : { kind, a, b, from };
+      v = until !== null ? { ...base, until } : base;
     } else if (kind === 'cede') {
       if (!isRegionKey(o.region)) return null;
       v = o.permanent === true ? { kind, a, region: o.region, from, permanent: true } : { kind, a, region: o.region, from };

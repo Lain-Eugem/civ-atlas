@@ -599,6 +599,8 @@ function ivText(civ: Civ, v: Intervention): string {
       return `${id(v.a, 'polity', 'P')} 禁止分裂`;
     case 'halt':
       return `${id(v.a, 'polity', 'P')} 禁止扩张${until(v.until)}`;
+    case 'press':
+      return `${id(v.a, 'polity', 'P')} 坚持打${v.b !== undefined ? `(只管与 ${id(v.b, 'polity', 'P')} 的仗)` : ''}${until(v.until)}`;
     case 'ally':
       return `${id(v.a, 'polity', 'P')} 与 ${id(v.b, 'polity', 'P')} 结盟${until(v.until)}`;
     case 'declare':
@@ -938,6 +940,7 @@ const OP_WORDS: Record<string, string> = {
   protect: '保护',
   unity: '禁止分裂',
   halt: '禁止扩张',
+  press: '坚持打',
   ally: '结盟',
   declare: '宣战',
   move: '迁都',
@@ -1453,6 +1456,7 @@ const KIND_LABEL: Record<Intervention['kind'], string> = {
   protect: '保护',
   unity: '禁止分裂',
   halt: '禁止扩张',
+  press: '坚持打',
   ally: '结盟',
   declare: '宣战',
   move: '迁都',

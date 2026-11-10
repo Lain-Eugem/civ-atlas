@@ -1118,8 +1118,12 @@ export function installWars(sim: CivSim, pm: PolityModel, world: World, wm: WarM
       }
     }
     if (w.end !== undefined) return; // 有一方亡国,已经议和
+    // 君主下了"坚持打"(press):这一仗不许引擎自己议和 —— 受降罢兵、厌战、僵持、国用不足、达成目标都不算数
+    // (讨伐民变不算:那是内乱,不吃对外命令)
+    const pressed =
+      !api.war.revolt?.(w) && ((wm.iv?.pressing(w.a, t, w.b) ?? false) || (wm.iv?.pressing(w.b, t, w.a) ?? false));
     // 邦交:守方打得很惨时可能奉表称臣、攻方受降罢兵(diplomacy.ts;成了就已经议和)
-    if (api.war.sue?.(w, i, t, pow, defCapital)) return;
+    if (!pressed && api.war.sue?.(w, i, t, pow, defCapital)) return;
     // 议和?
     const last = w.takes.length ? w.takes[w.takes.length - 1].year : w.start;
     // 攻方此刻在位的君主:越好战越不轻易罢兵、想多拿几州,好战低的打不了多久就想议和(rulers.ts;加上方针的胆量、和谈底线)
@@ -1139,6 +1143,11 @@ export function installWars(sim: CivSim, pm: PolityModel, world: World, wm: WarM
       // 灭国之战:拿下国都、对方丢了过半国土都不停(不设目标,见 CRUSH_GOAL;君主的倾向只管打多久,算在上面的年限里)
       if (pow[w.a] >= CRUSH * pow[w.b]) peace = held >= CRUSH_GOAL * goalOf(wm, w);
       else peace = capitalFell || held >= pm.size[w.b] || held >= Math.max(1, goalOf(wm, w) + eff.goal);
+    }
+    // 君主下了"坚持打":引擎的议和理由全部不算数;强制结束(结盟、不许扩张、灭国、一方亡国)照旧走别处
+    if (pressed) {
+      peace = false;
+      weary = false;
     }
     if (peace) {
       // 罢兵割地:攻方这场仗净得了州(讨伐民变的不算),守方再割 CEDE 州

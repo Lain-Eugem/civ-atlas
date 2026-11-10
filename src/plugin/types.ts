@@ -306,6 +306,7 @@ export type InterventionInfo = (
   | { kind: 'found'; region: string; from: number; name?: string }
   | { kind: 'move'; a: string; city: string; from: number }
   | { kind: 'halt'; a: string; from: number; until?: number }
+  | { kind: 'press'; a: string; b?: string; from: number; until?: number }
   | { kind: 'crown'; a: string; char: number; from: number; born: number; until?: number; abdicate?: true; after?: true; keep?: true; leanings: Leanings }
   | { kind: 'keep'; a: string; from: number; until?: number }
   | { kind: 'destroy'; a: string; from: number; b?: string }
