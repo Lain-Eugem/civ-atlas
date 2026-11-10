@@ -14,6 +14,7 @@ import type { KnobPatch, KnobSet } from './engine/knobs';
 import { BIRTH_SPAN, cultureKey, cultureModelOf, finishCultures, planCultures, type CultureModel } from './cultures';
 import { buildRoutes, usedLanes } from './routes';
 import { capacityNorm, finishPolities, planPolities, polityModelOf, routeCities, ruinGaps, type PolityModel } from './polities';
+import { devModelOf } from './development';
 import { findPlaces, keepPlaceNames, nameRefs, type NameRef } from './places';
 import { passSites } from './passSites';
 import { commandedList, scheduleInterventions } from './interventions';
@@ -473,9 +474,11 @@ function bridge(sim: CivSim, seed: number): PluginBridge<SimRead> | null {
   if (!read || !pm) return null;
   const reg = pm.terrain.regions;
   const R = sim.R;
+  const mesh = devModelOf(sim)?.world.mesh;
   return {
     read,
     regions: { count: R, adjStart: reg.adjStart.slice(0, R + 1), adj: reg.adj.slice(), seat: reg.seat.slice(0, R) },
+    ...(mesh ? { tiles: { count: mesh.n, adjStart: mesh.adjStart, adj: mesh.adj, of: reg.of } } : {}),
     polities: () => ({ count: pm.polities.length, anchor: pm.ptag }),
     unit: (name) => (officialNames.has(name) ? officialUnit(name as OfficialName) : undefined),
     official: (name) => read.official(name as OfficialName),

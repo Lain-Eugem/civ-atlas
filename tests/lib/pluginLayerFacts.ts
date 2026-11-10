@@ -52,7 +52,9 @@ export async function openSample(file: Uint8Array): Promise<OpenedSample> {
   }
   history.forEach(({ by, id, ...value }, i) => {
     const block = pluginLayerPart(by, id);
-    layers.push({ at: historyBlocks.has(block) ? block : `civ.simLayers[${i}]`, by, id, history: true, value });
+    // 和 worldFile 落盘一样:按地块的层在文件里写 unit 'cell'
+    const stored: PluginLayerValue = { ...value, unit: value.unit === 'tile' ? 'cell' : 'region' };
+    layers.push({ at: historyBlocks.has(block) ? block : `civ.simLayers[${i}]`, by, id, history: true, value: stored });
   });
   return { opened, content, layers };
 }

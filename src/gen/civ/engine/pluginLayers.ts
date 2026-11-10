@@ -30,15 +30,15 @@ export interface SimLayerSpec extends SimLayerLook {
   keep: number;
 }
 
-/** 存进历史的一个图层(去掉 by、id 就是世界文件里那一块的内容) */
+/** 存进历史的一个图层(去掉 by、id 就是世界文件里那一块的内容;写进世界文件时 tile 记成 cell) */
 export interface SimLayer extends SimLayerLook {
   /** 哪个插件的 */
   by: string;
   id: string;
-  unit: 'region';
+  unit: 'region' | 'tile';
   /** 每一份是哪一年的 */
   years: number[];
-  /** 份数 × 州数 */
+  /** 份数 × 州数(region)或份数 × 地块数(tile) */
   values: Float32Array;
 }
 
@@ -51,6 +51,8 @@ export const LAYER_LIMITS = { layers: 4, keep: 1000, bytes: 6e6 } as const;
 /** 一个图层推着推着存下的几份 */
 export class LayerRun {
   readonly keep: number;
+  /** 表按什么单位记(州/地块),存下来的图层跟着它 */
+  readonly unit: 'region' | 'tile';
   private readonly col: number;
   private readonly cols: number;
   private readonly look: SimLayerLook;
@@ -67,7 +69,9 @@ export class LayerRun {
     const s = spec;
     if (typeof s.id !== 'string' || !LAYER_ID.test(s.id)) throw new Error(`图层编号 ${String(s.id)} 只能有小写字母、数字和连字符,最长 25 个字`);
     if (!card) throw new Error(`图层 ${s.id} 的表 ${String(s.table)} 没有`);
-    if (card.unit !== 'region' || card.kind === 'id') throw new Error(`图层 ${s.id} 的表 ${card.id} 要按州记数`);
+    if (card.unit !== 'region' && card.unit !== 'tile') throw new Error(`图层 ${s.id} 的表 ${card.id} 要按州或按地块记`);
+    if (card.kind === 'id') throw new Error(`图层 ${s.id} 的表 ${card.id} 要记数(编号表画不出图)`);
+    this.unit = card.unit;
     this.cols = colCount(card);
     this.col = s.col === undefined ? (this.cols === 1 ? 0 : -1) : (card.cols ?? []).indexOf(s.col);
     if (this.col < 0) throw new Error(`图层 ${s.id} 要给表 ${card.id} 的一栏`);
@@ -83,19 +87,19 @@ export class LayerRun {
   /** 存一份:data = 那张表此刻的值(格 × 栏);超出单精度能存的压到最大最小,不变成无穷大 */
   keepFrame(year: number, data: Float64Array): void {
     const n = data.length / this.cols;
-    if ((this.years.length + 1) * n * 4 > LAYER_LIMITS.bytes) throw new Error(`图层 ${this.spec.id} 存的太多(每 ${this.spec.keep} 年一份、${n} 个州),把 keep 调大`);
+    if ((this.years.length + 1) * n * 4 > LAYER_LIMITS.bytes) throw new Error(`图层 ${this.spec.id} 存的太多(每 ${this.spec.keep} 年一份、${n} 格),把 keep 调大`);
     const f = new Float32Array(n);
     for (let r = 0; r < n; r++) f[r] = Math.max(-F32_MAX, Math.min(F32_MAX, data[r * this.cols + this.col]));
     this.years.push(year);
     this.frames.push(f);
   }
 
-  /** 接上存下的(推到 year;州 count 个):份数、年份要正好是从第 0 年起每 keep 年一份 */
+  /** 接上存下的(推到 year;格 count 个):份数、年份要正好是从第 0 年起每 keep 年一份 */
   restore(saved: SimLayer, year: number, count: number, ticks: number): void {
     const s = this.spec;
     const want: number[] = [];
     for (let t = 0; t <= year * ticks; t += this.keep) want.push(t / ticks);
-    if (saved.unit !== 'region' || !Array.isArray(saved.years) || saved.years.length !== want.length || saved.years.some((y, i) => y !== want[i])) throw new Error(`存下的图层 ${s.id} 的年份对不上`);
+    if (saved.unit !== this.unit || !Array.isArray(saved.years) || saved.years.length !== want.length || saved.years.some((y, i) => y !== want[i])) throw new Error(`存下的图层 ${s.id} 的年份对不上`);
     if (!(saved.values instanceof Float32Array) || saved.values.length !== want.length * count) throw new Error(`存下的图层 ${s.id} 的格数对不上`);
     if (canon(lookOf(saved)) !== canon(this.look)) throw new Error(`存下的图层 ${s.id} 和插件现在的样子对不上`);
     this.years = want;
@@ -107,7 +111,7 @@ export class LayerRun {
     const values = new Float32Array(this.years.length * count).fill(NaN);
     this.frames.forEach((f, k) => values.set(f.length > count ? f.subarray(0, count) : f, k * count));
     const { title, ...rest } = this.look;
-    return { by, id: this.spec.id, title, unit: 'region', years: this.years.slice(), values, ...rest };
+    return { by, id: this.spec.id, title, unit: this.unit, years: this.years.slice(), values, ...rest };
   }
 }
 

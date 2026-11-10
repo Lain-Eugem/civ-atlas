@@ -172,7 +172,8 @@ export function simLayerPaint(civ: Civ, year: number): CellPaint | null {
   const l = civ.simLayers?.[0];
   if (!l?.years.length) return null;
   const frame = framePaint(l, year);
-  return frame && regionsToCells(frame, civ.regions.of);
+  // 按地块记的图层本来就是地块数,按州的要摊到地块
+  return frame && (l.unit === 'tile' ? frame : regionsToCells(frame, civ.regions.of));
 }
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));

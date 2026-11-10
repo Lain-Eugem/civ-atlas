@@ -30,6 +30,7 @@
     "mcp:selftest:magic": "node mcp/.build/mcp/selftest-magic.js",
     "mcp:selftest:field-plugin": "node mcp/.build/mcp/selftest-field-plugin.js",
     "mcp:selftest:plugin-loader": "node mcp/.build/mcp/selftest-plugin-loader.js",
+    "mcp:selftest:tile-field": "node mcp/.build/mcp/selftest-tile-field.js",
     "mcp:serve": "node mcp/.build/mcp/server.js",
     "mcp:viewer": "node mcp/.build/mcp/viewer.js --port 5190"
   },

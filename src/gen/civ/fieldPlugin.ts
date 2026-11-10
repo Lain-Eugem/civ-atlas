@@ -60,6 +60,8 @@ export interface FieldSpec {
   max?: number;
   /** 几年算一步,默认 5,必须是官方频率 */
   every?: number;
+  /** 按州记(默认)还是按地块记(整张图每个地块一格,逐年演化;没有人口耗散,drain 只当额外衰减) */
+  unit?: 'region' | 'tile';
   /** 影响哪些官方数值,1..6 条 */
   influences: FieldInfluenceSpec[];
   /** 图层画法;不给 = 会自动生成一套(ember 色带) */
@@ -119,6 +121,25 @@ export const EXAMPLE_FIELD_SPEC: FieldSpec = {
   layer: { title: '魔脉浓度', colors: [...FIELD_COLORS], min: 0, max: 60, legend: '魔脉(0–100)', keep: 50 },
 };
 
+/** 示例:按地块逐年演化的场(给玩家抄的模板;keep 100 是因为地块多,帧太多会超单层 6MB) */
+export const EXAMPLE_TILE_FIELD_SPEC: FieldSpec = {
+  id: 'ley',
+  name: '地脉浓度',
+  unit: 'tile',
+  density: 0.05,
+  sourceMin: 30,
+  sourceMax: 80,
+  spread: 0.12,
+  seep: 0.03,
+  fade: 0.004,
+  drain: 0.002,
+  crowd: 100,
+  max: 80,
+  every: 5,
+  influences: [{ target: 'city.capacity', perPoint: 0.008 }],
+  layer: { title: '地脉浓度', colors: [...FIELD_COLORS], min: 0, max: 60, legend: '地脉(0–80)', keep: 100 },
+};
+
 const num = (v: number): string => String(Number(v.toFixed(6)));
 
 /** 查一份设定:返回问题清单(空 = 没问题);写错时给中文原因 */
@@ -157,6 +178,7 @@ export function fieldSpecProblems(raw: unknown): string[] {
   if (typeof max !== 'number' || !Number.isFinite(max) || max < 1 || max > 1e6) bad.push('max 要在 1..1000000 之间');
   const every = s.every === undefined ? 5 : s.every;
   if (typeof every !== 'number' || !(FREQUENCIES as readonly number[]).includes(every)) bad.push(`every 只能是 ${FREQUENCIES.join('、')} 年`);
+  if (s.unit !== undefined && s.unit !== 'region' && s.unit !== 'tile') bad.push('unit 只能是 region(按州)或 tile(按地块)');
   if (typeof s.sourceMin === 'number' && typeof s.sourceMax === 'number' && typeof max === 'number') {
     if (s.sourceMin > s.sourceMax) bad.push('sourceMin 不能大于 sourceMax');
     if (s.sourceMax > max) bad.push('sourceMax 不能大于 max');
@@ -212,6 +234,7 @@ export function cleanFieldSpec(raw: unknown): FieldSpec {
     name: s.name.trim(),
     max,
     every: s.every ?? 5,
+    unit: s.unit ?? 'region',
     strength: s.strength ?? 1,
     layer: {
       title: (layer.title ?? s.name).trim(),
@@ -232,45 +255,65 @@ export function fieldStrengthOf(v: unknown): number {
   return Math.round(x / FIELD_STRENGTH.step) * FIELD_STRENGTH.step;
 }
 
-/** 造一个原生推演插件:表 + 图层 + 影响口映射 */
+/** 造一个原生推演插件:表 + 图层 + 影响口映射(按州或按地块) */
 export function fieldPlugin(raw: FieldSpec | unknown): SimPlugin<SimRead> {
   const spec = cleanFieldSpec(raw);
   const strength = fieldStrengthOf(spec.strength);
   const max = spec.max ?? 100;
   const every = spec.every ?? 5;
+  const unit = spec.unit ?? 'region';
   const layer = spec.layer!;
   const ports = fieldPorts();
   const table = spec.id;
-  const tables: TableCard[] = [
-    {
-      id: 'vein',
-      name: '灵脉',
-      unit: 'region',
-      every: 1000,
-      min: 0,
-      max: Math.max(max, spec.sourceMax),
-      off: 0,
-      init: `if(rand() < ${num(spec.density)}, ${num(spec.sourceMin)} + ${num(spec.sourceMax - spec.sourceMin)} * rand(1), 0)`,
-      rule: 'vein',
-    },
-    { id: 'rural', name: '乡村人口', unit: 'region', input: true, min: 0, max: 1e9, off: 0 },
-    {
-      id: table,
-      name: spec.name,
-      unit: 'region',
-      every,
-      min: 0,
-      max,
-      off: 0,
-      init: 0,
-      consts: { spread: spec.spread, seep: spec.seep, fade: spec.fade, drain: spec.drain, crowd: spec.crowd },
-      rate:
-        `spread * (nbmean(nb.${table}) - ${table})` +
-        ` + max(seep * (vein - ${table}), 0)` +
-        ` - fade * ${table}` +
-        ` - drain * ${table} * min(rural / crowd, 1)`,
-    },
-  ];
+  const vein: TableCard = {
+    id: 'vein',
+    name: '灵脉',
+    unit,
+    every: 1000,
+    min: 0,
+    max: Math.max(max, spec.sourceMax),
+    off: 0,
+    init: `if(rand() < ${num(spec.density)}, ${num(spec.sourceMin)} + ${num(spec.sourceMax - spec.sourceMin)} * rand(1), 0)`,
+    rule: 'vein',
+  };
+  const tables: TableCard[] =
+    unit === 'tile'
+      ? [
+          vein,
+          {
+            id: table,
+            name: spec.name,
+            unit,
+            every,
+            min: 0,
+            max,
+            off: 0,
+            init: 0,
+            // 地块场没有「乡村人口」输入(官方表按州),drain 只当额外衰减
+            consts: { spread: spec.spread, seep: spec.seep, fade: spec.fade, drain: spec.drain },
+            rate: `spread * (nbmean(nb.${table}) - ${table})` + ` + max(seep * (vein - ${table}), 0)` + ` - fade * ${table}` + ` - drain * ${table}`,
+          },
+        ]
+      : [
+          vein,
+          { id: 'rural', name: '乡村人口', unit, input: true, min: 0, max: 1e9, off: 0 },
+          {
+            id: table,
+            name: spec.name,
+            unit,
+            every,
+            min: 0,
+            max,
+            off: 0,
+            init: 0,
+            consts: { spread: spec.spread, seep: spec.seep, fade: spec.fade, drain: spec.drain, crowd: spec.crowd },
+            rate:
+              `spread * (nbmean(nb.${table}) - ${table})` +
+              ` + max(seep * (vein - ${table}), 0)` +
+              ` - fade * ${table}` +
+              ` - drain * ${table} * min(rural / crowd, 1)`,
+          },
+        ];
   const look = {
     title: layer.title!,
     ramp: { colors: [...layer.colors!], min: layer.min!, max: layer.max! },
@@ -281,11 +324,30 @@ export function fieldPlugin(raw: FieldSpec | unknown): SimPlugin<SimRead> {
     id: spec.id,
     every,
     tables,
-    inputs: { rural: 'rural' },
+    ...(unit === 'region' ? { inputs: { rural: 'rural' } } : {}),
     influences: spec.influences.map((x) => x.target),
     layers: [{ id: spec.id, table, keep: layer.keep!, ...look }],
     act(turn) {
       const field = turn.table(table);
+      // 按地块的场先聚合成州:每州取治下地块的均值(海里、湖里的格子不算)
+      let perRegion = field;
+      if (unit === 'tile') {
+        // 接口第 1 版里没写这一样:宿主只给原生插件挂,不可枚举、不进 QuickJS 的 header
+        const tiles = (turn as unknown as { readonly tiles?: { readonly count: number; readonly of: Int32Array } }).tiles;
+        if (!tiles) throw new Error('按地块记的场要那一层地块(这套规则没给)');
+        const R = turn.read.regions().count;
+        const sum = new Float64Array(R);
+        const cnt = new Float64Array(R);
+        for (let i = 0; i < field.length; i++) {
+          const r = tiles.of[i];
+          if (r >= 0 && r < R) {
+            sum[r] += field[i];
+            cnt[r]++;
+          }
+        }
+        perRegion = new Float64Array(R);
+        for (let r = 0; r < R; r++) perRegion[r] = cnt[r] > 0 ? sum[r] / cnt[r] : 0;
+      }
       const out: Record<string, Float64Array> = {};
       const polityOwner = turn.read.owners('polity');
       const polityCount = turn.read.polities().length;
@@ -293,18 +355,18 @@ export function fieldPlugin(raw: FieldSpec | unknown): SimPlugin<SimRead> {
         const port = ports.find((p) => p.id === inf.target)!;
         const k = inf.perPoint * strength;
         const base = inf.base ?? (port.op === 'mul' ? 1 : 0);
-        const R = field.length;
         if (port.unit === 'region') {
+          const R = perRegion.length;
           const arr = new Float64Array(R);
-          for (let r = 0; r < R; r++) arr[r] = clamp(base + field[r] * k, port.min, port.max);
+          for (let r = 0; r < R; r++) arr[r] = clamp(base + perRegion[r] * k, port.min, port.max);
           out[inf.target] = arr;
         } else {
           const sum = new Float64Array(polityCount);
           const cnt = new Float64Array(polityCount);
-          for (let r = 0; r < R; r++) {
+          for (let r = 0; r < perRegion.length; r++) {
             const p = polityOwner[r];
             if (p >= 0 && p < polityCount) {
-              sum[p] += field[r];
+              sum[p] += perRegion[r];
               cnt[p]++;
             }
           }

@@ -59,6 +59,9 @@ node mcp/.build/mcp/selftest-field-plugin.js
 
 # 官方 .civplugin 加载器自检(QuickJS 直装/源码目录/非推演插件拒绝/MCP 开会话/回放)
 node mcp/.build/mcp/selftest-plugin-loader.js
+
+# 地块级场自检(按 mesh 地块逐年演化 + 落盘 cell 层往返;强度 0 = 官方指纹)
+node mcp/.build/mcp/selftest-tile-field.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -86,10 +89,10 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | 工具 | 作用 |
 | --- | --- |
 | `civ_world_create` | 生成世界:`seed`(必填)+ `params`(可选:cells/landFraction/plates/…) |
-| `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules`/`magicField`/`fields`(最多 4 份自定义场)/`plugins`(最多 4 个官方 .civplugin 路径) |
-| `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹 |
+| `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules`/`magicField`/`fields`(最多 4 份自定义场,可带 `unit: "tile"` 按地块记)/`plugins`(最多 4 个官方 .civplugin 路径) |
+| `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹、`fields` 与 `layers`(含按地块图层) |
 | `civ_orders_catalog` | 列出 26 种命令的字段与稳定键写法 |
-| `civ_field_catalog` | 列出自定义场能接的影响口(按州/按政治体)、强度档位与一份示例 spec |
+| `civ_field_catalog` | 列出自定义场能接的影响口(按州/按政治体)、强度档位与一份示例 spec(含按地块场的写法) |
 | `civ_orders_submit` | 提交本回合命令(`from` 省略即填当前年;给 `polityId` 时按该国君主口吻编译),返回被拒收的命令及原因 |
 | `civ_turn_step` | 推 `stepYears` 年(或指定 `years`),返回年份、各国增减、事件、拒收 |
 | `civ_chronicle_get` | 按年份/类型读编年史 |
@@ -326,6 +329,18 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 - **错误**:路径不存在、不是推演插件、重复 id、超过 4 个、插件表公式有问题,都以中文错误返回,不会把半装好的插件带进引擎。
 - **自检**:`node mcp/.build/mcp/selftest-plugin-loader.js`(22 项:直装 `.civplugin`/装源码目录/坏路径/非推演插件拒绝/重复拒绝/MCP 开会话/指纹变化/两次一致/回放对账)。
 
+## 地块级场(阶段C:场在每块地上逐年长)
+
+阶段A 的场按州记(每州一个值);阶段C 让场直接按**地块**记:每块地一个值,每几年扩散/衰减,画出来是逐格变化的热力图,同时还能聚合成州值去影响官方数值。
+
+- **怎么用**:`civ_session_open` 的 `fields` 里给带 `unit: "tile"` 的 spec(不写 = `"region"`,和阶段A 一样);示例 spec 是 `src/gen/civ/fieldPlugin.ts` 的 `EXAMPLE_TILE_FIELD_SPEC`(id `ley`),`civ_field_catalog` 会连端口和示例一起列出来。
+- **地块表怎么建**:表按世界**全部**地块记(`count = mesh.n`,邻接用 `mesh.adjStart/adj`),不是只算宜居地;地块场里没有「人口」这张表,`drain` 当作额外的固定衰减(免得以为和按州场一样有人口耗散)。
+- **影响口**:每次出手先把地块值按 `regions.of` 聚合成州均值(跳过海/湖),再按 `influences` 交给按州/按政治体的官方影响口;强度 0 时场照算、图层照存,只是不影响引擎——官方指纹逐字节不变。
+- **图层**:`civ_state_get.layers` 里 `unit: "tile"`、`cells = mesh.n`、`years`/`frameYear`/`frameCount`/`stats` 与按州层一致;存进世界时按文件格式写成 `cell` 层(读回来仍是 tile 层),`validateSimLayers` 接受 tile。
+- **上限**:一层 6,000,000 字节(帧数 × 地块数 × 4),34,043 地块最多 44 帧——地块场示例把 `layer.keep` 设成 100,长局请按地块数调小 keep 或加大 `every`。
+- **和官方 QuickJS 插件的关系**:只有原生插件(阶段A/C 的场、内置魔力场)能按地块记;官方 `.civplugin` 的表仍按州,已发布的接口第 1 版没变(插件作者写的类型不受影响)。
+- **自检**:`node mcp/.build/mcp/selftest-tile-field.js`(30 项:spec/unit 校验、强度 0 = 官方指纹、layer 元数据、按地块帧数、同 spec 复现、回合新帧、回放对账、MCP 开会话、落盘 cell 层往返)。
+
 
 
 没有写死的「默认对局」:世界生成参数、起始年、每回合年数、回合数、结束年、引擎参数(`civParams`)、接管的君主数量、每国命令上限、模型/温度/超时都由调用方给。想固定一套配置,就由调用方每次传同样的值,或者自己包一层脚本/MCP 客户端配置。
@@ -375,6 +390,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/rural/magic 三张表 + `city.capacity` 影响口 + 每 50 年一帧图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,PNG + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 34 项。
 - **可配置场(阶段A,已完成)**:`src/gen/civ/fieldPlugin.ts` 把玩家给的 `FieldSpec`(密度/源强/扩散/渗出/衰减/人口耗散/强度/图层 + 1–6 条 `influences`)变成本地 `SimPlugin`;`civ_session_open` 的 `fields`(最多 4 份)、`civ_field_catalog` 列出可接的影响口(`city.capacity`/`war.odds`/`unrest.add` 等)与示例 spec;`civ_state_get` 返回 `fields`/`layers`;玩家自己决定影响哪些数值;不给 `fields` 或强度 0 时官方指纹逐字节不变;自检 46 项。
 - **官方 .civplugin 加载器(阶段B,已完成)**:`mcp/plugin-loader.ts` 在 mcp 的 CommonJS 产物里用 QuickJS 直装官方推演插件(文件或源码目录,最多 4 个);`civ_session_open` 加 `plugins` 路径数组,插件与内置魔力场/自定义场同走 `CivParams.plugins`;summary/session.json 记插件 id,`civ_state_get.layers` 能看插件图层;非 sim 插件/坏路径/重复 id/超上限都有中文错误;自检 22 项。
+- **地块级场(阶段C,已完成)**:`FieldSpec.unit` 支持 `tile`(按世界全部 mesh 地块逐年演化);插件层 Host 支持 tile 表/图层(内存按地块、落盘按 `cell`),`fieldPlugin` 把地块值聚合成州均值后接影响口;`civ_state_get.layers` 带 `unit: "tile"`;官方 `.civplugin` 接口第 1 版不动;自检 30 项。
 
 ## 目录
 
@@ -404,6 +420,7 @@ mcp/
   selftest-magic.ts        魔力动态层自检(34 项,引擎影响/图层/回放)
   selftest-field-plugin.ts 可配置场自检(46 项,spec 校验/影响口/确定性)
   selftest-plugin-loader.ts 官方 .civplugin 加载器自检(22 项,QuickJS/会话/回放)
+  selftest-tile-field.ts   地块级场自检(30 项,按地块演化/落盘往返/回放)
   plugin-loader.ts   官方 .civplugin 加载器(CJS 里用 QuickJS wasm + simPluginsOn)
   vite-url.d.ts      mcp 构建认 Vite 的 `?url` 导入(只给类型)
   png.ts             纯 Node PNG 编码(渲染层共用)
@@ -416,7 +433,7 @@ mcp/
   .runs/             会话日志(不提交)
 ```
 
-`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。`src/gen/civ/fieldPlugin.ts` 是「可配置场」工厂:把一份玩家给的 `FieldSpec` 变成表卡 + 影响口 + 图层的原生插件,影响哪些官方数值由 spec 的 `influences` 决定。`mcp/plugin-loader.ts` 是官方 `.civplugin` 加载器:用 QuickJS 装现成插件,再交给同一个 `CivParams.plugins`,和自定义场/内置魔力场并列。`src/gen/civ/magicPlugin.ts` 是原生推演插件(表卡 + 影响口 + 图层),不依赖 QuickJS,可以直接传给 `CivParams.plugins`;`mcp/magic-render.ts` 只读它的图层画图。
+`src/gen/civ/monarch.ts` 是纯计算的君主模块(简报生成、命令编译、选国),不依赖 DOM/网络,可以被 MCP 层和将来的浏览器层共用。`src/gen/field.ts` 同样是纯计算(每地块一个值,不碰渲染),渲染在 `mcp/field-render.ts`。`src/gen/civ/fieldPlugin.ts` 是「可配置场」工厂:把一份玩家给的 `FieldSpec` 变成表卡 + 影响口 + 图层的原生插件,影响哪些官方数值由 spec 的 `influences` 决定;`unit: "tile"` 时表按世界全部地块记(阶段C),图层内存按地块、落盘按 `cell`,出手前聚合成州值。`mcp/plugin-loader.ts` 是官方 `.civplugin` 加载器:用 QuickJS 装现成插件,再交给同一个 `CivParams.plugins`,和自定义场/内置魔力场并列。`src/gen/civ/magicPlugin.ts` 是原生推演插件(表卡 + 影响口 + 图层),不依赖 QuickJS,可以直接传给 `CivParams.plugins`;`mcp/magic-render.ts` 只读它的图层画图。`src/gen/civ/engine/plugin.ts` 的 Host 现在支持 `tile` 表(要有 `PluginBridge.tiles`);`pluginLayers.ts` 的 `SimLayer.unit` 多了 `'tile'`,世界文件里仍写 `cell`。
 
 
 

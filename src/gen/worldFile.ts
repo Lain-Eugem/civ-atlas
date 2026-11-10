@@ -175,7 +175,12 @@ export async function splitSimLayers(civ: Civ): Promise<{ civ: Civ; parts: Packe
   if (civ.simLayers === undefined) return { civ, parts: [] };
   const { simLayers, ...rest } = civ;
   const parts: PackedPart[] = [];
-  for (const { by, id, ...value } of simLayers) parts.push(await packPluginLayer(by, id, value));
+  for (const l of simLayers) {
+    const { by, id, ...rest } = l;
+    // 按地块记的图层写进文件时记成 cell(世界文件里的地块层不区分是州的还是地块的)
+    const value: PluginLayerValue = rest.unit === 'tile' ? { ...rest, unit: 'cell' } : { ...rest, unit: 'region' };
+    parts.push(await packPluginLayer(by, id, value));
+  }
   return { civ: rest, parts };
 }
 
@@ -512,11 +517,12 @@ async function readLayerParts(opened: OpenedWorldFile, read: ReturnType<typeof p
       // 按地块、不跟着历史的年份不受历史长短限制(地图换了历史也还在)
       const byRegion = typeof v === 'object' && v !== null && (v as { unit?: unknown }).unit === 'region';
       validatePluginLayer(v, hist || byRegion ? sizes : { cells: sizes.cells, regions: sizes.regions }, `插件图层 ${p.name}`);
-      if (v.unit === 'region' && v.years === undefined) broken(`插件图层 ${p.name} 按州的要带年份`);
+      if (byRegion && v.years === undefined) broken(`插件图层 ${p.name} 按州的要带年份`);
       if (!hist) continue;
-      if (v.unit !== 'region') broken(`插件图层 ${p.name} 是推演插件的,要按州、带年份`);
+      // 历史里的推演插件图层:按州(带年份)或按地块(写进文件时记成 cell)
+      if (v.years === undefined) broken(`插件图层 ${p.name} 是推演插件的,要带年份`);
       const [by, id] = pluginLayerOf(p.name)!;
-      out.push({ by, id, ...v } as SimLayer);
+      out.push({ by, id, ...v, unit: byRegion ? 'region' : 'tile' } as SimLayer);
     } catch (err) {
       if (asWorldFileError(err).kind === 'memory' || (opened.options.maxBytes ?? ZIP_LOCAL_MAX_BYTES) <= ZIP_UPLOAD_MAX_BYTES) throw err;
       skipped.push(p.name);

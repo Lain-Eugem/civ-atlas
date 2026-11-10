@@ -313,7 +313,7 @@ function putPlugins(civ: Civ, plug: PluginLine<SimRead>): void {
   const lines = plug.chronicle();
   if (lines.length) civ.simChronicle = lines;
   civ.simPlugins = plug.snapshot(civ.endYear);
-  const layers = plug.layers(civ.regions.count);
+  const layers = plug.layers();
   if (layers.length) civ.simLayers = layers;
 }
 

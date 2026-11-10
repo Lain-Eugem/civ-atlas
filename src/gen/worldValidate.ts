@@ -1503,8 +1503,9 @@ function validateSimLayers(raw: unknown, sizes: LayerSizes): void {
     const l = obj(x, at);
     if (!isPluginId(l.by) || typeof l.id !== 'string' || !PLUGIN_LAYER_ID.test(l.id) || seen.has(`${l.by}.${l.id}`)) broken(`${at} 的 by、id 不合规矩`);
     seen.add(`${l.by}.${l.id}`);
-    if (l.unit !== 'region' || l.years === undefined) broken(`${at} 要按州、带年份`);
-    validatePluginLayer(l, sizes, at, ['by', 'id']);
+    if ((l.unit !== 'region' && l.unit !== 'tile') || l.years === undefined) broken(`${at} 要按州或按地块、带年份`);
+    // 内存里地块层记 'tile',世界文件那一块记 'cell';按地块的格数按 mesh 地块算
+    validatePluginLayer(l.unit === 'tile' ? { ...l, unit: 'cell' } : l, sizes, at, ['by', 'id']);
   });
 }
 

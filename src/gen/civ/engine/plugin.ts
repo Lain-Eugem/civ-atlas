@@ -98,6 +98,15 @@ export interface PluginRefused {
   why: string;
 }
 
+/** 地块那一层(按地块记的表用):地块数、邻接(CSR)、每块属于哪个州(−1 = 水) */
+export interface PluginTiles {
+  count: number;
+  adjStart: Int32Array;
+  adj: Int32Array;
+  /** 地块 → 州(−1 = 海、湖) */
+  of: Int32Array;
+}
+
 /** 交给插件的一回合 */
 export interface PluginTurn<V> {
   /** 此刻(这一刻官方的都办完了) */
@@ -143,7 +152,7 @@ export interface SimPlugin<V = unknown> {
   readonly id: string;
   /** 每隔几年出手一次(从 FREQUENCIES 里挑);不给 = 只在第 0 年和自己约的事件那一刻 */
   readonly every?: number;
-  /** 自己的数表(不能按地块) */
+  /** 自己的数表(按州;规则包给了地块的也可以按地块) */
   readonly tables?: readonly TableCard[];
   /** 自己的输入表接哪张官方表:表名 → 官方表的稳定名字(单位要一样,只能一栏) */
   readonly inputs?: Readonly<Record<string, string>>;
@@ -161,6 +170,8 @@ export interface PluginBridge<V> {
   read: V;
   /** 州的结构(插件按州记的表用) */
   regions: { count: number; adjStart: Int32Array; adj: Int32Array; seat: Int32Array };
+  /** 地块那一层(规则包给了才有;按地块记的表用它) */
+  tiles?: PluginTiles;
   /** 此刻有几国(亡了的也算)、各国的位置锚(数表里按国取随机数用) */
   polities(): { count: number; anchor: ArrayLike<number> };
   /** 官方表的单位;没有这个名字 = undefined */
@@ -289,6 +300,8 @@ class Host<V> {
   private readonly sig: number;
   private readonly eng: TableEngine | null;
   private readonly cards = new Map<string, TableCard>();
+  /** 规则包给的地块层(没有 = 按地块记的表不能用) */
+  private readonly tiles: PluginTiles | null;
   private readonly inputs: [string, string][] = [];
   private readonly ownsPolities: boolean;
   private readonly listen: ReadonlySet<string> | null;
@@ -320,6 +333,7 @@ class Host<V> {
   ) {
     const id = plugin.id;
     this.id = id;
+    this.tiles = bridge.tiles ?? null;
     const fail = (what: string): never => {
       throw new PluginError(id, what);
     };
@@ -343,7 +357,10 @@ class Host<V> {
     for (const c of cards) {
       if (c.id === OWNER_TABLE) fail(`表不能叫 ${OWNER_TABLE}`);
       if (typeof c.id !== 'string' || c.id.length > TABLE_ID_MAX) fail(`表名最长 ${TABLE_ID_MAX} 个字`);
-      if (c.unit === 'tile') fail(`表 ${c.id} 不能按地块记`);
+      if (c.unit === 'tile') {
+        if (!this.tiles) fail(`表 ${c.id} 要按地块记,这套规则没给地块`);
+        if (c.kind === 'id') fail(`表 ${c.id} 按地块记的要是数`);
+      }
       cols += colCount(c);
       this.cards.set(c.id, c);
     }
@@ -373,12 +390,13 @@ class Host<V> {
     }
     if (cards.length) {
       const r = bridge.regions;
+      const t = this.tiles;
       const all = this.ownsPolities ? [...cards, { id: OWNER_TABLE, name: OWNER_TABLE, unit: 'region', kind: 'id', min: -1, max: 2 ** 15, off: -1 } as TableCard] : cards;
       try {
         this.eng = new TableEngine({
           seed: subSeed(seed, `plugin-tables:${id}`),
           cards: all,
-          units: { region: { count: r.count, adjStart: r.adjStart, adj: r.adj, seat: r.seat } },
+          units: { region: { count: r.count, adjStart: r.adjStart, adj: r.adj, seat: r.seat }, ...(t ? { tile: { count: t.count, adjStart: t.adjStart, adj: t.adj } } : {}) },
           ...(this.ownsPolities ? { owner: OWNER_TABLE } : {}),
         });
       } catch (e) {
@@ -422,7 +440,7 @@ class Host<V> {
       for (const c of cards) {
         const cur = saved.tables[c.id]?.cur;
         const cols = colCount(c);
-        const n = c.unit === 'world' ? cols : c.unit === 'polity' ? P * cols : -1;
+        const n = c.unit === 'world' ? cols : c.unit === 'polity' ? P * cols : c.unit === 'tile' ? this.tiles!.count * cols : -1;
         if (!(cur instanceof Float64Array) || (n >= 0 ? cur.length !== n : cur.length % cols !== 0 || cur.length > this.bridge.regions.count * cols)) fail(`的表 ${c.id} 和插件的表对不上`);
       }
       try {
@@ -444,7 +462,7 @@ class Host<V> {
       const saved = mine.find((l) => l.id === run.spec.id);
       if (!saved) fail('的图层和插件的对不上');
       try {
-        run.restore(saved!, year, this.bridge.regions.count, TICKS);
+        run.restore(saved!, year, run.unit === 'tile' ? this.tiles!.count : this.bridge.regions.count, TICKS);
       } catch (e) {
         throw new PluginError(this.id, e instanceof Error ? e.message : String(e), { cause: e });
       }
@@ -480,9 +498,9 @@ class Host<V> {
     return o ? { influences: o } : {};
   }
 
-  /** 存下的图层(州补到 count 个) */
-  layerSnapshot(count: number): SimLayer[] {
-    return this.layers.map((l) => l.snapshot(this.id, count));
+  /** 存下的图层(按层的单位补到够长:州数或地块数) */
+  layerSnapshot(): SimLayer[] {
+    return this.layers.map((l) => l.snapshot(this.id, l.unit === 'tile' ? this.tiles!.count : this.bridge.regions.count));
   }
 
   /** at 以后最早要办的那一刻(没有 = Infinity) */
@@ -590,7 +608,7 @@ class Host<V> {
     const base = this.rand;
     const refused = this.refused;
     this.refused = [];
-    return {
+    const t: PluginTurn<V> = {
       year,
       tick,
       events: due.map((e) => ({ year: e.tick / TICKS, kind: e.kind, data: e.data.slice() })),
@@ -608,6 +626,9 @@ class Host<V> {
         return this.sim.influence!.view(this.slot, id, this.bridge.polities().count);
       },
     };
+    // 按地块记的表才给;不可枚举,官方 QuickJS 插件按可枚举的键打包表头,看不到它
+    if (this.tiles) Object.defineProperty(t, 'tiles', { value: { count: this.tiles.count, of: this.tiles.of }, enumerable: false });
+    return t;
   }
 
   private apply(now: number, reply: PluginReply | undefined): void {
@@ -781,9 +802,9 @@ export class PluginLine<V> {
     return this.lines.map((l) => ({ ...l }));
   }
 
-  /** 存下的图层(按插件的先后;州补到 count 个) */
-  layers(count: number): SimLayer[] {
-    return this.hosts.flatMap((h) => h.layerSnapshot(count));
+  /** 存下的图层(按插件的先后;按层的单位补到州数或地块数) */
+  layers(): SimLayer[] {
+    return this.hosts.flatMap((h) => h.layerSnapshot());
   }
 
   /** 下一处插件要办事的时刻(年;没有 = Infinity) */

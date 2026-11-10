@@ -115,7 +115,7 @@ export function layerChips(s: PluginLayers): LayerChip[] {
 export interface ShownLayer {
   key: string;
   /** 画的这一份:开着的插件交来的,没有就是存着的;带年份的是几份(画哪一份见 shownPaint) */
-  cells: CellLayer | RegionLayer | PluginLayerValue;
+  cells: CellLayer | RegionLayer | PluginLayerValue | SimLayer;
   plugin: string;
   pluginId: string;
   dev: boolean;
@@ -202,8 +202,8 @@ export function shownPaint(year: number | null = getCivTime().year): ShownPaint 
   const sim = pluginLayers.get().sim;
   if (shown.sim) return sim && simPaint(sim, shown.sim, year);
   const c = shown.cells;
-  if ('years' in c && c.years !== undefined) return storedPaint(c as Timed, year);
-  return c as CellLayer | PluginLayerValue;
+  if ('years' in c && c.years !== undefined) return storedPaint(c as unknown as Timed, year);
+  return c as unknown as CellLayer | PluginLayerValue;
 }
 
 /** 按钮亮不亮:选中的就是它,或者选中的是它这个插件、交来的正是它 */
