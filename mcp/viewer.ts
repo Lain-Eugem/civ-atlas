@@ -872,7 +872,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         timeoutMs: args.timeoutMs === undefined ? undefined : num(args, 'timeoutMs', 120000),
         probe: args.probe === true,
       });
-      sendJson(res, 200, { petty, state: stateView(s) });
+      sendJson(res, 200, { petty: petty.petty, state: stateView(s) });
       return true;
     }
 
