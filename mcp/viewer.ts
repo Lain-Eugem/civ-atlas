@@ -40,6 +40,7 @@ import {
 } from './engine';
 import { setupMonarch, monarchRound, monarchStatus, verifySession } from './monarch';
 import { dmRound, dmSetup, dmStatus } from './dm';
+import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
 import { polityName } from '../src/gen/civ/growth';
 import type { World } from '../src/gen/world';
@@ -550,6 +551,26 @@ function stateView(s: Session): Record<string, unknown> {
           };
         })
       : [],
+    // 小事件裁决层(Jev)的状态;小事会先结算,再进君主/DM 回合
+    petty: s.petty ? pettyStatus(s) : null,
+    pettyRounds: s.petty
+      ? s.petty.rounds.map((r) => {
+          const o = r as Record<string, unknown>;
+          return {
+            round: o.round,
+            year: o.year,
+            fromYear: o.fromYear,
+            toYear: o.toYear,
+            source: o.mock === true ? 'mock' : 'jev',
+            events: o.events,
+            decisions: Array.isArray(o.decisions) ? o.decisions : [],
+            commands: o.commands,
+            fallbackCount: o.fallbackCount,
+            tokens: o.tokens,
+            fingerprint: o.fingerprint,
+          };
+        })
+      : [],
     // 让前端能直接拿到君主信息(与 polities[].ruler 相同,单独列一份方便调试)
     monarchOn: !!s.monarch,
   };
@@ -833,6 +854,35 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       });
       ownerCache.delete(s.id);
       sendJson(res, 200, { dm, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/petty/setup') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const mock = args.mock !== false;
+      const petty = await pettySetup(s, {
+        mock,
+        profile: args.profile === undefined || args.profile === '' ? undefined : (String(args.profile) as 'L1' | 'L2' | 'L3'),
+        maxQuestions: args.maxQuestions === undefined ? undefined : num(args, 'maxQuestions', 8),
+        apiKey: args.apiKey === undefined || args.apiKey === '' ? undefined : String(args.apiKey),
+        baseUrl: args.baseUrl === undefined || args.baseUrl === '' ? undefined : String(args.baseUrl),
+        model: args.model === undefined || args.model === '' ? undefined : String(args.model),
+        timeoutMs: args.timeoutMs === undefined ? undefined : num(args, 'timeoutMs', 120000),
+        probe: args.probe === true,
+      });
+      sendJson(res, 200, { petty, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/petty/round') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const petty = await pettyRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
+      ownerCache.delete(s.id);
+      sendJson(res, 200, { petty, state: stateView(s) });
       return true;
     }
 

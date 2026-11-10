@@ -307,6 +307,12 @@ export type InterventionInfo = (
   | { kind: 'move'; a: string; city: string; from: number }
   | { kind: 'halt'; a: string; from: number; until?: number }
   | { kind: 'press'; a: string; b?: string; from: number; until?: number }
+  | {
+      kind: 'petty';
+      a: string;
+      from: number;
+      effect: { type: 'sack'; loss: 1 | 2 | 3; city?: string; region?: string } | { type: 'dev'; years: number };
+    }
   | { kind: 'crown'; a: string; char: number; from: number; born: number; until?: number; abdicate?: true; after?: true; keep?: true; leanings: Leanings }
   | { kind: 'keep'; a: string; from: number; until?: number }
   | { kind: 'destroy'; a: string; from: number; b?: string }

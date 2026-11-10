@@ -44,6 +44,7 @@ import {
   type LlmProviderSettings,
 } from './llm';
 import { decideDm, type DmDecisionOutcome } from './dm';
+import { pettyDigest, settlePetty, type PettySettlement } from './petty';
 import { MONARCH_SYSTEM_PROMPT, monarchUserPrompt } from './prompt';
 
 export interface MonarchRunConfig {
@@ -183,6 +184,16 @@ export interface MonarchRoundResult {
   toYear: number;
   years: number;
   decisions: MonarchDecisionRecord[];
+  /** 同一回合里由小事件裁决层结算的部分;没配置 = 不存在 */
+  petty?: {
+    source: 'mock' | 'jev';
+    events: number;
+    decisions: number;
+    commands: number;
+    fallback: number;
+    digest: string;
+    error?: string;
+  };
   /** 同一回合里由 DM 小决策(oracle)产生的那部分;没配置 DM = 不存在 */
   dm?: {
     source: DmDecisionOutcome['source'];
@@ -268,12 +279,39 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     });
   }
 
+  // 同一回合的「小事件裁决层」:先结算小事,结果作为既定事实给 DM,再和君主命令一起交给引擎
+  let petty: MonarchRoundResult['petty'] | undefined;
+  let pettySettlement: PettySettlement | undefined;
+  if (s.petty) {
+    try {
+      pettySettlement = await settlePetty(s, { years: opts.years });
+      petty = {
+        source: (s.petty.config as { mock?: boolean }).mock === true ? 'mock' : 'jev',
+        events: pettySettlement.events,
+        decisions: pettySettlement.decisions.length,
+        commands: pettySettlement.commands.length,
+        fallback: pettySettlement.fallbackCount,
+        digest: pettyDigest(pettySettlement),
+      };
+    } catch (e) {
+      petty = {
+        source: s.petty && (s.petty.config as { mock?: boolean }).mock === true ? 'mock' : 'jev',
+        events: 0,
+        decisions: 0,
+        commands: 0,
+        fallback: 0,
+        digest: '',
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
   // 同一回合的 DM 小决策(天灾/小贸易):和君主命令一起,在同一刻交给引擎
   let dm: MonarchRoundResult['dm'] | undefined;
   const dmCommands: Intervention[] = [];
   if (s.dm) {
     try {
-      const out = await decideDm(s);
+      const out = await decideDm(s, undefined, petty?.digest);
       dmCommands.push(...out.commands);
       dm = {
         source: out.source,
@@ -296,7 +334,8 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     }
   }
 
-  submitOrders(s, dmCommands.length ? [...allCommands, ...dmCommands] : allCommands);
+  const engineCommands = [...allCommands, ...(pettySettlement?.commands ?? []), ...dmCommands];
+  submitOrders(s, engineCommands);
   const turn = turnStep(s, { years: opts.years });
 
   const record: Record<string, unknown> = {
@@ -312,6 +351,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     events: turn.events,
     fingerprint: turn.fingerprint,
     briefs: briefs.map((b) => ({ polityId: b.polityId, name: b.name, text: b.text })),
+    ...(petty ? { petty } : {}),
     ...(dm ? { dm } : {}),
   };
   s.monarch!.rounds.push(record);
@@ -322,6 +362,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     fromYear: turn.fromYear,
     toYear: turn.toYear,
     decisions: decisions.map((d) => ({ polityId: d.polityId, source: d.source, commands: d.commands.length, rejected: d.rejected.length, error: d.error ?? null })),
+    ...(petty ? { petty: { source: petty.source, events: petty.events, decisions: petty.decisions, commands: petty.commands, fallback: petty.fallback, error: petty.error ?? null } } : {}),
     ...(dm ? { dm: { source: dm.source, decisions: dm.decisions.length, commands: dm.commands, error: dm.error ?? null } } : {}),
     fingerprint: turn.fingerprint,
   }) + '\n');
@@ -333,6 +374,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     toYear: turn.toYear,
     years: turn.years,
     decisions,
+    ...(petty ? { petty } : {}),
     ...(dm ? { dm } : {}),
     engineRejected: turn.rejected,
     changes: turn.polities,

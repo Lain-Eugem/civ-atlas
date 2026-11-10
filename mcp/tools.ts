@@ -20,6 +20,7 @@ import { compileMonarchOrders, MONARCH_MAX_ORDERS } from '../src/gen/civ/monarch
 import { dmPresetInfo } from '../src/gen/civ/dm';
 import { monarchBriefList, monarchRound, monarchStatus, setupMonarch, verifySession } from './monarch';
 import { dmRound, dmSetup, dmStatus } from './dm';
+import { pettyDigest, pettyRound, pettySetup, pettyStatus } from './petty';
 
 export interface ToolDef {
   name: string;
@@ -276,6 +277,58 @@ export const TOOLS: ToolDef[] = [
       required: ['sessionId'],
     },
   },
+  {
+    name: 'civ_petty_setup',
+    description:
+      '配置「小事件裁决层」:把不涉及君主战略的微观判定(天灾、小贸易、边境摩擦、民变、基建等 20 个模式)交给官方 Jev(typesafe/jev-1.14.0)按概率裁决,降低 DM 的 token 压力。需要 API Key:参数 apiKey 或环境变量 JEV_API_KEY;地址默认 https://api.defapi.org,模型默认 typesafe/jev-1.14.0。mock:true 完全离线。每回合按 P0>P1>P2 串行调用、token 预算默认硬 4250/目标 4000、失败自动退回引擎确定性规则。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        mock: { type: 'boolean', description: '不联网,用确定性 mock 答案(默认 false)' },
+        profile: {
+          type: 'string',
+          enum: ['L1', 'L2', 'L3'],
+          description: '上下文画像等级:L1 只跑 P0 战争/灾害,L2 加 P1 经济/社会,L3 再加 P2 基建(默认 L2)',
+        },
+        maxQuestions: { type: 'integer', minimum: 1, maximum: 64, description: '每批最多几个问题(默认 8)' },
+        budget: {
+          type: 'object',
+          description: '可选:覆盖 token 预算 { hardTokens, targetTokens, maxQuestions, envRatio }',
+          additionalProperties: true,
+        },
+        queue: {
+          type: 'object',
+          description: '可选:覆盖队列参数 { maxPending, roundWaitMs, failuresToTrip }',
+          additionalProperties: true,
+        },
+        apiKey: { type: 'string', description: '官方 Jev API Key;也可用环境变量 JEV_API_KEY / DEFAPI_API_KEY' },
+        baseUrl: { type: 'string', description: '默认 https://api.defapi.org;也可用环境变量 JEV_BASE_URL' },
+        model: { type: 'string', description: '默认 typesafe/jev-1.14.0;也可用环境变量 JEV_MODEL' },
+        timeoutMs: { type: 'integer', minimum: 5000, maximum: 600000, description: '单次请求超时毫秒(默认 120000)' },
+        probe: { type: 'boolean', description: '配置完发一个最小请求测连通(默认 false)' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'civ_petty_status',
+    description: '查看小事件裁决层配置(不含 Key)、已跑回合数、队列统计与上回合摘要。',
+    inputSchema: { type: 'object', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
+  },
+  {
+    name: 'civ_petty_round',
+    description:
+      '跑一个小事件回合:扫描→按 P0/P1/P2 预算打包→串行问官方 Jev(或 mock)→概率用引擎随机流派生抽签→把结果编译成引擎干预(disaster / petty)→推演 stepYears 年→写 petty-round 日志。返回结果里的 digest 字段是给 DM 的已结算摘要(不含概率/选项)。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID,
+        years: { type: 'integer', minimum: 1, maximum: 1000, description: '可选:本回合推几年(默认用会话的 stepYears)' },
+      },
+      required: ['sessionId'],
+    },
+  },
 ];
 
 function text(value: unknown): ToolResult {
@@ -407,6 +460,32 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     case 'civ_monarch_round': {
       const s = getSession(String(args.sessionId ?? ''));
       return text(await monarchRound(s, { years: optNum(args.years, 'years') }));
+    }
+    case 'civ_petty_setup': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(
+        await pettySetup(s, {
+          mock: typeof args.mock === 'boolean' ? args.mock : undefined,
+          profile: typeof args.profile === 'string' ? (args.profile as 'L1' | 'L2' | 'L3') : undefined,
+          maxQuestions: optNum(args.maxQuestions, 'maxQuestions'),
+          budget: isObject(args.budget) ? (args.budget as never) : undefined,
+          queue: isObject(args.queue) ? (args.queue as never) : undefined,
+          apiKey: typeof args.apiKey === 'string' ? args.apiKey : undefined,
+          baseUrl: typeof args.baseUrl === 'string' ? args.baseUrl : undefined,
+          model: typeof args.model === 'string' ? args.model : undefined,
+          timeoutMs: optNum(args.timeoutMs, 'timeoutMs'),
+          probe: args.probe === true,
+        }),
+      );
+    }
+    case 'civ_petty_status': {
+      const s = getSession(String(args.sessionId ?? ''));
+      return text(pettyStatus(s));
+    }
+    case 'civ_petty_round': {
+      const s = getSession(String(args.sessionId ?? ''));
+      const result = await pettyRound(s, { years: optNum(args.years, 'years') });
+      return text({ ...result, digest: pettyDigest(result) });
     }
     case 'civ_monarch_status': {
       const s = getSession(String(args.sessionId ?? ''));

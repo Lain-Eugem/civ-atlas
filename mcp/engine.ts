@@ -90,6 +90,13 @@ export interface DmState {
   rounds: Record<string, unknown>[];
 }
 
+/** 小事件裁决层在会话上的状态(配置 + 每回合日志;具体结构由 mcp/petty.ts 解释) */
+export interface PettyState {
+  /** 运行期配置(可能含 Key,只在当前进程内存;对外展示请用 mcp/petty.ts 的 pettyStatus) */
+  config: Record<string, unknown>;
+  rounds: Record<string, unknown>[];
+}
+
 export interface SessionOpenInput {
   worldId: string;
   /** 起始年(必填;第一轮从这个年份年初开始) */
@@ -136,6 +143,8 @@ export interface Session {
   monarch?: MonarchState;
   /** DM 小决策的状态(先用 civ_dm_oracle_setup 配置;天灾会真改引擎,小贸易只记叙事) */
   dm?: DmState;
+  /** 小事件裁决层的状态(先用 civ_petty_setup 配置;需要 v2 petty 干预生效) */
+  petty?: PettyState;
 }
 
 const sessions = new Map<string, Session>();

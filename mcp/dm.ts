@@ -603,8 +603,8 @@ export interface DmRoundResult {
   fingerprint: string;
 }
 
-/** 只问 DM 要决策、编译成命令;不推演(供君主回合合并用) */
-export async function decideDm(s: Session, manual?: unknown[]): Promise<DmDecisionOutcome> {
+/** 只问 DM 要决策、编译成命令;不推演(供君主回合合并用)。extra = 本回合已结算的小事件摘要。 */
+export async function decideDm(s: Session, manual?: unknown[], extra?: string): Promise<DmDecisionOutcome> {
   const cfg = dmConfigOf(s);
   if (!cfg) throw new Error('还没有配置 DM 小决策;先调用 civ_dm_oracle_setup(mock:true 可离线跑)');
   const base = buildDmContext(s, cfg.maxDecisions);
@@ -625,10 +625,11 @@ export async function decideDm(s: Session, manual?: unknown[]): Promise<DmDecisi
     reason = parsed.reason;
   } else {
     const started = Date.now();
+    const userPrompt = extra ? `${renderDmPrompt(base)}\n\n本回合已由小事件裁决层结算的小事（既定事实，不要再裁决）：\n${extra}` : renderDmPrompt(base);
     const reply = await askLlm(
       [
         { role: 'system', content: DM_SYSTEM_PROMPT },
-        { role: 'user', content: renderDmPrompt(base) },
+        { role: 'user', content: userPrompt },
       ],
       cfg.provider!,
     );

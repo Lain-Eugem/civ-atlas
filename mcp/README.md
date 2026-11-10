@@ -41,6 +41,12 @@ node mcp/.build/mcp/selftest-dm.js
 
 # DM 小决策自检(天灾/贸易编译、mock 回合、日志、回放对账)
 node mcp/.build/mcp/selftest-dm-oracle.js
+
+# 小事件裁决层核心自检(估算 token、预算打包、串行队列、超时/熔断、Jev 客户端)
+node mcp/.build/mcp/selftest-petty-core.js
+
+# 小事件裁决层端到端自检(v2 引擎效果、mock 回合、君主合流、降级、回放)
+node mcp/.build/mcp/selftest-petty-oracle.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -61,7 +67,7 @@ Claude Code(`.mcp.json` 或用户级配置)、Cursor(`mcp.json`)都类似:
 }
 ```
 
-Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能看到 14 个 `civ_*` 工具。
+Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能看到 20 个 `civ_*` 工具。
 
 ## 工具一览
 
@@ -70,7 +76,7 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | `civ_world_create` | 生成世界:`seed`(必填)+ `params`(可选:cells/landFraction/plates/…) |
 | `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules` |
 | `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹 |
-| `civ_orders_catalog` | 列出 24 种命令的字段与稳定键写法 |
+| `civ_orders_catalog` | 列出 25 种命令的字段与稳定键写法 |
 | `civ_orders_submit` | 提交本回合命令(`from` 省略即填当前年;给 `polityId` 时按该国君主口吻编译),返回被拒收的命令及原因 |
 | `civ_turn_step` | 推 `stepYears` 年(或指定 `years`),返回年份、各国增减、事件、拒收 |
 | `civ_chronicle_get` | 按年份/类型读编年史 |
@@ -83,6 +89,9 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | `civ_dm_oracle_setup` | 配置 DM 小决策:离线 `mock`,或 `baseUrl` + `model`(OpenAI 兼容)+ 可选 Key/温度/超时/每回合上限;可 `probe` 测连通 |
 | `civ_dm_oracle_status` | 看 DM 小决策状态(模式/上限/已跑回合/最近一回合;不含 Key) |
 | `civ_dm_round` | 单独跑一个 DM 回合(只做天灾/小贸易),或传 `decisions` 手动指定 |
+| `civ_petty_setup` | 配置小事件裁决层:离线 `mock`,或官方 Jev(`apiKey` 或环境变量)+ `profile`(L1/L2/L3)/`maxQuestions`/token 预算/队列参数;可 `probe` 测连通 |
+| `civ_petty_status` | 看小事件裁决层状态(模式/画像/预算/队列健康/已跑回合;不含 Key) |
+| `civ_petty_round` | 单独跑一个小事件回合:扫描 → 估算+打包 → 串行请求 → 确定性抽样 → v2 引擎生效 → 推演,返回决策与摘要 |
 | `civ_session_verify` | 回放对账:用同一世界 + 命令史重推,比较 16 位 civ 指纹与年份 |
 
 ## 君主模式(任务二)
@@ -142,6 +151,46 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 
 浏览器查看器里也有对应面板:展开「DM 小决策」→ 勾选「本局启用 DM」→(假模型就勾 mock;真模型填地址/模型)→ 点「连接 / 测试 DM」;之后「跑一回合」时 DM 小决策会随君主命令一起提交,AI 决策页会显示每条天灾/贸易。
 
+小事件裁决层也有独立面板:「小事件裁决层」→ 勾选「本局启用小事件」→ mock 演示或填官方 Jev 的 API Key(也可预先设 `JEV_API_KEY` 环境变量)→ 点「连接 / 测试 Jev」;之后跑回合时会先结算小事,再让君主/DM 决策,AI 决策页会多出「小事件裁决」块。
+
+## 小事件裁决层(官方 Jev)
+
+把「不涉及君主战略、选项有限、结果可以用概率表达」的微观判定从 DM 手里拆出来,单独交给 Jev 裁决;DM 只看结算后的既定事实,不再花 token 决定这些小事。每回合顺序:**扫描待裁决事件 → 估算 token + 打包 → 串行队列请求 Jev → 概率转确定性抽样 → v2 引擎效果落地 → 君主/DM 决策 → 一次推演**。
+
+### 配置官方 Jev
+
+- 在 defapi 控制台拿 API Key,然后三样配置:
+  - `baseUrl`:`https://api.defapi.org`(默认)
+  - `model`:`typesafe/jev-1.14.0`(默认)
+  - API Key:环境变量 `JEV_API_KEY`(也认 `DEFAPI_API_KEY`),或调用 `civ_petty_setup` 时直接传 `apiKey`;Key 只在本次进程内存里,不写日志。
+- 也可以用环境变量 `JEV_BASE_URL`、`JEV_MODEL` 覆盖前两项。
+- 第一次配好先 `probe: true` 测连通:`civ_petty_setup { "sessionId": "...", "probe": true }`。
+- 官方请求体没有 `temperature` / `top_p` 字段,温度由服务端固定;确定性靠「记录每回合概率与抽样结果 + 命令进日志 + 回放对账」保证,不靠固定客户端参数。
+- 成本按官方计价:输入 $0.084 / 百万 token(以官方文档为准);离线演示用 `mock: true`。
+
+### 用法
+
+```
+1. civ_world_create      { "seed": 7, "params": { "cells": 12000 } }
+2. civ_session_open      { "worldId": "...", "startYear": 2500, "stepYears": 5, "mode": "monarch" }
+3. civ_petty_setup       { "sessionId": "...", "mock": false, "profile": "L2", "maxQuestions": 8, "probe": true }
+4. civ_monarch_setup     { "sessionId": "...", "polities": "all", "mock": true }   # 或接真模型
+5. civ_monarch_round     { "sessionId": "...", "years": 5 }    # 自动先结算小事,再跑君主回合
+```
+
+只跑小事件层、不跑君主:`civ_petty_round { "sessionId": "...", "years": 5 }`。
+`civ_petty_status` 看模式、画像、预算、队列健康(排队/超时/熔断/平均等待)、已跑回合,返回值不含 Key。
+
+### 行为与边界
+
+- **画像**:`L1` 只开 P0(灾害/战争小事)、`L2` 再加 P1(经济/社会)、`L3` 全开(含基建);默认 L2。
+- **20 个模式**:经济 4、环境 4、军事 4、社会 4、基建 4;每个模式只出 2–4 个预定义选项,模型只在这些选项里给概率。
+- **token 预算**:默认硬上限 4250、目标 4000、环境描述约 45%、每批最多 8 个问题;超预算先丢 P1/P2,永不裁 P0;每回合日志记录估算 token、实际 usage、每级占用。
+- **严格串行**:同一时刻只有一个 Jev 请求在途;优先级 P0 > P1 > P2,同级 FIFO;P0 超时 60s、其它 30s;回合总等待 120s;排队 >40 时 P2 直接降级;连续失败 5 次熔断,下一回合开头探活一次。
+- **降级**:服务不可达/超时/格式异常时,该批小事回退引擎确定性规则,日志标 `engine-rule` 与原因,回合不会卡死。
+- **v2 引擎效果**:小事不是纯叙事——`petty` 干预会把「折损」写进城市 `sacks`(人口下滑,之后自然恢复),或「发展」委托给引擎 `boost`;道路类(修路/断路)目前只记叙事(道路是推演结束统一算的,途中没有逐条增删入口)。
+- **确定性**:概率→抽样用引擎统一随机流,种子 `petty:<事件ID>:<年份>:<国家ID>`;同一串决策重放结果逐位一致。DM 只会看到「某国某城折损一级」这类已结算摘要,看不到概率/选项/置信度/队列。
+
 ## 参数全部可自定义
 
 没有写死的「默认对局」:世界生成参数、起始年、每回合年数、回合数、结束年、引擎参数(`civParams`)、接管的君主数量、每国命令上限、模型/温度/超时都由调用方给。想固定一套配置,就由调用方每次传同样的值,或者自己包一层脚本/MCP 客户端配置。
@@ -153,7 +202,8 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 - 同一 `seed` + 同生成参数 → 逐位一致的世界(引擎本身保证)。
 - 同一世界 + 同起始年 + 同一串命令 + 同推演年数 → `fingerprint` 一致(`civ_state_get`、`civ_turn_step`、`civ_monarch_round` 都会返回 16 位指纹)。
 - 会话只把命令交给引擎,不引入随机;外部模型决策的不可复现性只体现在"下了什么命令",不在引擎内部。把每轮命令按顺序重放,结果可精确复现(`civ_session_verify` 就是干这个的)。
-- 每轮日志写在 `mcp/.runs/<sessionId>/round-XXXX.json` 与 `monarch-round-XXXX.json`,`rounds.jsonl`、`monarch-rounds.jsonl` 是精简流水。
+- 小事件裁决层的概率→抽样用引擎统一随机流(`petty:<事件ID>:<年份>:<国家ID>`),原始概率/选项/抽样结果/`engine-rule` 降级都写进 `petty-round-XXXX.json`;命令同样进命令史,回放一致。
+- 每轮日志写在 `mcp/.runs/<sessionId>/round-XXXX.json`、`monarch-round-XXXX.json` 与 `petty-round-XXXX.json`,`rounds.jsonl`、`monarch-rounds.jsonl`、`petty-rounds.jsonl` 是精简流水。
 
 ## 浏览器查看器(阶段 4)
 
@@ -183,7 +233,8 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **任务二(已完成)**:君主回合循环,新增 5 个君主工具;`mock` 与真 LLM 两条路径;回放对账。
 - **任务三(已完成)**:DM 规则预设(`tuningPatch` 写 `CivParams.knobs`,`civ_dm_preset` 查看/覆盖)+ 新增 `press` 干预(引擎自动议和 vs 君主坚持打);官方世界确定性逐位不变(21/21 对账通过)。
 - **阶段四(已完成)**:本地浏览器查看器(`mcp/viewer.ts` + `mcp/viewer/` 前端),地图/疆域/君主决策/编年史/回合日志可视化,零新依赖。
-- **DM 小决策接口(新增)**:`mcp/dm.ts` + `civ_dm_oracle_setup/status/round` 三个工具 + 查看器 DM 面板;OpenAI 兼容(OpenJEV / Ollama / LM Studio / vLLM),天灾写成 `disaster` 命令真改历史,小贸易只记叙事;命令照常进日志,回放对账仍一致。
+- **DM 小决策接口(已完成)**:`mcp/dm.ts` + `civ_dm_oracle_setup/status/round` 三个工具 + 查看器 DM 面板;OpenAI 兼容(OpenJEV / Ollama / LM Studio / vLLM),天灾写成 `disaster` 命令真改历史,小贸易只记叙事;命令照常进日志,回放对账仍一致。
+- **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**共 20 个 MCP 工具**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
 
 ## 目录
 
@@ -195,14 +246,20 @@ mcp/
   prompt.ts          君主系统提示词
   llm.ts             DeepSeek/百炼/自定义 OpenAI 兼容 + mock 决策
   dm.ts              DM 小决策(OpenAI 兼容 oracle + 天灾/小贸易编译 + 日志)
-  tools.ts           17 个 MCP 工具定义与分发
+  petty-client.ts    官方 Jev 客户端(POST /api/v1/decisions,鉴权/解析/错误映射)
+  petty-budget.ts    token 估算 + P0/P1/P2 预算打包
+  petty-queue.ts     严格串行优先队列(超时/背压/熔断/降级)
+  petty.ts           小事件裁决层编排(扫描/上下文/请求/抽签/落效果/日志/摘要)
+  tools.ts           20 个 MCP 工具定义与分发
   server.ts          JSON-RPC 2.0 over stdio(逐行串行处理)
   selftest.ts        引擎自检(31 项)
-  selftest-protocol.ts  协议自检(16 项)
+  selftest-protocol.ts  协议自检(16 项,20 工具)
   selftest-monarch.ts   君主回合自检(29 项,mock)
   selftest-press.ts     press 干预自检(16 项)
   selftest-dm.ts        DM 规则预设自检(17 项)
   selftest-dm-oracle.ts DM 小决策自检(34 项,mock)
+  selftest-petty-core.ts   小事件核心自检(57 项,不联网)
+  selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1

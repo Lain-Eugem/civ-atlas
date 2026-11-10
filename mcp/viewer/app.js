@@ -61,6 +61,13 @@
     dmMax: $('#dmMax'),
     btnDmConnect: $('#btnDmConnect'),
     dmStatusLine: $('#dmStatusLine'),
+    pettyEnable: $('#pettyEnable'),
+    pettyMock: $('#pettyMock'),
+    pettyProfile: $('#pettyProfile'),
+    pettyMax: $('#pettyMax'),
+    pettyKey: $('#pettyKey'),
+    btnPettyConnect: $('#btnPettyConnect'),
+    pettyStatusLine: $('#pettyStatusLine'),
     btnWorld: $('#btnWorld'),
     btnSession: $('#btnSession'),
     btnRound: $('#btnRound'),
@@ -410,6 +417,13 @@
           ? `DM 已连接:${dm.mode === 'mock' ? 'mock(离线)' : esc(dm.label)} · 每回合最多 ${dm.maxDecisions} 条 · 已跑 ${dm.rounds} 回合${dm.last ? ` · 上回合 ${dm.last.decisions} 条决定` : ''}`
           : 'DM 未连接。填地址和模型后点「连接 / 测试 DM」;天灾会写成引擎命令,小贸易只记叙事。';
     }
+    if (el.pettyStatusLine) {
+      const pt = st.petty;
+      el.pettyStatusLine.textContent =
+        pt && pt.configured
+          ? `小事件已连接:${pt.mock ? 'mock(离线)' : `${esc(pt.client && pt.client.baseUrl ? pt.client.baseUrl : 'Jev')} / ${esc(pt.client && pt.client.model ? pt.client.model : '')}`} · 画像 ${pt.profile} · 已跑 ${pt.rounds} 回合${pt.last ? ` · 上回合 ${pt.last.events} 件 / ${pt.last.decided} 条决定` : ''}`
+          : '未连接。官方 Jev 默认 https://api.defapi.org + typesafe/jev-1.14.0;离线演示勾 mock。';
+    }
   }
 
   function renderPolities() {
@@ -497,7 +511,7 @@
     if (!S.state || !el.tabBody) return;
     if (S.tab === 'decisions') {
       el.tabBody.innerHTML = renderDecisions();
-      el.tabNote.textContent = `${S.state.monarchRounds.length} 回合${S.state.dmRounds && S.state.dmRounds.length ? ` · DM ${S.state.dmRounds.length} 回合` : ''}`;
+      el.tabNote.textContent = `${S.state.monarchRounds.length} 回合${S.state.dmRounds && S.state.dmRounds.length ? ` · DM ${S.state.dmRounds.length} 回合` : ''}${S.state.pettyRounds && S.state.pettyRounds.length ? ` · 小事件 ${S.state.pettyRounds.length} 回合` : ''}`;
     } else if (S.tab === 'chronicle') {
       el.tabBody.innerHTML = renderChronicle();
       el.tabNote.textContent = `共 ${fmtInt(S.state.chronicleTotal)} 条,最近 ${S.state.events.length} 条`;
@@ -539,12 +553,26 @@
       </div>`;
   }
 
+  function pettyInlineHtml(pt) {
+    if (!pt) return '';
+    const err = pt.error ? `<span class="cmd-chip err">${esc(pt.error)}</span>` : '';
+    const digest = pt.digest
+      ? `<div class="dec-reason" style="margin-top:2px">${esc(String(pt.digest).slice(0, 260))}</div>`
+      : '';
+    return `
+      <div class="dm-inline petty-inline">
+        <div class="dm-inline-head"><b>小事件裁决</b><span>${esc(pt.source || '')} · ${fmtInt(pt.events || 0)} 件 · ${pt.decisions || 0} 条决定 · ${pt.commands || 0} 条引擎命令${pt.fallback ? ` · 降级 ${pt.fallback}` : ''}</span>${err}</div>
+        ${digest}
+      </div>`;
+  }
+
   function renderDecisions() {
     const st = S.state;
     const rounds = st.monarchRounds || [];
     const dmRounds = st.dmRounds || [];
-    if (!rounds.length && !dmRounds.length) {
-      return '<div class="side-empty">还没有跑过回合。点「跑一回合」,这里会列出每个君主看到了什么、为什么这么下命令;启用 DM 后还会列出天灾和小贸易。</div>';
+    const pettyRounds = st.pettyRounds || [];
+    if (!rounds.length && !dmRounds.length && !pettyRounds.length) {
+      return '<div class="side-empty">还没有跑过回合。点「跑一回合」,这里会列出每个君主看到了什么、为什么这么下命令;启用 DM 或小事件裁决层后还会列出天灾、小贸易和边境小事。</div>';
     }
     const keyNames = keyNamesOf(st);
     const royal = rounds
@@ -583,6 +611,7 @@
               <span>第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年 · ${decisions.length} 位君主 · ${cmdCount} 条命令${rejCount ? ` · 拒收 ${rejCount}` : ''}${(r.engineRejected || []).length ? ` · 引擎拒收 ${r.engineRejected.length}` : ''}</span>
             </div>
             ${items}
+            ${pettyInlineHtml(r.petty)}
             ${dmInlineHtml(r.dm, keyNames)}
           </div>`;
       })
@@ -602,7 +631,21 @@
           </div>`;
       })
       .join('');
-    return royal + dmOnly;
+    const pettyOnly = pettyRounds
+      .slice()
+      .reverse()
+      .map((r) => {
+        const decisions = Array.isArray(r.decisions) ? r.decisions : [];
+        return `
+          <div class="dec-round">
+            <div class="dec-round-head"><b>小事件第 ${r.round} 回合</b>
+              <span>第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年 · ${fmtInt(r.events || 0)} 件 · ${decisions.length} 条决定 · ${r.commands || 0} 条引擎命令${r.fallbackCount ? ` · 降级 ${r.fallbackCount}` : ''}</span>
+            </div>
+            ${pettyInlineHtml({ source: r.source, events: r.events, decisions: decisions.length, commands: r.commands, fallback: r.fallbackCount, digest: decisions.slice(0, 4).map((d) => `${d.polityName || `P${d.polityId}`}:${d.modeId}→${d.option || d.optionKey || ''}`).join('；') })}
+          </div>`;
+      })
+      .join('');
+    return royal + dmOnly + pettyOnly;
   }
 
   function renderChronicle() {
@@ -669,6 +712,7 @@
     el.btnVerify.disabled = !hasSession || S.busy;
     el.btnExport.disabled = !hasSession || S.busy;
     el.btnDmConnect.disabled = !hasSession || S.busy;
+    el.btnPettyConnect.disabled = !hasSession || S.busy;
     el.btnAuto.textContent = S.autoOn ? '暂停自动播放' : '自动播放';
     el.btnAuto.classList.toggle('playing', S.autoOn);
   }
@@ -738,6 +782,14 @@
           await connectDm(true);
         } catch (e) {
           toast(`DM 小决策未连接(不影响君主):${e instanceof Error ? e.message : String(e)}`, true);
+        }
+      }
+      if (el.pettyEnable.checked) {
+        try {
+          setBusy(true, '正在连接小事件裁决层…', el.pettyMock.checked ? 'mock 模式,不联网' : '官方 Jev;Key 只在服务端内存。');
+          await connectPetty(true);
+        } catch (e) {
+          toast(`小事件裁决层未连接(不影响君主/DM):${e instanceof Error ? e.message : String(e)}`, true);
         }
       }
       const king = setup.setup.monarchs.length;
@@ -826,6 +878,27 @@
     }
   }
 
+  async function connectPetty(silent = false) {
+    if (!S.sessionId) return;
+    const mock = el.pettyMock.checked;
+    const d = await api('/api/petty/setup', {
+      sessionId: S.sessionId,
+      mock,
+      profile: el.pettyProfile.value,
+      maxQuestions: int(el.pettyMax, 8),
+      apiKey: mock ? '' : el.pettyKey.value,
+      probe: !mock,
+    });
+    if (d && d.state) await applyState(d.state);
+    if (!silent) {
+      toast(
+        mock
+          ? '小事件裁决层已连接(mock):每回合先结算小事,再让君主/DM 决策'
+          : `小事件裁决层已连接:${d && d.petty && d.petty.client ? `${d.petty.client.baseUrl} / ${d.petty.client.model}` : '官方 Jev'}`,
+      );
+    }
+  }
+
   async function verifySession() {
     if (!S.sessionId) return;
     try {
@@ -886,6 +959,21 @@
       })();
     });
 
+    el.btnPettyConnect.addEventListener('click', () => {
+      void (async () => {
+        try {
+          setBusy(true, el.pettyMock.checked ? '正在连接小事件裁决层(mock)…' : '正在测试官方 Jev 连接…', '只裁决小事;Key 只在服务端内存。');
+          await connectPetty(false);
+          setHint('小事件裁决层已接上:跑一回合时,会先结算小事,再让君主/DM 决策。');
+        } catch (e) {
+          toast(`连接小事件裁决层失败:${e instanceof Error ? e.message : String(e)}`, true);
+        } finally {
+          setBusy(false);
+          refreshButtons();
+        }
+      })();
+    });
+
     el.tabs.addEventListener('click', (e) => {
       const btn = e.target.closest('.tab');
       if (!btn) return;
@@ -910,6 +998,10 @@
       el.dmKey.disabled = el.dmMock.checked;
     });
 
+    el.pettyMock.addEventListener('change', () => {
+      el.pettyKey.disabled = el.pettyMock.checked;
+    });
+
     window.addEventListener('resize', () => resizeCanvas());
     if (window.ResizeObserver && el.mapWrap) {
       new ResizeObserver(() => resizeCanvas()).observe(el.mapWrap);
@@ -921,6 +1013,7 @@
     el.dmBaseUrl.disabled = el.dmMock.checked;
     el.dmModel.disabled = el.dmMock.checked;
     el.dmKey.disabled = el.dmMock.checked;
+    el.pettyKey.disabled = el.pettyMock.checked;
   }
 
   bind();

@@ -87,6 +87,7 @@ import { LOOK_K, quantize, type CivSim } from './engine/sim';
 import { addPolity, bookOf, endPolity, foundCity, moveCapital, polityModelOf, reopen, respread, rulerAct, rulerOf, setPolicy, type PolityModel } from './polities';
 import { IV_NOT_HIM, IV_PEOPLE, IV_PROTECTED, IV_WAIT, crownOf, reignBorn } from './rulers';
 import { strikeDisaster } from './disaster';
+import { strikePetty, type PettyIv } from './pettyEngine';
 import { segAt } from './policy';
 import { bestCapital, polityBorders, warModelOf, type War } from './wars';
 import { politicsModelOf } from './politics';
@@ -109,6 +110,7 @@ import { civApi } from './api';
 type Ally = Extract<Intervention, { kind: 'ally' }>;
 type Halt = Extract<Intervention, { kind: 'halt' }>;
 type Press = Extract<Intervention, { kind: 'press' }>;
+type Petty = PettyIv;
 type Cede = Extract<Intervention, { kind: 'cede' }>;
 type Found = Extract<Intervention, { kind: 'found' }>;
 type Move = Extract<Intervention, { kind: 'move' }>;
@@ -750,6 +752,11 @@ export function installInterventions(sim: CivSim, iv: InterventionModel): void {
     if (v.kind === 'boost') {
       // 推一把发展:快几倍登记(发展度每一步照着乘)/ 直接进下一个时代(boost.ts;史事 intervene 也在那里记)
       strikeBoost(sim, iv, v, i, a, t);
+      return;
+    }
+    if (v.kind === 'petty') {
+      // 小事件裁决层(v2):sack 记城市折损 / dev 委托 boost(pettyEngine.ts)
+      strikePetty(sim, iv, v, i, a, t);
       return;
     }
     if (v.kind === 'treaty' || v.kind === 'neutral') {

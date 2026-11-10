@@ -593,3 +593,7 @@ details.llm-row[open] summary { margin-bottom: 10px; }
 }
 .dm-inline-head span { color: var(--muted); font-size: 11px; }
 .dm-inline .dec-item { grid-template-columns: 10px 96px minmax(0, 1fr); }
+
+/* 小事件裁决层(Jev) */
+.petty-inline { border-top-color: rgba(79, 209, 197, 0.28); }
+.petty-inline .dm-inline-head b { color: #4fd1c5; }

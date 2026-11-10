@@ -82,6 +82,27 @@
       </div>
     </details>
 
+    <details class="llm-row" id="pettyRow">
+      <summary>小事件裁决层 <span class="muted">(官方 Jev / mock:天灾、边境、民生小事;先结算小事,再让君主决策)</span></summary>
+      <div class="control-row">
+        <label class="field check"><input id="pettyEnable" type="checkbox"><span>本局启用小事件</span></label>
+        <label class="field check"><input id="pettyMock" type="checkbox" checked><span>mock 裁决(不联网)</span></label>
+        <label class="field"><span>画像</span>
+          <select id="pettyProfile">
+            <option value="L1">L1(只 P0)</option>
+            <option value="L2" selected>L2(P0+P1)</option>
+            <option value="L3">L3(全开)</option>
+          </select>
+        </label>
+        <label class="field"><span>每批最多问题</span><input id="pettyMax" type="number" value="8" min="1" max="16" step="1"></label>
+        <label class="field grow"><span>API Key(可留空;也可用 JEV_API_KEY)</span><input id="pettyKey" type="password" placeholder="官方 Jev 需要" autocomplete="off"></label>
+      </div>
+      <div class="control-row">
+        <button id="btnPettyConnect" class="btn" disabled>连接 / 测试 Jev</button>
+        <span class="hint grow" id="pettyStatusLine">未连接。官方 Jev 默认 https://api.defapi.org + typesafe/jev-1.14.0;离线演示勾 mock。</span>
+      </div>
+    </details>
+
     <div class="control-row actions">
       <button id="btnWorld" class="btn">① 创建世界</button>
       <button id="btnSession" class="btn" disabled>② 开始会话</button>

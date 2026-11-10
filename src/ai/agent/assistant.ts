@@ -273,6 +273,7 @@ const IV_WORD: Record<Intervention['kind'], string> = {
   unity: '禁止分裂',
   halt: '禁止扩张',
   press: '坚持打',
+  petty: '小事件',
   ally: '结盟',
   declare: '宣战',
   move: '迁都',

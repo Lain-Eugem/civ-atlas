@@ -738,6 +738,7 @@ export type InterventionKind =
   | 'move'
   | 'halt'
   | 'press'
+  | 'petty'
   | 'crown'
   | 'policy'
   | 'destroy'
@@ -846,6 +847,16 @@ export const POLICY_PICK_MAX = 3;
  * 顺着引出来的(只有方针)再多一个 guide = true:编年史不写,国家卡片上的方针不算它;只有它能带 power、unrest(国力、动荡加减)。
  * author = 记在哪位作者人物名下(只有 AUTHOR_IV_KINDS 那几种;推演不看它,见文件头);plugin = 哪个推演插件下的(见文件头)
  */
+/**
+ * 小事件裁决层(v2)落的两种真实效果：
+ *   - sack：某座城记一次折损(人口/发展都会按既有机制慢慢恢复)；
+ *   - dev：委托引擎的 boost 推一把发展。
+ * 只由 petty 干预携带；不写进作者的手动干预面板。
+ */
+export type PettyIvEffect =
+  | { type: 'sack'; loss: 1 | 2 | 3; city?: string; region?: string }
+  | { type: 'dev'; years: number };
+
 export type Intervention = (
   | { kind: 'protect'; a: string; from: number; until?: number }
   | { kind: 'ally'; a: string; b: string; from: number; until?: number }
@@ -856,6 +867,7 @@ export type Intervention = (
   | { kind: 'move'; a: string; city: string; from: number }
   | { kind: 'halt'; a: string; from: number; until?: number }
   | { kind: 'press'; a: string; b?: string; from: number; until?: number }
+  | { kind: 'petty'; a: string; from: number; effect: PettyIvEffect }
   | { kind: 'crown'; a: string; char: number; from: number; born: number; until?: number; abdicate?: true; after?: true; keep?: true; leanings: RulerLeanings }
   | { kind: 'keep'; a: string; from: number; until?: number }
   | { kind: 'destroy'; a: string; from: number; b?: string }
@@ -1967,7 +1979,7 @@ function folkRenamed(civ: Civ, f: Faith, cultures: readonly Culture[]): string |
 /** 干预年份的上限(推演引擎能预约的最远时刻) */
 export const INTERVENTION_YEAR_MAX = 65535;
 
-export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
+export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'petty', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
 
 /** 人物键的几段(格式见 personKey):国家键、身份、生成时的名字、生年(取整)、同名同年的第几个(0 起);格式不对 = null */
 export interface PersonKeyParts {
@@ -2325,6 +2337,22 @@ export function tidyIntervention(x: unknown): Intervention | null {
       if (b === undefined) return null;
       const base = b === null ? { kind, a, from } : { kind, a, b, from };
       v = until !== null ? { ...base, until } : base;
+    } else if (kind === 'petty') {
+      const e = o.effect;
+      if (!e || typeof e !== 'object') return null;
+      const ef = e as Record<string, unknown>;
+      if (ef.type === 'sack') {
+        const loss = ef.loss;
+        if (loss !== 1 && loss !== 2 && loss !== 3) return null;
+        const city = ef.city === undefined ? undefined : isCityKey(ef.city) ? ef.city : null;
+        const region = ef.region === undefined ? undefined : isRegionKey(ef.region) ? ef.region : null;
+        if (city === null || region === null || (city === undefined) === (region === undefined)) return null;
+        v = city !== undefined ? { kind, a, from, effect: { type: 'sack', loss, city } } : { kind, a, from, effect: { type: 'sack', loss, region: region! } };
+      } else if (ef.type === 'dev') {
+        const raw = ef.years === undefined ? 1 : ef.years;
+        if (typeof raw !== 'number' || !Number.isFinite(raw)) return null;
+        v = { kind, a, from, effect: { type: 'dev', years: Math.min(20, Math.max(1, Math.round(raw))) } };
+      } else return null;
     } else if (kind === 'cede') {
       if (!isRegionKey(o.region)) return null;
       v = o.permanent === true ? { kind, a, region: o.region, from, permanent: true } : { kind, a, region: o.region, from };

@@ -310,6 +310,8 @@ function ivText(civ: Civ, v: Intervention, i: number, a: string | undefined): st
       return `${A}:禁止扩张${v.until !== undefined ? `(至第 ${v.until} 年)` : ''}`;
     case 'press':
       return `${A}:坚持打${v.b !== undefined ? `，只管与${keyName(civ, v.b, v.from)}的仗` : ''}${v.until !== undefined ? `(至第 ${v.until} 年)` : ''}`;
+    case 'petty':
+      return `${A}:小事件(${v.effect.type === 'dev' ? `发展 ${v.effect.years} 年` : `折损 ${v.effect.loss} 级`})`;
     case 'keep':
       // "大澜王朝保住王室，一直有效" / "……，到 1560 年"
       return `${A}保住王室，${v.until !== undefined ? `到${spaced(yearAt(v.until, getEdits().era))}` : '一直有效'}`;

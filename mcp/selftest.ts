@@ -81,7 +81,7 @@ function main(): void {
 
   // --- 命令目录 ---
   const cat = catalog() as unknown as CatalogShape;
-  ok(cat.kinds.length === 24, '命令目录列出 24 种干预', cat.kinds.length);
+  ok(cat.kinds.length === 25, '命令目录列出 25 种干预', cat.kinds.length);
   ok(cat.keyHelp.includes('polity:'), '键格式说明可读');
 
   // --- 交命令 ---
