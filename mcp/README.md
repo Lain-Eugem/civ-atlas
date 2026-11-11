@@ -5,7 +5,7 @@
 - 生成世界(纯计算,不联网)
 - 把世界推到任意起始年并停住
 - 读当前回合的完整状态(国家、君主、州数、国都、编年史)
-- 提交外部命令(26 种干预:宣战/结盟/国策/迁都/天灾/立约/坚持打/小事件/故事事件……)
+- 提交外部命令(27 种干预:宣战/结盟/国策/迁都/天灾/立约/坚持打/渗透/小事件/故事事件……)
 - 单步或多年推演,返回各国增减与本回合大事
 - **君主模式**:每回合暂停,给每个在世国家发局势简报,并发调用外部 LLM(或 mock)当君主,把决策编译成引擎命令,再统一推演一回合
 - **DM 规则预设**(可选):降低引擎自动开战/自动议和/自动分裂的强度,把历史更多交给外部君主
@@ -62,6 +62,12 @@ node mcp/.build/mcp/selftest-plugin-loader.js
 
 # 地块级场自检(按 mesh 地块逐年演化 + 落盘 cell 层往返;强度 0 = 官方指纹)
 node mcp/.build/mcp/selftest-tile-field.js
+
+# 瓦片自带海岸线自检(合成蒙版 + 真实瓦片的线是否贴着自己的水陆边界,和 1 倍那份对比)
+node mcp/.build/mcp/selftest-coast.js
+
+# 君主沙盒四功能自检(角色卡确定性、记忆上限、分层提示词不含年份、高影响命令审核、intel 进命令史与回放、plan/commit、双开关组合)
+node mcp/.build/mcp/selftest-monarch-sandbox.js
 ```
 
 构建产物在 `mcp/.build/`(已加进 `.git/info/exclude`,不进版本库)。`.runs/` 里是每次会话的日志。
@@ -91,7 +97,7 @@ Windows 下路径用正斜杠或双反斜杠都行。启动后客户端应该能
 | `civ_world_create` | 生成世界:`seed`(必填)+ `params`(可选:cells/landFraction/plates/…) |
 | `civ_session_open` | 开会话:`worldId` + `startYear`(必填)+ `stepYears`/`maxRounds`/`endYear`/`mode`(`auto`\|`monarch`)/`civParams`/`dmPreset`/`dmRules`/`magicField`/`fields`(最多 4 份自定义场,可带 `unit: "tile"` 按地块记)/`plugins`(最多 4 个官方 .civplugin 路径) |
 | `civ_state_get` | 读当前状态:年份、在世国家(编号/国名/州数/国都/君主/稳定键)、已下命令、指纹、`fields` 与 `layers`(含按地块图层) |
-| `civ_orders_catalog` | 列出 26 种命令的字段与稳定键写法 |
+| `civ_orders_catalog` | 列出 27 种命令的字段与稳定键写法 |
 | `civ_field_catalog` | 列出自定义场能接的影响口(按州/按政治体)、强度档位与一份示例 spec(含按地块场的写法) |
 | `civ_orders_submit` | 提交本回合命令(`from` 省略即填当前年;给 `polityId` 时按该国君主口吻编译),返回被拒收的命令及原因 |
 | `civ_turn_step` | 推 `stepYears` 年(或指定 `years`),返回年份、各国增减、事件、拒收 |
@@ -262,6 +268,46 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 - **v2 引擎效果**:小事不是纯叙事——`petty` 干预会把「折损」写进城市 `sacks`(人口下滑,之后自然恢复),或「发展」委托给引擎 `boost`;道路类(修路/断路)目前只记叙事(道路是推演结束统一算的,途中没有逐条增删入口)。
 - **确定性**:概率→抽样用引擎统一随机流,种子 `petty:<事件ID>:<年份>:<国家ID>`;同一串决策重放结果逐位一致。DM 只会看到「某国某城折损一级」这类已结算摘要,看不到概率/选项/置信度/队列。
 
+## 君主沙盒四功能(界面)
+
+这四项都在监视台里,不新增 MCP 工具(仍是 21 个);关掉时引擎指纹与改造前逐字节一致。
+
+### 1. 首次引导(两把 Key)
+
+第一次打开 `/sandbox/` 会弹引导浮层,分别填 **LLM 扮演**(服务商 / 地址 / 模型 / Key)与 **Jev 判断**(Key,地址与模型可留默认)。
+- 决定:**Key 落盘本机**。存在 `localStorage['civSandbox.config.v1']`,只 POST 给 `127.0.0.1` 的监视台进程;不写会话日志、不进导出。公用电脑点「稍后配置」即用 mock。
+- 引导只在没存过配置时出现;之后可在顶栏「参数」里改。
+
+### 2. 双开关(LLM 扮演 / Jev 判断)
+
+两个开关互相独立,四种组合都合法:
+
+| LLM | Jev | 走哪条路 |
+|---|---|---|
+| 开 | 关 | `monarchPlan → monarchCommit`:简报 → LLM → 编译 → 一次推演;审核用确定性规则 |
+| 关 | 开 | `pettyRound`:扫小事 → Jev → 落效果 → 推演;国家行为按引擎规则 |
+| 开 | 开 | 君主回合内先结算小事,高影响命令过 Jev 审核,再统一推演 |
+| 关 | 关 | `turnStep`:纯引擎推演 |
+
+`civ_session_open` 的 `features` 字段(引擎门面)与查看器 `/api/session` 的 `features` 一一对应。
+
+### 3. 君主角色卡 + 独立记忆 + 高影响命令审核
+
+- **角色卡**(`src/gen/civ/monarchCard.ts`):从引擎君主的倾向确定性映射出性格(谨慎/野心/荣誉/贪欲)、偏好、能力档位,persona 明确写"会老、会怕、会记仇的人,不是国家意志"。换君主(`rulerAt` 变人)时自动重建,旧记忆保留并记一笔"继位"。
+- **记忆库**(`monarchMemory.ts`):战败/亡国/饥荒/背盟等从编年史自动派生;君主也能在决策 JSON 里用 `remember:[{text,weight}]` 自己写(每回合 ≤2 条、每条 ≤60 字、总上限 16,按权重淘汰)。记忆**只进提示词**,不进引擎。
+- **审核**(`mcp/monarch-audit.ts`):只有高影响命令(宣战/坚持打/灭国/割地)交给 Jev;`choice{fit,stretch,beyond}` 的概率按阈值落成 **放行 / 降级 / 退回**(宣战→守成,坚持打→停止扩张)。Jev 不可达时整批退回确定性规则,绝不阻塞回合。其余命令由玩家/DM 在复核界面勾选决定。
+- **复核**:打开「玩家 / DM 复核」后,「跑一回合」只出方案(`/api/monarch/plan`,不推演),在「本回合方案」里取消勾选即否决,再 `/api/monarch/commit` 落地。否决记录写进 `rejectedByReview`,回放仍一致。
+- **改卡**:君主标签页里可直接改 persona 并保存(`/api/monarch/card`),只影响提示词与审核。
+
+### 4. 分层提示词 + 逐州属性 + 渗透情报
+
+- **分层**(`mcp/prompt.ts`):system = 身份硬约束 + 角色卡 + 世界口径 + 命令契约(不含年份,逐字节稳定);user = 记忆 + 本年局势 + 逐州表 + 他国情报。年份只在 user,前缀缓存可命中;回合日志记 `promptTokens / cachedTokens`。
+- **逐州表**(`monarchIntel.ts`):人口(`regionPopulationAt`)、控制档位(`controlAt`)、生产能力(`developmentAt`)是真值;产粮能力、逐州税收(按人口从国家账本分摊)、稳定度(控制档位 − 近 20 年战乱灾荒)是推算,结构里带 `derived` 标记、提示词写"估"。按人口取 top-10 州 + 其余汇总,控制 token。
+- **渗透**:君主可下 `{"kind":"intel","b":国家编号,"focus":"all|pop|stability|tax"}`。它是**第 27 种干预**,进命令史;`result`(none/partial/full/blown)由 Jev 概率 + 引擎随机流确定性抽签写进命令本身,回放逐位一致。full 含税收,partial 只有人口与稳定,blown 后 5 年不能再探。
+- **遮蔽**:没探过的国家在提示词里只有公开州数;情报超过 10 年标"陈旧"。情报状态存在会话的 `s.intel`,不进引擎。
+
+自检:`node mcp/.build/mcp/selftest-monarch-sandbox.js`(45 项:卡确定性、记忆上限、分层 system 不含年份、规则审核、intel 进命令史与回放、plan/commit、双开关三组合)。
+
 ## 自定义场(原型:计算层 / 渲染层分开)
 
 这个原型回答一个具体问题:能不能给地图加「自己带生成公式、能影响数值」的场(魔脉浓度、矿产、辐射)?当前版本先把**计算和显示彻底分开**:
@@ -385,7 +431,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹),同样可收起。
 - 左侧行动栏:创建世界 → 开始会话 → 跑一回合 → 自动播放,以及回放对账、导出会话;这三块都是浮在地图上的玻璃卡片,地图始终露在中间。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/vectors?worldId=`(海岸线 / 波纹 / 符号 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 ### 地形渲染:复用主站的管线
 
@@ -401,11 +447,22 @@ node mcp/.build/mcp/viewer.js --port 5190
 
 - **分辨率**:底图是 1 倍主图,够缩小时用;放大后前端按 √2 分档请求 `/api/map/tile`,服务端只铺视口那几块,按当前倍数重新栅格化 + 上色。手绘风的窗口像素层会重算全局场,低频颜色和整图不同,所以 `alignColors()` 按 32 × 32 小格把颜色拉回整张底图,只留下现算出来的高频细节 —— 不然拼起来会有方块色差。
   `currentLod()` 的门槛是 `k × dpr > 1.8` 且最小档为 2 倍:**高分屏上 100% 视图不再启用低档瓦片**。之前 1.41 倍档被启用时,它和整图底图拼在一起会出现水平细线和矩形色块(缩小后尤其明显);现在 100% 一律只用整张底图。
+  **换档不再整片发糊**:`drawHiTiles()` 按倍率升序把缓存里已有的低层块先画一遍,当前层最后画 —— 新层一块都没到时,看到的是只差 √2 倍的上一层被放大,而不是 1 倍底图被放大 4~9 倍。倍率不同的块在世界平面上是对齐的,贴图位置按 `k / lod` 换算、交给 `drawImage` 重采样即可。能盖满视口的最低一层以下的层会被跳过(`levelComplete()`),加载完成后每帧只画当前层,不会因为多画几层拖慢拖动。
+  **瓦片长期缓存**:底图与瓦片响应带 `cache-control: public, max-age=31536000, immutable`(世界不可变,同 key 永远同一张图),前端 URL 上加 `v=MAP_VER`。改了地形 / 上色算法要把 `mcp/viewer/app.js` 里的 `MAP_VER` 加一,否则老浏览器会一直用磁盘里的旧图。实测同一块第二次请求 `transferSize = 0`(命中磁盘缓存,<1ms),刷新页面、来回切倍率都不再走网络,服务端那 192 块的上限也就不会被重复请求挤掉。
 - **矢量层**:`/api/map/vectors` 返回抽稀过的海岸线、湖岸线、三圈近岸波纹和 3.3k 个地形符号(约 1.3 MB,每个世界只算一次并缓存)。服务端用 `cleanInk()` 把像素层里的墨线 / 波纹 / 冰缘墨线抹掉(照主站 `fantasyBaseClean` 的顺序),浏览器再用 Canvas 按**固定屏幕线宽 1–1.15px** 重画:墨线不随倍率变粗、波纹不会被拉成粗带、符号按 `g.z` 分级出现且尺寸按 `glyphScale(k)` 收缩。低倍率用抽稀版线,放大到 2.5 倍以上换成精细版(`tol=0.12`),否则折角会被放大成多边形。
+  **海岸 / 湖岸线跟着瓦片走**(`mcp/coast-trace.ts`):上面那份是在 1 倍底图(2048 × 1024)上追一次就固定的,而瓦片是按当前倍率重新栅格化的 —— 两边的水陆边界差 1 个底图像素,放大到 400% 就是 3~4 个屏幕像素,线会"浮"在海岸外面(实测偏差 mean 2.9 / p90 6.6 / max 11.4 瓦片像素)。现在 `renderTile()` 顺手把这块自己的水陆图走一遍 marching squares,接成折线(Douglas–Peucker 抽稀 0.25 瓦片像素,点数砍一半)随 `/api/map/coast` 发给前端,前端按瓦片的贴图尺寸缩放后画在瓦片矩形内 —— 实测偏差 0.5 瓦片像素(就是边界像素本身的量化下限)。全局那份只用来补瓦片还没到的空白:前端把瓦片矩形做成 `Path2D` 用 `evenodd` 裁掉;当前层铺满视口时(`S.tileFull`)整份都不画。
   前端按**每一小段线段**做视口裁剪(不是整条折线的包围盒:长海岸线横跨整幅地图时,整条 bbox 判断会漏画局部,出现"一半有描边一半没有"),并且每 3000 段 `stroke()` 一次,避免上万段塞进同一个路径时后半段丢失。跨 180° 经线的海岸线坐标会伸出左右边界(`fantasyCoastLines` 里 3 条线就占了近一半点数),前端照主站 `chunkPath` / `wrapShifts` 的做法,对 `x1 > W` 的线在另一侧补一份 `x − W`、对 `x0 < 0` 的补 `x + W`,贴着边界的符号同样补一份 —— 否则那段海岸只在某一份平铺副本里出现,把地图拖到屏幕边缘时就整段消失,移回中间又出现。换档时 `S.tileSeq++` 让上一档没发完的瓦片请求作废,避免不同倍数混在一起。矢量接口取不到(监视台进程还是旧代码)时会明确弹提示让用户重启,因为此时位图墨线已被服务端抹掉。
+- **窗口起点必须是整数**(`src/gen/rasterWindow.ts`):`renderTile` 的起点是 `(x − pad) % W`,而 `W = 底图宽 × S`(S 取 √2 的整数半次幂)不是整数,会算出 `3067.999999999999`。`coverWindow` 用 `cosLat[py]` / `cosLon[px]` 按下标取,带小数的下标直接取到 `undefined`,三角形内测试全部落空、整段被静默跳过 —— 表现为瓦片上一条几十像素高、完全没铺地形的横带(水陆图退化成"陆地"),前端就会在那里画出一条笔直的海岸线,而且只在大倍率下显眼。现在行列区间往外取整到整数(整数起点时结果逐位不变,主站不受影响),`selftest-coast` 里钉了这条用例:小数起点不得有整行漏铺、瓦片里不得有整行发黑。
+- **拖动 / 缩放的流畅度**:Canvas2D 的瓶颈是填充率,高 DPI 大窗口一帧要铺 700 万像素,再乘上好几层(底图 + 瓦片 + 场 + 矢量)。现在做了五件事:
+  1. **合帧**:`requestDraw()` 把拖动 / 滚轮事件合并到 `requestAnimationFrame`,一帧最多画一次(以前每个 pointermove 都同步重绘,事件一密就排队卡死)。
+  2. **海岸线连着描**:连续可见的线段共用一个 `moveTo` + 一串 `lineTo`,线帽改成 `butt`。以前每段单独 `moveTo` 再配圆头线帽,等于给一万多段各画两个圆 —— dpr2 / 1920 宽下**单帧 400ms 以上**,改完掉到 20ms 级。
+  3. **符号整帧两条路径**:所有可见符号合成两条 `Path2D`(实心三角 + 线条),整帧只调一次 `fill` + 一次 `stroke`,不再是每个符号 2~4 次。
+  4. **瓦片盖满就不画底图**:高倍率下把 2048 宽的整图放大到几万像素、再被瓦片完全盖住,纯属白填。
+  5. **交互时降分辨率**:画布按"最多铺 320 万像素"反推一个系数(`S.rs`),拖动 / 滚轮时降到 0.5~1(1920 宽的 dpr2 约 0.65),手停 220ms 后恢复满分辨率重画一次。dpr1 的小窗口不触发。
+  实测(Playwright + 无头 Chromium,SwiftShader 软件光栅,1920×1000):dpr1 两档缩放都是 11ms/帧;dpr2 从 **493ms/帧降到 44ms**(100%)、**66ms 降到 22ms**(338%)。
 - **跨极**:`/api/map/tile` 的 `(x, y)` 是球面展开坐标,可以出上下边。`n = floor(y / H)` 为奇数时(越过一次极点),按 `(x − W/2, (n+1)H − y)` 取源窗口、渲染结果上下翻回来;这是球面在极点的真实接法,和 main 的地球仪跨极一致。前端底图、疆域 / 场图层、国都标注用同一套变换逐层平铺。
 - **构建补丁**:`src/render/labels/fonts.ts` 里有一句 Vite 专属的 `import.meta.env.BASE_URL`,CommonJS 产物里是语法错误。`mcp/build-compat.cjs` 在每次构建后把产物里的它换成 `'./'`(不改上游源码);`mcp/build.ps1` 和 `scripts/lib/sandboxViewer.ts` 都会调用。因此 tsc 会报那两条 TS1343/TS2339,但产物完整,构建脚本以「关键产物在不在」判成败。
-- 首次生成底图约 2–3 秒(世界生成另算),放大后高清块会在几秒内逐块变清晰;瓦片缓存在服务端(最多 192 块)和浏览器里,拖动时按世界坐标复用。
+- 首次生成底图约 2–3 秒(世界生成另算),放大后高清块会在几秒内逐块变清晰(实测单块冷渲染 300–900ms、一屏 6–12 块);瓦片缓存在服务端(最多 192 块)、浏览器 `S.tiles`(最多 160 块)和浏览器磁盘缓存里,拖动与切档都按世界坐标复用。
 
 注意:查看器进程内的世界/会话表是内存里的,关掉进程就没了;日志仍写在 `mcp/.runs/`。查看器不改变引擎的确定性,只是把同一套 `mcp/engine.ts` / `mcp/monarch.ts` 搬到 HTTP 后面。
 
@@ -417,7 +474,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **阶段四(已完成)**:本地浏览器查看器(`mcp/viewer.ts` + `mcp/viewer/` 前端),地图/疆域/君主决策/编年史/回合日志可视化,零新依赖。
 - **DM 小决策接口(已完成)**:`mcp/dm.ts` + `civ_dm_oracle_setup/status/round` 三个工具 + 查看器 DM 面板;OpenAI 兼容(OpenJEV / Ollama / LM Studio / vLLM),天灾写成 `disaster` 命令真改历史,小贸易只记叙事;命令照常进日志,回放对账仍一致。
 - **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**MCP 工具增至 20 个(现在 21)**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
-- **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录 26 种、查看器标成「故事事件」。
+- **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录随后增到 27 种(新增 `intel`)、查看器标成「故事事件」。
 - **自定义场原型(已完成)**:`src/gen/field.ts`(计算层,魔脉/矿产/辐射三种、逐字节确定、FNV-1a hash)+ `mcp/field-render.ts`(渲染层,色带/拉伸/等高线/辉光/浮雕/透明度,只读数值)+ `mcp/png.ts` + 查看器「自定义场」面板与 `/api/field/*`;计算与渲染彻底分开,改样式不再重算;自检 43 项。
 - **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/rural/magic 三张表 + `city.capacity` 影响口 + 每 50 年一帧图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,PNG + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 34 项。
 - **可配置场(阶段A,已完成)**:`src/gen/civ/fieldPlugin.ts` 把玩家给的 `FieldSpec`(密度/源强/扩散/渗出/衰减/人口耗散/强度/图层 + 1–6 条 `influences`)变成本地 `SimPlugin`;`civ_session_open` 的 `fields`(最多 4 份)、`civ_field_catalog` 列出可接的影响口(`city.capacity`/`war.odds`/`unrest.add` 等)与示例 spec;`civ_state_get` 返回 `fields`/`layers`;玩家自己决定影响哪些数值;不给 `fields` 或强度 0 时官方指纹逐字节不变;自检 46 项。

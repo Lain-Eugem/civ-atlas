@@ -766,6 +766,14 @@ export function installInterventions(sim: CivSim, iv: InterventionModel): void {
       strikePetty(sim, iv, v, i, a, t);
       return;
     }
+    if (v.kind === 'intel') {
+      // 渗透他国:只记一笔史事(谁派人摸谁的底),不改归属、不改数值;
+      // 拿到哪几样在命令的 result/focus 里(edits.ts),由编排层(Jev 判定 + 确定性抽签)写上,回放逐位一致
+      const b = iv.resolve(v.b);
+      const sid = capitalAt(pm.polities[a], t);
+      sim.record('intervene', { a, b, region: S[sid]?.region ?? -1, settlement: sid, war: i });
+      return;
+    }
     if (v.kind === 'treaty' || v.kind === 'neutral') {
       // 立约、划中立地:照立约的规矩办(treaties.ts 的 decree;史事 intervene 也在那里记)
       treatyModelOf(sim)?.decree?.(v, i, a, t, iv);

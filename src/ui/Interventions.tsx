@@ -314,6 +314,8 @@ function ivText(civ: Civ, v: Intervention, i: number, a: string | undefined): st
       return `${A}:禁止扩张${v.until !== undefined ? `(至第 ${v.until} 年)` : ''}`;
     case 'press':
       return `${A}:坚持打${v.b !== undefined ? `，只管与${keyName(civ, v.b, v.from)}的仗` : ''}${v.until !== undefined ? `(至第 ${v.until} 年)` : ''}`;
+    case 'intel':
+      return `${A}:派人渗透${keyName(civ, v.b, v.from)}${v.result ? `(结果:${v.result})` : ''}`;
     case 'petty':
       return `${A}:小事件(${v.effect.type === 'dev' ? `发展 ${v.effect.years} 年` : `折损 ${v.effect.loss} 级`})`;
     case 'keep':

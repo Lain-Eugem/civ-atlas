@@ -25,11 +25,21 @@
     cw: 800,
     ch: 480,
     dpr: 1,
+    /** 交互时的分辨率系数(1 = 满分辨率);见 interactiveScale */
+    rs: 1,
+    /** 画布实际的设备像素比 = dpr × rs */
+    rdpr: 1,
     view: { k: 1, x: 0, y: 0 },
     draw: { k: 1, ox: 0, oy: 0, P: 1, H: 1 },
     // 地形画法 + 放大后现算的高清瓦片(坐标锚在世界展开平面,不是屏幕,所以拖动时缓存照样命中)
     style: 'fantasy',
     tiles: new Map(),
+    // 每块瓦片自带的海岸线(key 与 tiles 同):瓦片内坐标的 Path2D,跟着贴图一起缩放
+    tileLines: new Map(),
+    // 本帧画了自带海岸线的瓦片在屏幕上的矩形,用来把全局那份(1 倍底图追的)裁掉
+    tileCover: [],
+    /** 当前层的瓦片已经铺满视口(此时全局海岸线整份都不用画) */
+    tileFull: false,
     tilePending: new Set(),
     tileTimer: 0,
     tileSeq: 0,
@@ -43,6 +53,8 @@
     autoOn: false,
     busy: false,
     tab: 'decisions',
+    /** 复核模式下待提交的回合方案(mcp/monarch.ts 的 MonarchPlan) */
+    plan: null,
     toastTimer: 0,
     field: { on: false, img: null, data: null, legend: null, kind: 'magic' },
     magic: { on: false, img: null, data: null, legend: null, meta: null, year: null },
@@ -145,6 +157,27 @@
     tabs: $('#tabs'),
     tabBody: $('#tabBody'),
     tabNote: $('#tabNote'),
+    featLlm: $('#featLlm'),
+    featJev: $('#featJev'),
+    reviewMode: $('#reviewMode'),
+    reviewPanel: $('#reviewPanel'),
+    reviewBody: $('#reviewBody'),
+    reviewSub: $('#reviewSub'),
+    btnReviewCommit: $('#btnReviewCommit'),
+    btnReviewCancel: $('#btnReviewCancel'),
+    onboard: $('#onboard'),
+    obProvider: $('#obProvider'),
+    obBaseUrl: $('#obBaseUrl'),
+    obModel: $('#obModel'),
+    obKey: $('#obKey'),
+    obJevKey: $('#obJevKey'),
+    obJevBase: $('#obJevBase'),
+    obJevModel: $('#obJevModel'),
+    obMock: $('#obMock'),
+    obLlmState: $('#obLlmState'),
+    obJevState: $('#obJevState'),
+    btnOnboardSave: $('#btnOnboardSave'),
+    btnOnboardSkip: $('#btnOnboardSkip'),
     toast: $('#toast'),
     busy: $('#busy'),
     busyTitle: $('#busyTitle'),
@@ -152,6 +185,108 @@
   };
 
   const ctx = el.map ? el.map.getContext('2d') : null;
+
+  /* ------------------------------------------------------------------ *
+   * 本机配置(两把 Key 落盘在 localStorage;只发给 127.0.0.1 的监视台)
+   * ------------------------------------------------------------------ */
+
+  const CFG_KEY = 'civSandbox.config.v1';
+
+  function loadCfg() {
+    try {
+      return JSON.parse(localStorage.getItem(CFG_KEY) || '{}') || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveCfg(cfg) {
+    try {
+      localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+    } catch {
+      /* 隐私模式下写不进去:本次仍可用,只是下次要重填 */
+    }
+  }
+
+  /** 把存下的配置灌进参数栏与引导浮层(参数栏是实际提交用的那一份) */
+  function applyCfg(cfg) {
+    if (!cfg) return;
+    const llm = cfg.llm || {};
+    if (el.provider && llm.provider) el.provider.value = llm.provider;
+    if (el.baseUrl) el.baseUrl.value = llm.baseUrl || '';
+    if (el.model) el.model.value = llm.model || '';
+    if (el.apiKey) el.apiKey.value = llm.apiKey || '';
+    const jev = cfg.jev || {};
+    if (el.pettyKey) el.pettyKey.value = jev.apiKey || '';
+    if (el.obProvider && llm.provider) el.obProvider.value = llm.provider;
+    if (el.obBaseUrl) el.obBaseUrl.value = llm.baseUrl || '';
+    if (el.obModel) el.obModel.value = llm.model || '';
+    if (el.obKey) el.obKey.value = llm.apiKey || '';
+    if (el.obJevKey) el.obJevKey.value = jev.apiKey || '';
+    if (el.obJevBase) el.obJevBase.value = jev.baseUrl || '';
+    if (el.obJevModel) el.obJevModel.value = jev.model || '';
+    if (cfg.features) {
+      if (el.featLlm) el.featLlm.checked = cfg.features.llm !== false;
+      if (el.featJev) el.featJev.checked = !!cfg.features.jev;
+    }
+    if (el.reviewMode && cfg.review !== undefined) el.reviewMode.checked = !!cfg.review;
+    if (el.mock && cfg.mock !== undefined) el.mock.checked = !!cfg.mock;
+  }
+
+  /** 当前参数栏里的配置(保存用) */
+  function cfgFromForm() {
+    return {
+      llm: {
+        provider: el.provider ? el.provider.value : 'deepseek',
+        baseUrl: el.baseUrl ? el.baseUrl.value.trim() : '',
+        model: el.model ? el.model.value.trim() : '',
+        apiKey: el.apiKey ? el.apiKey.value : '',
+      },
+      jev: {
+        apiKey: el.pettyKey ? el.pettyKey.value : '',
+        baseUrl: el.obJevBase ? el.obJevBase.value.trim() : '',
+        model: el.obJevModel ? el.obJevModel.value.trim() : '',
+      },
+      features: {
+        llm: el.featLlm ? el.featLlm.checked : true,
+        jev: el.featJev ? el.featJev.checked : false,
+      },
+      review: el.reviewMode ? el.reviewMode.checked : false,
+      mock: el.mock ? el.mock.checked : false,
+      onboarded: true,
+    };
+  }
+
+  /** 引导浮层里的值 → 参数栏(再一起存) */
+  function applyOnboardToForm() {
+    if (el.obProvider && el.provider) el.provider.value = el.obProvider.value;
+    if (el.obBaseUrl && el.baseUrl) el.baseUrl.value = el.obBaseUrl.value.trim();
+    if (el.obModel && el.model) el.model.value = el.obModel.value.trim();
+    if (el.obKey && el.apiKey) el.apiKey.value = el.obKey.value;
+    if (el.obJevKey && el.pettyKey) el.pettyKey.value = el.obJevKey.value;
+  }
+
+  function onboardState() {
+    const llmKey = el.obKey ? el.obKey.value.trim() : '';
+    const jevKey = el.obJevKey ? el.obJevKey.value.trim() : '';
+    if (el.obLlmState) el.obLlmState.textContent = llmKey ? '已填(只存在这台机器)' : '没填:只能先勾 mock 离线演示';
+    if (el.obJevState) el.obJevState.textContent = jevKey ? '已填(只存在这台机器)' : '没填:审核与渗透会退回确定性规则';
+  }
+
+  function showOnboard() {
+    if (!el.onboard) return;
+    if (el.obProvider && el.provider) el.obProvider.value = el.provider.value;
+    if (el.obBaseUrl && el.baseUrl) el.obBaseUrl.value = el.baseUrl.value;
+    if (el.obModel && el.model) el.obModel.value = el.model.value;
+    if (el.obKey && el.apiKey) el.obKey.value = el.apiKey.value;
+    if (el.obJevKey && el.pettyKey) el.obJevKey.value = el.pettyKey.value;
+    el.onboard.hidden = false;
+    onboardState();
+  }
+
+  function hideOnboard() {
+    if (el.onboard) el.onboard.hidden = true;
+  }
 
   /* ------------------------------------------------------------------ *
    * 通用小工具
@@ -283,10 +418,46 @@
     S.cw = Math.max(240, Math.round(rect.width));
     S.ch = Math.max(180, Math.round(rect.height));
     S.dpr = Math.min(2, window.devicePixelRatio || 1);
-    el.map.width = Math.round(S.cw * S.dpr);
-    el.map.height = Math.round(S.ch * S.dpr);
+    // 交互(拖动 / 滚轮)时把画布分辨率降下来:Canvas2D 的瓶颈是填充率,
+    // 高 DPI 大窗口一帧要铺 700 万像素,降一半就是少 4 倍工作量。
+    // 手一停就恢复满分辨率重画一次(见 endInteractive)。
+    S.rdpr = S.dpr * S.rs;
+    el.map.width = Math.round(S.cw * S.rdpr);
+    el.map.height = Math.round(S.ch * S.rdpr);
     normalizeView();
     draw();
+  }
+
+  /**
+   * 拖 / 缩放时降到多少分辨率:按"交互时最多铺 320 万像素"反推。
+   * dpr1 的小窗口本来就不超,不降;dpr2 的 1920 宽大概降到 0.65。
+   */
+  function interactiveScale() {
+    const px = S.cw * S.ch * S.dpr * S.dpr;
+    if (px <= 3.2e6) return 1;
+    return Math.max(0.5, Math.round(Math.sqrt(3.2e6 / px) * 100) / 100);
+  }
+
+  let idleTimer = 0;
+  function beginInteractive() {
+    if (S.rs !== 1) {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(endInteractive, 220);
+      return;
+    }
+    const rs = interactiveScale();
+    if (rs === 1) return;
+    S.rs = rs;
+    resizeCanvas();
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(endInteractive, 220);
+  }
+
+  function endInteractive() {
+    clearTimeout(idleTimer);
+    if (S.rs === 1) return;
+    S.rs = 1;
+    resizeCanvas();
   }
 
   // 纵向不再夹住:世界是球面,越过极点会接到另一侧。只把累积的位移折回偶数层
@@ -321,10 +492,32 @@
     return { k, P, H, ox, oxAbs, oyAbs };
   }
 
+  /**
+   * 把重绘合并到下一帧:拖动 / 滚轮一秒钟能来上百个事件,每个都同步重绘一次会把
+   * 主线程和渲染队列一起塞满(实测 dpr2 的 1920×1000 下单帧就要几十毫秒)。
+   * 这里保证一帧最多画一次,事件只更新状态。
+   */
+  let drawTicket = 0;
+  function requestDraw() {
+    if (drawTicket) return;
+    drawTicket = requestAnimationFrame(() => {
+      drawTicket = 0;
+      draw();
+    });
+  }
+
+  /** 当前层的瓦片是否已经铺满视口(铺满了就不必再画 1 倍底图和全局海岸线) */
+  function tilesCoverView() {
+    if (!S.lod || !S.tiles.size) return false;
+    const g = tileGridAt(S.lod);
+    return !!g && g.step >= 4 && levelComplete(g);
+  }
+
   function draw() {
     if (!el.map || !ctx) return;
-    const { cw, ch, dpr } = S;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { cw, ch } = S;
+    const rdpr = S.rdpr || S.dpr;
+    ctx.setTransform(rdpr, 0, 0, rdpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
     if (!S.baseImg) {
       updateZoomLabel();
@@ -353,12 +546,16 @@
       }
     }
     // 每层先铺底图,再把现算的高清瓦片盖在底图上,最后才叠场 / 魔力 / 疆域,
-    // 这样国家颜色不会被地形盖掉。
-    for (const r of rects) {
-      ctx.save();
-      if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
-      ctx.drawImage(S.baseImg, r.x, r.yTop, P, H);
-      ctx.restore();
+    // 这样国家颜色不会被地形盖掉。瓦片已经铺满视口时整张底图都不用画:
+    // 高倍率下把 2048 宽的图放大到几万像素再被瓦片完全盖住,纯粹是白fill。
+    const baseCovered = tilesCoverView();
+    if (!baseCovered) {
+      for (const r of rects) {
+        ctx.save();
+        if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
+        ctx.drawImage(S.baseImg, r.x, r.yTop, P, H);
+        ctx.restore();
+      }
     }
     const nextLod = currentLod();
     if (nextLod !== S.lod) S.tileSeq++;  // 换档时让上一档还没发完的请求作废(缓存留着,来回缩放还能用)
@@ -390,6 +587,12 @@
    * ------------------------------------------------------------------ */
   const TILE = 512;
   const LOD_MAX = 16;
+  /**
+   * 底图 / 瓦片 URL 的版本号。服务端把它们标成 immutable 让浏览器长期缓存,
+   * 所以只要改了地形或上色的算法,这里就要 +1,否则老浏览器会一直用旧图。
+   */
+  // 改地形 / 上色算法时 +1:瓦片和底图都是 immutable 缓存,不换 URL 老浏览器会一直用旧图
+  const MAP_VER = 3;
 
   function currentLod() {
     const kd = fitScale() * S.view.k * S.dpr;
@@ -403,6 +606,8 @@
 
   function clearTiles() {
     S.tiles.clear();
+    S.tileLines.clear();
+    S.tileCover.length = 0;
     S.tilePending.clear();
     S.tileSeq++;
     S.tileRetry = 0;
@@ -416,14 +621,14 @@
     S.tileTimer = setTimeout(() => { S.tileTimer = 0; void loadHiTiles(); }, 180);
   }
 
-  /** 当前视口需要哪些块,以及每块贴在屏幕哪里 */
-  function tileGrid() {
-    if (!S.lod || !S.baseImg || !S.worldId) return null;
+  /** 某一层里,视口需要哪些块,以及每块贴在屏幕哪里 */
+  function tileGridAt(lod) {
+    if (!lod || !S.baseImg || !S.worldId) return null;
     const { k, oxAbs, oyAbs } = viewMetrics();
-    const f = S.lod / k;
-    const step = TILE * k / S.lod;
+    const f = lod / k;
+    const step = TILE * k / lod;
     return {
-      lod: S.lod, step, oxAbs, oyAbs,
+      lod, step, oxAbs, oyAbs,
       i0: Math.floor((-oxAbs * f) / TILE),
       i1: Math.floor(((S.cw - oxAbs) * f) / TILE),
       j0: Math.floor((-oyAbs * f) / TILE),
@@ -431,16 +636,108 @@
     };
   }
 
-  function drawHiTiles() {
-    const g = tileGrid();
-    if (!g) return;
+  function tileGrid() {
+    return tileGridAt(S.lod);
+  }
+
+  /** 缓存里已经有哪几层(升序)。每帧扫一遍键,一百来个,可以忽略不计 */
+  function cachedLods() {
+    const set = new Set();
+    for (const key of S.tiles.keys()) {
+      const lod = Number(key.slice(0, key.indexOf('|')));
+      if (Number.isFinite(lod) && lod > 0) set.add(lod);
+    }
+    return [...set].sort((a, b) => a - b);
+  }
+
+  /** 这一层的可见块是不是齐了 */
+  function levelComplete(g) {
     for (let j = g.j0; j <= g.j1; j++) {
-      for (let i = g.i0; i <= g.i1; i++) {
-        const img = S.tiles.get(`${g.lod}|${i}|${j}`);
-        if (!img) continue;
-        ctx.drawImage(img, g.oxAbs + i * g.step, g.oyAbs + j * g.step, g.step + 0.6, g.step + 0.6);
+      for (let i = g.i0; i <= g.i1; i++) if (!S.tiles.has(`${g.lod}|${i}|${j}`)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * 从低倍率往高倍率叠画,当前层最后画。
+   *
+   * 换档(√2 一档)时新层一块都没有,以前只能露 1 倍底图被放大 3~5 倍、整片发糊;
+   * 现在缺块的地方由上一层(只差 √2 倍)顶着,补上再替换,观感上不会"先糊一下"。
+   * 倍率不同的块在世界平面上是对齐的,所以贴图位置按 k / lod 换算即可,
+   * 源图会被 drawImage 按目标尺寸重采样,不需要额外裁切。
+   *
+   * 能盖满视口的最低一层以下的层全被挡住,直接跳过,避免每帧多画几十张。
+   *
+   * 海岸 / 湖岸线跟着各自的瓦片一起画(见 drawTileCoast):全局那份是在 1 倍底图上
+   * 追的,放大后会和瓦片的水陆边界差一两个屏幕像素,所以有瓦片覆盖的地方不用它。
+   */
+  function drawHiTiles() {
+    S.tileCover.length = 0;
+    S.tileFull = false;
+    if (!S.lod || !S.tiles.size) return;
+    const lods = cachedLods().filter((lod) => lod <= S.lod);
+    if (!lods.length) return;
+    let from = 0;
+    for (let n = 0; n < lods.length; n++) {
+      const g = tileGridAt(lods[n]);
+      if (!g || g.step < 4) continue;
+      if (levelComplete(g)) {
+        from = n;
+        if (lods[n] === S.lod) S.tileFull = true;   // 当前层齐了,全局那份海岸线整份都不用画
       }
     }
+    for (let n = from; n < lods.length; n++) {
+      const g = tileGridAt(lods[n]);
+      if (!g || g.step < 4) continue;
+      for (let j = g.j0; j <= g.j1; j++) {
+        for (let i = g.i0; i <= g.i1; i++) {
+          const key = `${g.lod}|${i}|${j}`;
+          const img = S.tiles.get(key);
+          if (!img) continue;
+          const x = g.oxAbs + i * g.step;
+          const y = g.oyAbs + j * g.step;
+          ctx.drawImage(img, x, y, g.step + 0.6, g.step + 0.6);
+          if (drawTileCoast(key, x, y, g.step + 0.6)) S.tileCover.push({ x, y, w: g.step + 0.6, h: g.step + 0.6 });
+        }
+      }
+    }
+  }
+
+  /** 把服务端给的折线(瓦片内坐标)编成 Path2D,每块只编一次 */
+  function coastPathOf(json) {
+    const mk = (lines) => {
+      const p = new Path2D();
+      if (!Array.isArray(lines)) return p;
+      for (const line of lines) {
+        if (!Array.isArray(line) || line.length < 4) continue;
+        p.moveTo(line[0], line[1]);
+        for (let i = 2; i + 1 < line.length; i += 2) p.lineTo(line[i], line[i + 1]);
+      }
+      return p;
+    };
+    return { coast: mk(json && json.sea), lake: mk(json && json.lake) };
+  }
+
+  /** 一块瓦片自带的海岸 / 湖岸线:坐标是瓦片内像素,按贴图尺寸放大即可 */
+  function drawTileCoast(key, x, y, size) {
+    const lines = S.tileLines.get(key);
+    if (!lines) return false;
+    const m = size / TILE;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(m, m);
+    // 裁在本块矩形内:相邻两块在接缝处会各自画到对方一点,不裁就会在那条线上叠成双倍深
+    ctx.beginPath();
+    ctx.rect(0, 0, TILE, TILE);
+    ctx.clip();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(58,45,34,0.86)';
+    ctx.lineWidth = 1.15 / m;
+    ctx.stroke(lines.coast);
+    if (lines.lake) ctx.stroke(lines.lake);
+    ctx.restore();
+    return true;
   }
 
   async function loadHiTiles() {
@@ -465,19 +762,30 @@
     const stale = () => seq !== S.tileSeq || S.style !== style || S.lod !== g.lod;
     const one = async (w) => {
       if (stale()) { S.tilePending.delete(w.key); return; }
-      const url = `/api/map/tile?worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(style)}`
-        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}`;
+      const qs = `worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(style)}`
+        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}&v=${MAP_VER}`;
       try {
-        const r = await fetch(url);
+        // 图和这一块自己的海岸线一起要:线是按这块的倍率追的,和这块的地形严丝合缝
+        const [r, rc] = await Promise.all([
+          fetch(`/api/map/tile?${qs}`),
+          fetch(`/api/map/coast?${qs}`).catch(() => null),
+        ]);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const img = await createImageBitmap(await r.blob());
+        let lines = null;
+        if (rc && rc.ok) {
+          try { lines = coastPathOf(await rc.json()); } catch (_) { lines = null; }
+        }
         if (stale()) return;
         S.tiles.set(w.key, img);
-        if (S.tiles.size > 160) {
+        if (lines) S.tileLines.set(w.key, lines);
+        while (S.tiles.size > 160) {
           const first = S.tiles.keys().next().value;
-          if (first) S.tiles.delete(first);
+          if (first === undefined) break;
+          S.tiles.delete(first);
+          S.tileLines.delete(first);
         }
-        draw();
+        requestDraw();
       } catch (_) {
         // 单块失败(代理超时等)就继续用拉伸的底图,晚点再试一次,不打断对局
         if (!stale() && S.tileRetry < 3) {
@@ -535,56 +843,45 @@
       });
   }
 
-  function drawGlyph(g, x, y, unit) {
+  /**
+   * 一个地形符号的几何,塞进两条 Path2D:fill(山的实心三角)和 stroke(其余线条)。
+   * 以前这里直接 ctx.fill()/stroke(),每个符号 2~4 次调用;三千多个符号时一帧要
+   * 上万次 canvas 调用,光驱动开销就够呛。现在整帧只调两次。
+   */
+  function glyphInto(g, x, y, unit, fillPath, linePath) {
     const kind = g[2];
     // 后几级(放大后才出现)的符号画小一点:像主站那样一级一级补细节,而不是一起撑成大三角
     const tier = 1 / (1 + Math.log2(Math.max(1, g[7])) * 0.55);
     const s = clamp(g[3] * unit * tier, 2.5, 24);
     const w = s * (0.75 + g[6] * 0.12);
-    ctx.lineWidth = clamp(s * 0.085, 0.8, 1.5);
-    ctx.strokeStyle = 'rgba(58,45,34,0.78)';
-    ctx.fillStyle = 'rgba(238,228,201,0.82)';
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.beginPath();
     if (kind === 0 || kind === 7) {          // 山 / 火山
-      ctx.moveTo(x - w, y);
-      ctx.lineTo(x - w * 0.12, y - s * 0.9);
-      ctx.lineTo(x + w, y);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(x - w * 0.12, y - s * 0.9);
-      ctx.lineTo(x + w * 0.16, y - s * 0.45);
-      ctx.lineTo(x + w * 0.38, y);
-      ctx.stroke();
+      fillPath.moveTo(x - w, y);
+      fillPath.lineTo(x - w * 0.12, y - s * 0.9);
+      fillPath.lineTo(x + w, y);
+      fillPath.closePath();
+      linePath.moveTo(x - w * 0.12, y - s * 0.9);
+      linePath.lineTo(x + w * 0.16, y - s * 0.45);
+      linePath.lineTo(x + w * 0.38, y);
       if (kind === 7) {
-        ctx.beginPath();
-        ctx.moveTo(x - w * 0.12, y - s * 0.9);
-        ctx.quadraticCurveTo(x + w * 0.1, y - s * 1.3, x, y - s * 1.55);
-        ctx.stroke();
+        linePath.moveTo(x - w * 0.12, y - s * 0.9);
+        linePath.quadraticCurveTo(x + w * 0.1, y - s * 1.3, x, y - s * 1.55);
       }
     } else if (kind === 1) {                 // 丘陵
-      ctx.moveTo(x - s * 0.7, y);
-      ctx.quadraticCurveTo(x, y - s * 0.85, x + s * 0.7, y);
-      ctx.stroke();
+      linePath.moveTo(x - s * 0.7, y);
+      linePath.quadraticCurveTo(x, y - s * 0.85, x + s * 0.7, y);
     } else if (kind === 5) {                 // 沙丘
-      ctx.moveTo(x - s * 0.6, y);
-      ctx.quadraticCurveTo(x - s * 0.1, y - s * 0.45, x + s * 0.6, y);
-      ctx.stroke();
+      linePath.moveTo(x - s * 0.6, y);
+      linePath.quadraticCurveTo(x - s * 0.1, y - s * 0.45, x + s * 0.6, y);
     } else if (kind === 6) {                 // 草丛
       for (let i = -1; i <= 1; i++) {
-        ctx.moveTo(x + i * s * 0.18, y);
-        ctx.lineTo(x + i * s * 0.18 + s * 0.12, y - s * 0.5);
+        linePath.moveTo(x + i * s * 0.18, y);
+        linePath.lineTo(x + i * s * 0.18 + s * 0.12, y - s * 0.5);
       }
-      ctx.stroke();
     } else {                                 // 沼泽
-      ctx.moveTo(x - s * 0.5, y);
-      ctx.lineTo(x + s * 0.5, y);
-      ctx.moveTo(x - s * 0.35, y - s * 0.22);
-      ctx.lineTo(x + s * 0.2, y - s * 0.22);
-      ctx.stroke();
+      linePath.moveTo(x - s * 0.5, y);
+      linePath.lineTo(x + s * 0.5, y);
+      linePath.moveTo(x - s * 0.35, y - s * 0.22);
+      linePath.lineTo(x + s * 0.2, y - s * 0.22);
     }
   }
 
@@ -608,6 +905,11 @@
       const fy = (py) => (r.odd ? r.yTop + H - py * sy : r.yTop + py * sy);
       // 逐线段裁剪,而不是整条折线的包围盒:长海岸线可能横跨整幅地图,用整条线的
       // bbox 判断会漏画局部;一次塞进超长路径描边也可能丢后半段。每 3000 段 flush 一次。
+      //
+      // 关键:连续可见的线段要连着画(一个 moveTo + 一串 lineTo),不能每段都 moveTo。
+      // 每段单独成一条子路径、再配上圆头线帽,等于给一万多段各画两个圆 —— dpr2 的
+      // 1920×1000 画布上光是这一项就要 400ms,拖动直接卡死。改成折线 + 平头线帽后
+      // 子路径从一万多降到几百条,渲染时间掉一个数量级(观感不变:转折处仍是圆角连接)。
       const strokeLines = (lists, color, lw) => {
         ctx.strokeStyle = color;
         ctx.lineWidth = lw;
@@ -620,15 +922,16 @@
             // 否则那段海岸只在"某一份平铺副本"里出现,拖到屏幕边缘就没了(主站 chunkPath / wrapShifts 同款)。
             const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
             for (const sh of shifts) {
+              let pen = false;    // 上一段还连着,可以省掉 moveTo
               for (let i = 0; i + 3 < p.length; i += 2) {
                 const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
                 const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
-                if (!Number.isFinite(x0 + y0 + x1 + y1)) continue;
+                if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
                 if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
-                  || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) continue;
-                ctx.moveTo(x0, y0);
+                  || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
+                if (!pen) { ctx.moveTo(x0, y0); pen = true; }
                 ctx.lineTo(x1, y1);
-                if (++seg >= 3000) { ctx.stroke(); ctx.beginPath(); seg = 0; }
+                if (++seg >= 3000) { ctx.stroke(); ctx.beginPath(); pen = false; seg = 0; }
               }
             }
           }
@@ -637,10 +940,23 @@
       };
       ctx.save();
       ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
+      ctx.lineCap = 'butt';
       strokeLines(ripples, 'rgba(58,45,34,0.17)', 1);
-      strokeLines([lake, coast], 'rgba(58,45,34,0.86)', 1.15);
+      // 有瓦片覆盖的地方用瓦片自带的那份线(它是按当前倍率追的,才和这块地形对齐);
+      // 全局这份是在 1 倍底图上追的,放大后会和海岸差一两个像素,只在没瓦片的空白处补。
+      if (!S.tileFull) {
+        if (S.tileCover.length) {
+          const cover = new Path2D();
+          cover.rect(-20, -20, cw + 40, ch + 40);
+          for (const t of S.tileCover) cover.rect(t.x, t.y, t.w, t.h);
+          ctx.clip(cover, 'evenodd');
+        }
+        strokeLines([lake, coast], 'rgba(58,45,34,0.86)', 1.15);
+      }
       ctx.restore();
+      // 符号:整帧只合成两条路径(实心三角 + 线条),最后各调一次 fill / stroke
+      const gFill = new Path2D();
+      const gLine = new Path2D();
       for (const g of v.glyphs) {
         if (g[7] > relK + 0.01) continue;   // z:放大后逐级出现更多符号
         const gy = r.odd ? r.yTop + H - g[1] * sy : r.yTop + g[1] * sy;
@@ -650,9 +966,16 @@
         for (const sh of shifts) {
           const gx = r.x + (g[0] + sh) * sx;   // 位置跟着地图,不跟着符号缩放
           if (gx < -24 || gx > cw + 24) continue;
-          drawGlyph(g, gx, gy, unit);
+          glyphInto(g, gx, gy, unit, gFill, gLine);
         }
       }
+      ctx.fillStyle = 'rgba(238,228,201,0.82)';
+      ctx.fill(gFill);
+      ctx.lineWidth = 0.85;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(58,45,34,0.78)';
+      ctx.stroke(gLine);
     }
   }
 
@@ -695,9 +1018,9 @@
 
   /** 屏幕点 → 主图上的 (mx, my)。跨极层按 draw() 用的同一套镜像 / 半圈偏移反算。 */
   function mapPointAt(x, y) {
-    const { k, ox, oy } = S.draw;
-    const ux = wrapX((x - ox) / k);
-    const vy = (y - oy) / k;
+    const { k, oxAbs, oyAbs } = viewMetrics();
+    const ux = wrapX((x - oxAbs) / k);
+    const vy = (y - oyAbs) / k;
     const n = Math.floor(vy / S.mapH);
     const odd = ((n % 2) + 2) % 2 === 1;
     const mx = odd ? wrapX(ux - S.mapW / 2) : ux;
@@ -721,25 +1044,24 @@
   // 以 (px, py) 为中心缩放(px/py 是画布内坐标);横向回环时锚点照样对得上
   function zoomAt(factor, px, py) {
     if (!S.baseImg) return;
-    const fit = fitScale();
-    const k0 = fit * S.view.k;
-    const { oxAbs, oy } = S.draw;
+    beginInteractive();
+    const { k: k0, oxAbs, oyAbs } = viewMetrics();
     const wx = (px - oxAbs) / k0;
-    const wy = (py - oy) / k0;
+    const wy = (py - oyAbs) / k0;
     const next = clamp(S.view.k * factor, 1, 12);
     if (Math.abs(next - S.view.k) < 1e-4) return;
     S.view.k = next;
-    const k2 = fit * next;
+    const k2 = fitScale() * next;
     S.view.x = px - wx * k2 - (S.cw - S.mapW * k2) / 2;
     S.view.y = py - wy * k2 - (S.ch - S.mapH * k2) / 2;
     normalizeView();
-    draw();
+    requestDraw();
   }
 
   function resetView() {
     S.view = { k: 1, x: 0, y: 0 };
     normalizeView();
-    draw();
+    requestDraw();
   }
 
   // 浮窗的开关:参数抽屉、面板收起、缩放按钮
@@ -798,7 +1120,8 @@
       S.view.x = drag.ox + dx;
       S.view.y = drag.oy + dy;
       normalizeView();
-      draw();
+      beginInteractive();
+      requestDraw();
     });
     el.map.addEventListener('pointerup', (e) => {
       if (!drag) return;
@@ -831,7 +1154,7 @@
     el.mapLoadingText.textContent = '地图绘制中…';
     el.mapEmpty.classList.add('hidden');
     try {
-      const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(S.style)}`);
+      const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(S.style)}&v=${MAP_VER}`);
       if (!r.ok) {
         let msg = `HTTP ${r.status}`;
         try { msg = (await r.json()).error || msg; } catch (_) { /* ignore */ }
@@ -1288,8 +1611,56 @@
       '<span class="legend-item"><span class="legend-swatch" style="background:#2e4a66"></span>海洋</span>';
   }
 
+  /** 君主标签页:角色卡 + 独立记忆 + 情报(选中哪个国家就看哪个) */
+  function renderCrown() {
+    const st = S.state;
+    const p = (st.polities || []).find((x) => x.id === S.sel);
+    if (!p) return '<div class="side-empty">先在右侧选一个国家。</div>';
+    const card = (st.cards || []).find((c) => c.polityId === p.id);
+    if (!card) return `<div class="side-empty">${esc(p.name)} 还没有角色卡。跑一次「跑一回合」或「本回合方案」后,君主卡会在这里出现。</div>`;
+    const t = card.traits || {};
+    const c = card.competence || {};
+    const pref = card.preferences || {};
+    const cell = (k, v) => `<div class="crown-cell"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`;
+    const book = (st.memory || []).find((m) => m.polityId === p.id);
+    const entries = (book && book.entries ? book.entries : []).slice(-8).reverse();
+    const memHtml = entries.length
+      ? entries.map((e) => `<div class="mem-row"><span class="mem-year">${fmtInt(e.year)}</span><span class="mem-src">${e.source === 'self' ? '自述' : '史事'}</span><span>${esc(e.text)}</span></div>`).join('')
+      : '<div class="review-note">还没有记忆。战败、饥荒、背盟会自动记;君主也可以自己写。</div>';
+    const intel = (st.intel || {})[String(p.id)] || {};
+    const intelRows = Object.entries(intel)
+      .map(([tid, k]) => {
+        const target = (st.polities || []).find((x) => x.id === Number(tid));
+        const fields = (k.fields || []).join('、') || '无';
+        return `<div class="mem-row"><span class="mem-year">${fmtInt(k.year)}</span><span>P${tid} ${esc(target ? target.name : '')}:${esc(fields)}(${esc(k.quality)})</span></div>`;
+      })
+      .join('') || '<div class="review-note">还没派人渗透过任何国家;他国的人口、税收、稳定度在提示词里显示为「未知」。</div>';
+    return `
+      <div class="crown-wrap">
+        <div class="crown-head"><span class="crown-name">${esc(card.name)}</span>
+          <span class="crown-sub">第 ${fmtInt(card.born)} 年生 · ${esc(card.title || '君主')} · ${esc(p.name)}(P${p.id})</span></div>
+        <div class="crown-grid">
+          ${cell('谨慎', t.caution ?? '—')}${cell('野心', t.ambition ?? '—')}${cell('荣誉感', t.honor ?? '—')}${cell('贪欲', t.greed ?? '—')}
+        </div>
+        <div class="crown-grid">
+          ${cell('用兵', c.war ?? 0)}${cell('理财', c.economy ?? 0)}${cell('密谋', c.intrigue ?? 0)}${cell('理政', c.admin ?? 0)}
+        </div>
+        <div class="review-note">偏好:战争 ${esc(pref.war || '—')} · 经济 ${esc(pref.economy || '—')} · 外交 ${esc(pref.diplomacy || '—')}(玩家 / DM 可改下面的性格说明)</div>
+        <textarea class="crown-persona" id="crownPersona" data-polity="${p.id}">${esc(card.persona || '')}</textarea>
+        <div><button class="btn" id="btnCrownSave" type="button" data-polity="${p.id}">保存角色卡</button></div>
+        <div><h4 style="margin:2px 0 4px;font-size:12px">独立记忆(最近 8 条)</h4>${memHtml}</div>
+        <div><h4 style="margin:2px 0 4px;font-size:12px">情报</h4>${intelRows}</div>
+      </div>`;
+  }
+
   function renderTabBody() {
     if (!S.state || !el.tabBody) return;
+    if (S.tab === 'crown') {
+      el.tabBody.innerHTML = renderCrown();
+      const card = (S.state.cards || []).find((c) => c.polityId === S.sel);
+      el.tabNote.textContent = card ? `${card.name} · 记忆 ${((S.state.memory || []).find((m) => m.polityId === S.sel) || {}).entries?.length || 0} 条` : '跑一回合后生成';
+      return;
+    }
     if (S.tab === 'decisions') {
       el.tabBody.innerHTML = renderDecisions();
       el.tabNote.textContent = `${S.state.monarchRounds.length} 回合${S.state.dmRounds && S.state.dmRounds.length ? ` · DM ${S.state.dmRounds.length} 回合` : ''}${S.state.pettyRounds && S.state.pettyRounds.length ? ` · 小事件 ${S.state.pettyRounds.length} 回合` : ''}`;
@@ -1487,9 +1858,9 @@
     const hasWorld = !!S.worldId;
     const hasSession = !!S.sessionId;
     const finished = !!(S.state && S.state.finished);
-    el.btnSession.disabled = !hasWorld || S.busy || S.autoOn;
-    el.btnRound.disabled = !hasSession || finished || S.busy || S.autoOn;
-    el.btnAuto.disabled = !hasSession || finished || S.busy;
+    el.btnSession.disabled = !hasWorld || S.busy || S.autoOn || !!S.plan;
+    el.btnRound.disabled = !hasSession || finished || S.busy || S.autoOn || !!S.plan;
+    el.btnAuto.disabled = !hasSession || finished || S.busy || !!S.plan || (el.reviewMode && el.reviewMode.checked);
     el.btnVerify.disabled = !hasSession || S.busy;
     el.btnExport.disabled = !hasSession || S.busy;
     el.btnDmConnect.disabled = !hasSession || S.busy;
@@ -1522,6 +1893,8 @@
       S.worldId = d.worldId;
       S.sessionId = null;
       S.state = null;
+      S.plan = null;
+      if (el.reviewPanel) el.reviewPanel.hidden = true;
       S.ownersImg = null;
       S.grid = null;
       S.sel = null;
@@ -1555,6 +1928,7 @@
     if (!S.worldId) return;
     try {
       setBusy(true, '正在推演到起始年…', '会话会先用引擎自动规则把历史推到起始年,再交给 AI 君主。');
+      const features = { llm: !!el.featLlm.checked, jev: !!el.featJev.checked };
       const d = await api('/api/session', {
         worldId: S.worldId,
         startYear: int(el.startYear, 2500),
@@ -1563,21 +1937,32 @@
         dmPreset: el.dmPreset.checked,
         magicField: el.magicField.checked,
         magicStrength: Number(el.magicStrength.value) || 1,
+        features,
+        review: !!el.reviewMode.checked,
       });
       S.sessionId = d.session.sessionId;
       S.autoOn = false;
-      setBusy(true, '正在配置君主…', '选君主范围、mock 或真模型;Key 只存在服务端内存。');
-      const setup = await api('/api/monarch/setup', {
-        sessionId: S.sessionId,
-        polities: el.polities.value === 'all' ? 'all' : Number(el.polities.value),
-        mock: el.mock.checked,
-        provider: el.provider.value,
-        baseUrl: el.baseUrl.value.trim(),
-        model: el.model.value.trim(),
-        apiKey: el.apiKey.value,
-        temperature: Number(el.temperature.value) || 0.7,
-      });
-      await applyState(setup.state || d.state);
+      S.plan = null;
+      if (el.reviewPanel) el.reviewPanel.hidden = true;
+      saveCfg(cfgFromForm());
+      let setup = null;
+      if (features.llm) {
+        setBusy(true, '正在配置君主…', '选君主范围、mock 或真模型;Key 只存在服务端内存。');
+        setup = await api('/api/monarch/setup', {
+          sessionId: S.sessionId,
+          polities: el.polities.value === 'all' ? 'all' : Number(el.polities.value),
+          mock: el.mock.checked,
+          provider: el.provider.value,
+          baseUrl: el.baseUrl.value.trim(),
+          model: el.model.value.trim(),
+          apiKey: el.apiKey.value,
+          temperature: Number(el.temperature.value) || 0.7,
+        });
+        await applyState(setup.state || d.state);
+      } else {
+        await applyState(d.state);
+        toast('「LLM 扮演」关着:这一局国家按引擎规则自动行动,只有 Jev 在结算小事。');
+      }
       if (el.dmEnable.checked) {
         try {
           setBusy(true, '正在连接 DM 小决策…', el.dmMock.checked ? 'mock 模式,不联网' : 'OpenAI 兼容服务;Key 只在服务端内存。');
@@ -1586,17 +1971,26 @@
           toast(`DM 小决策未连接(不影响君主):${e instanceof Error ? e.message : String(e)}`, true);
         }
       }
-      if (el.pettyEnable.checked) {
+      if (features.jev) {
+        el.pettyEnable.checked = true;
         try {
-          setBusy(true, '正在连接小事件裁决层…', el.pettyMock.checked ? 'mock 模式,不联网' : '官方 Jev;Key 只在服务端内存。');
+          setBusy(true, '正在连接 Jev 判断…', el.pettyMock.checked || el.mock.checked ? 'mock 模式,不联网' : '官方 Jev;Key 只在服务端内存。');
           await connectPetty(true);
         } catch (e) {
-          toast(`小事件裁决层未连接(不影响君主/DM):${e instanceof Error ? e.message : String(e)}`, true);
+          toast(`Jev 未连接:审核与渗透会退回确定性规则;小事也不结算。${e instanceof Error ? e.message : String(e)}`, true);
         }
       }
-      const king = setup.setup.monarchs.length;
-      toast(`会话已开始:第 ${fmtInt(yearOf(d.session.year))} 年,${king} 家君主接管${el.mock.checked ? '(mock)' : '(真模型)'}`);
-      setHint('点「跑一回合」:每个君主先看简报,再下命令;收齐后引擎统一推演一个回合。');
+      const king = setup && setup.setup ? setup.setup.monarchs.length : 0;
+      toast(
+        features.llm
+          ? `会话已开始:第 ${fmtInt(yearOf(d.session.year))} 年,${king} 家君主接管${el.mock.checked ? '(mock)' : '(真模型)'}${features.jev ? ' · Jev 判断已开' : ''}`
+          : `会话已开始:第 ${fmtInt(yearOf(d.session.year))} 年,引擎自动推演${features.jev ? ' + Jev 结算小事' : ''}`,
+      );
+      setHint(
+        el.reviewMode.checked
+          ? '复核模式:点「跑一回合」只出方案;在「本回合方案」里勾选要执行的命令,再点「提交本回合」。'
+          : '点「跑一回合」:每个君主先看简报,再下命令;高影响命令过 Jev 审核,收齐后引擎统一推演一个回合。',
+      );
     } catch (e) {
       toast(`开始会话失败:${e instanceof Error ? e.message : String(e)}`, true);
     } finally {
@@ -1620,6 +2014,8 @@
       toast('会话已经结束;改起始年/回合数再开一个。', true);
       return;
     }
+    if (el.reviewMode.checked) { await planRound(); return; }
+    if (el.featLlm && !el.featLlm.checked) { await engineRound(); return; }
     S.busyAutoBusy = true;
     try {
       setBusy(true, 'AI 君主回合进行中…', '每个君主看简报 → 下命令 → 收齐后统一推演;真模型时这一步要等网络。');
@@ -1636,6 +2032,141 @@
       setBusy(false);
       refreshButtons();
     }
+  }
+
+  /** LLM 关着时的回合:开了 Jev 就先结算小事,否则纯引擎推演 */
+  async function engineRound() {
+    if (!S.sessionId || S.busyAutoBusy) return;
+    const jevOnly = !!(el.featJev && el.featJev.checked);
+    S.busyAutoBusy = true;
+    try {
+      setBusy(true, jevOnly ? '小事件裁决回合…' : '引擎推演中…', jevOnly ? '先扫小事 → Jev 裁决 → 落效果 → 推演;国家行为按引擎规则。' : '没有 LLM、没有 Jev:纯引擎规则推进一步。');
+      const d = await api(jevOnly ? '/api/petty/round' : '/api/turn', { sessionId: S.sessionId });
+      if (d.state) await applyState(d.state);
+      const r = d.petty || d.turn || {};
+      toast(`第 ${r.round ?? '?'} 回合:第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年${jevOnly ? ' · Jev 结算小事' : ' · 引擎自动'}`);
+    } catch (e) {
+      toast(`回合失败:${e instanceof Error ? e.message : String(e)}`, true);
+    } finally {
+      S.busyAutoBusy = false;
+      setBusy(false);
+      refreshButtons();
+    }
+  }
+
+  /** 给已有会话接上/重接君主模式(引导浮层保存后调用) */
+  async function connectMonarchNow() {
+    if (!S.sessionId) return;
+    const setup = await api('/api/monarch/setup', {
+      sessionId: S.sessionId,
+      polities: el.polities.value === 'all' ? 'all' : Number(el.polities.value),
+      mock: el.mock.checked,
+      provider: el.provider.value,
+      baseUrl: el.baseUrl.value.trim(),
+      model: el.model.value.trim(),
+      apiKey: el.apiKey.value,
+      temperature: Number(el.temperature.value) || 0.7,
+    });
+    if (setup.state) await applyState(setup.state);
+  }
+
+  /** 复核模式第一步:只出方案,不推演 */
+  async function planRound() {
+    if (!S.sessionId || S.busyAutoBusy) return;
+    S.busyAutoBusy = true;
+    try {
+      setBusy(true, '正在出本回合方案…', '君主读简报 → 下命令 → 高影响命令过 Jev 审核;这一步还不推演。');
+      refreshButtons();
+      const d = await api('/api/monarch/plan', { sessionId: S.sessionId });
+      S.plan = d.plan;
+      if (d.state) await applyState(d.state);
+      renderReview();
+      const n = (d.plan && d.plan.commands ? d.plan.commands.length : 0);
+      toast(`方案已出:${n} 条命令待复核;在「本回合方案」里取消勾选即可否决。`);
+    } catch (e) {
+      toast(`出方案失败:${e instanceof Error ? e.message : String(e)}`, true);
+    } finally {
+      S.busyAutoBusy = false;
+      setBusy(false);
+      refreshButtons();
+    }
+  }
+
+  function renderReview() {
+    if (!el.reviewPanel || !el.reviewBody) return;
+    const plan = S.plan;
+    if (!plan) {
+      el.reviewPanel.hidden = true;
+      return;
+    }
+    el.reviewPanel.hidden = false;
+    const names = keyNamesOf(S.state);
+    el.reviewSub.textContent = `第 ${fmtInt(yearOf(plan.fromYear))} 年 · ${plan.decisions.length} 位君主 · ${plan.commands.length} 条命令 · 推 ${plan.years} 年 · ${plan.audit && plan.audit.source === 'jev' ? 'Jev 审核' : '规则审核'}`;
+    const refs = plan.commandRefs || [];
+    const byPolity = new Map();
+    plan.commands.forEach((c, i) => {
+      const ref = refs[i] || { polityId: -1, index: i };
+      if (!byPolity.has(ref.polityId)) byPolity.set(ref.polityId, []);
+      byPolity.get(ref.polityId).push({ c, ref });
+    });
+    const blocks = plan.decisions
+      .map((d) => {
+        const mine = byPolity.get(d.polityId) || [];
+        const rows = mine.length
+          ? mine
+              .map(
+                ({ c, ref }) => `
+            <label class="review-item">
+              <input type="checkbox" checked data-polity="${d.polityId}" data-index="${ref.index}">
+              <div>
+                <div class="rv-head"><b>${esc(d.name)}</b><span class="rv-cmd">${esc(cmdText(c, names))}</span></div>
+                ${d.reason ? `<div class="rv-reason">${esc(d.reason)}</div>` : ''}
+              </div>
+            </label>`,
+              )
+              .join('')
+          : '<div class="review-note">今年没有命令。</div>';
+        const audits = (d.audits || [])
+          .map((a) => `<div class="review-note"><span class="audit-chip ${a.outcome}">${a.outcome === 'allow' ? '放行' : a.outcome === 'soften' ? '降级' : '退回'}</span> ${esc(a.kind)}:${esc(a.reason)}</div>`)
+          .join('');
+        const rej = (d.rejected || [])
+          .map((r) => `<div class="review-note">拒收:${esc(r.reason)}</div>`)
+          .join('');
+        return `<div class="review-block"><div class="rv-head"><b>${esc(d.name)}</b><span class="muted">P${d.polityId} · ${mine.length} 条命令</span></div>${rows}${audits}${rej}</div>`;
+      })
+      .join('');
+    el.reviewBody.innerHTML =
+      `<div class="review-note">取消勾选 = 这条命令不执行(玩家/DM 否决)。Jev 只审高影响命令(宣战/坚持打);其余命令由你在这里决定。</div>` +
+      blocks +
+      `<div class="review-note">方案之外还会执行:小事件裁决产生的 ${(plan.pettyCommands || []).length} 条命令、DM 小决策产生的 ${(plan.dmCommands || []).length} 条命令。</div>`;
+  }
+
+  /** 复核模式第二步:按勾选结果提交 */
+  async function commitRound() {
+    if (!S.plan || !S.sessionId) return;
+    const reject = [...el.reviewBody.querySelectorAll('input[type=checkbox][data-polity]')]
+      .filter((x) => !x.checked)
+      .map((x) => ({ polityId: Number(x.dataset.polity), index: Number(x.dataset.index) }));
+    try {
+      setBusy(true, '正在提交本回合…', reject.length ? `已否决 ${reject.length} 条命令;其余交给引擎推演。` : '全部放行;交给引擎推演。');
+      const d = await api('/api/monarch/commit', { sessionId: S.sessionId, reject });
+      S.plan = null;
+      el.reviewPanel.hidden = true;
+      await applyState(d.state);
+      const r = d.round;
+      toast(`第 ${r.round} 回合已提交:第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年${reject.length ? ` · 否决 ${reject.length} 条` : ''}`);
+    } catch (e) {
+      toast(`提交失败:${e instanceof Error ? e.message : String(e)}`, true);
+    } finally {
+      setBusy(false);
+      refreshButtons();
+    }
+  }
+
+  function cancelReview() {
+    S.plan = null;
+    if (el.reviewPanel) el.reviewPanel.hidden = true;
+    toast('方案已放弃(还没推演,世界没有变化)');
   }
 
   async function autoLoop() {
@@ -1683,13 +2214,16 @@
 
   async function connectPetty(silent = false) {
     if (!S.sessionId) return;
-    const mock = el.pettyMock.checked;
+    const mock = el.pettyMock.checked || el.mock.checked;
     const d = await api('/api/petty/setup', {
       sessionId: S.sessionId,
       mock,
       profile: el.pettyProfile.value,
       maxQuestions: int(el.pettyMax, 8),
       apiKey: mock ? '' : el.pettyKey.value,
+      // 引导里填过的自定义地址/模型(留空 = 官方默认)
+      baseUrl: mock ? '' : (el.obJevBase ? el.obJevBase.value.trim() : ''),
+      model: mock ? '' : (el.obJevModel ? el.obJevModel.value.trim() : ''),
       probe: !mock,
     });
     if (d && d.state) await applyState(d.state);
@@ -1787,6 +2321,65 @@
       })();
     });
 
+    // 首次引导:保存两把 Key(落盘 localStorage),有会话就顺手接上
+    if (el.btnOnboardSave) {
+      el.btnOnboardSave.addEventListener('click', () => {
+        applyOnboardToForm();
+        const cfg = cfgFromForm();
+        saveCfg(cfg);
+        hideOnboard();
+        toast('配置已存在这台机器;只发给 127.0.0.1 的监视台进程。');
+        if (S.sessionId) {
+          if (cfg.features.llm) connectMonarchNow().catch((e) => toast(`君主模式未连上:${e instanceof Error ? e.message : String(e)}`, true));
+          if (cfg.features.jev) connectPetty(true).catch((e) => toast(`Jev 未连上:${e instanceof Error ? e.message : String(e)}`, true));
+        }
+      });
+    }
+    if (el.btnOnboardSkip) {
+      el.btnOnboardSkip.addEventListener('click', () => {
+        saveCfg({ ...cfgFromForm(), onboarded: true, features: { llm: false, jev: false }, mock: true });
+        if (el.mock) el.mock.checked = true;
+        if (el.featLlm) el.featLlm.checked = false;
+        hideOnboard();
+        toast('已跳过:先用 mock 离线演示;随时点顶栏「参数」补 Key。');
+      });
+    }
+    for (const id of ['obProvider', 'obBaseUrl', 'obModel', 'obKey', 'obJevKey', 'obJevBase', 'obJevModel']) {
+      const input = el[id];
+      if (input) input.addEventListener('input', onboardState);
+    }
+    if (el.featJev) {
+      el.featJev.addEventListener('change', () => {
+        if (el.pettyEnable) el.pettyEnable.checked = el.featJev.checked;
+      });
+    }
+    if (el.reviewMode) {
+      el.reviewMode.addEventListener('change', () => {
+        if (el.reviewMode.checked && el.btnAuto) el.btnAuto.disabled = true;
+        refreshButtons();
+      });
+    }
+    if (el.btnReviewCommit) el.btnReviewCommit.addEventListener('click', () => { void commitRound(); });
+    if (el.btnReviewCancel) el.btnReviewCancel.addEventListener('click', () => cancelReview());
+
+    // 君主卡保存(事件委托:卡片是动态渲染的)
+    el.tabBody.addEventListener('click', (e) => {
+      const btn = e.target.closest('#btnCrownSave');
+      if (!btn) return;
+      const polityId = Number(btn.dataset.polity);
+      const ta = el.tabBody.querySelector('#crownPersona');
+      if (!ta) return;
+      void (async () => {
+        try {
+          const d = await api('/api/monarch/card', { sessionId: S.sessionId, polityId, patch: { persona: ta.value } });
+          if (d.state) await applyState(d.state);
+          toast('角色卡已保存(只影响提示词与审核,不改引擎数值)');
+        } catch (err) {
+          toast(`保存角色卡失败:${err instanceof Error ? err.message : String(err)}`, true);
+        }
+      })();
+    });
+
     el.tabs.addEventListener('click', (e) => {
       const btn = e.target.closest('.tab');
       if (!btn) return;
@@ -1874,7 +2467,10 @@
     el.pettyKey.disabled = el.pettyMock.checked;
   }
 
+  const savedCfg = loadCfg();
+  applyCfg(savedCfg);
   bind();
+  if (!savedCfg.onboarded) showOnboard();
   refreshButtons();
   resizeCanvas();
 })();

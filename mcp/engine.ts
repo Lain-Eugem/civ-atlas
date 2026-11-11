@@ -26,6 +26,9 @@ import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
 import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
 import { cleanFieldSpec, fieldPlugin, type FieldSpec } from '../src/gen/civ/fieldPlugin';
 import type { TuningValues } from '../src/gen/civ/tuning';
+import type { MonarchCard } from '../src/gen/civ/monarchCard';
+import type { MemoryBook } from '../src/gen/civ/monarchMemory';
+import type { IntelKnowledge } from '../src/gen/civ/monarchIntel';
 
 /* ------------------------------------------------------------------ *
  * 世界注册表
@@ -111,6 +114,14 @@ export interface SessionOpenInput {
   endYear?: number;
   mode?: SessionMode;
   /**
+   * 两个独立开关:llm = 外部 LLM 扮演君主,jev = Jev 裁决(小事件 / 审核 / 渗透)。
+   * 缺省:llm 跟随 mode(monarch = 开),jev 关(配了 civ_petty_setup 会打开)。
+   * 三种组合都合法:仅 LLM、仅 Jev、双开;双关 = 纯引擎推演。
+   */
+  features?: { llm?: boolean; jev?: boolean };
+  /** 玩家 / DM 复核:开 = 先出方案(civ_monarch_plan),由人勾选命令后再 commit */
+  review?: boolean;
+  /**
    * 传给推演引擎的 CivParams 覆盖项(可选)。常用:tempo、regionArea、names、knobs 等。
    * 注意:interventions 可以放"起始年之前的历史命令",引擎会照它们从第 0 年重推。
    */
@@ -145,6 +156,18 @@ export interface SessionOpenInput {
 export interface Session {
   id: string;
   mode: SessionMode;
+  /** 双开关:LLM 扮演 / Jev 裁决,互相独立 */
+  features: { llm: boolean; jev: boolean };
+  /** 玩家 / DM 复核开关(开 = 回合分成 plan 与 commit 两步) */
+  review: boolean;
+  /** 君主角色卡(按国家编号;换君主即重建) */
+  cards?: Map<number, MonarchCard>;
+  /** 君主独立记忆库 */
+  memory?: Map<number, MemoryBook>;
+  /** 渗透情报:intel[我国编号][他国编号] = 最近一次探到的字段与年份 */
+  intel?: Record<string, Record<string, IntelKnowledge>>;
+  /** 复核模式里待提交的回合方案(mcp/monarch.ts 的 MonarchPlan) */
+  pendingPlan?: unknown;
   world: World;
   worldParams: WorldParams;
   civParams: Partial<CivParams>;
@@ -245,6 +268,8 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
   const session: Session = {
     id,
     mode,
+    features: { llm: input.features?.llm ?? mode === 'monarch', jev: input.features?.jev ?? false },
+    review: input.review === true,
     world: worldRec.world,
     worldParams: worldRec.params,
     civParams,
@@ -271,6 +296,8 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
       {
         id,
         mode,
+        features: session.features,
+        review: session.review,
         worldId: worldRec.id,
         worldParams: worldRec.params,
         civParams,
@@ -333,6 +360,9 @@ export interface EventView {
 export interface SessionSummary {
   sessionId: string;
   mode: SessionMode;
+  /** 双开关与复核模式 */
+  features: { llm: boolean; jev: boolean };
+  review: boolean;
   year: number;
   startYear: number;
   stepYears: number;
@@ -356,6 +386,8 @@ export function sessionSummary(s: Session): SessionSummary {
   return {
     sessionId: s.id,
     mode: s.mode,
+    features: { ...s.features },
+    review: s.review,
     year: s.play.year,
     startYear: s.startYear,
     stepYears: s.stepYears,
@@ -561,6 +593,10 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     magic: magicView(s),
     fields: fieldViews(s),
     layers: layerViews(s),
+    ...(s.cards?.size ? { cards: [...s.cards.values()] } : {}),
+    ...(s.memory?.size ? { memory: [...s.memory.values()].map((b) => ({ polityId: b.polityId, revision: b.revision, entries: b.entries })) } : {}),
+    ...(s.intel ? { intel: s.intel } : {}),
+    ...(s.pendingPlan ? { pendingPlan: true } : {}),
     ...(chronicle ? { chronicle } : {}),
   };
 }

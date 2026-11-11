@@ -15,6 +15,7 @@
 import type { World } from '../src/gen/world';
 import { rasterize, type Raster } from '../src/gen/raster';
 import { rasterizeWindow, zoomSource, WINDOW_PAD, type ZoomSource } from '../src/gen/rasterWindow';
+import { traceMaskValue } from './coast-trace';
 import {
   fantasyCoastLines,
   fantasyFullPixels,
@@ -248,12 +249,16 @@ export function renderTile(
   x: number,
   y: number,
   size: number,
-): { width: number; height: number; rgba: Uint8Array } {
+): { width: number; height: number; rgba: Uint8Array; sea: number[][]; lake: number[][] } {
   const ctx = ctxOf(world);
   const { src, grids } = ctx;
   const W = src.width * S;
   const H = src.height * S;
   const out = new Uint8ClampedArray(size * size * 4);
+  // 和这块瓦片同分辨率的水陆图,最后用来追本块的海岸 / 湖岸线(见文件末尾)
+  const mN = size + 2 * WINDOW_PAD;
+  const mask = new Uint8Array(mN * mN);
+  let maskOk = true;
 
   // 逐行找出连续的同一层,每段一次 rasterizeWindow + 上色(通常一段,靠近极点时两段)
   let py = 0;
@@ -291,10 +296,23 @@ export function renderTile(
       const to = ((py + t) * size) * 4;
       out.set(px.subarray(from, from + size * 4), to);
     }
+    // 整块的窗口(含 pad)一次铺满时,这份水陆图就是瓦片坐标系下的完整水陆图,直接拿来用;
+    // 跨极点的块是翻转 + 挪半圈的,对不上,放弃追线(前端会退回全局那份)
+    if (!odd && py === 0 && segH === size) mask.set(r.water);
+    else maskOk = false;
     py = end;
   }
   // 手绘风的窗口像素层会重算全局场,低频颜色和整图不一样,拉回底图才不出现方块色差。
   // 写实风的 realisticWindowPixels 本来就是按整图粗网格取的,不需要这一步。
   if (style === 'fantasy') alignColors(out, wholePixels(world, ctx, style), src.width, src.height, S, x, y, size);
-  return { width: size, height: size, rgba: asBytes(out) };
+  // 本块的海岸 / 湖岸线:在这块自己的水陆图上追,所以和这块的地形严丝合缝。
+  // 坐标是瓦片内的像素坐标(0..size),前端按贴图尺寸放大即可,不用再管世界坐标和跨极。
+  let sea: number[][] = [];
+  let lake: number[][] = [];
+  if (maskOk) {
+    const ox = WINDOW_PAD - 0.5;
+    sea = traceMaskValue(mask, mN, 1, ox, ox);
+    lake = traceMaskValue(mask, mN, 2, ox, ox);
+  }
+  return { width: size, height: size, rgba: asBytes(out), sea, lake };
 }

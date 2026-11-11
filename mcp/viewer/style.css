@@ -1158,3 +1158,100 @@ details.advanced > summary { font-weight: 500; }
 }
 .field-tip-value { font-size: 12px; color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; }
 .field-tip .muted { color: var(--ink-3); }
+
+/* ---------------- 首次引导 ---------------- */
+
+.onboard {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(20, 18, 14, 0.42);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.onboard[hidden] { display: none !important; }
+.onboard-card {
+  width: min(680px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  padding: 22px 24px 18px;
+  border-radius: 18px;
+  background: var(--panel-solid);
+  border: 1px solid var(--line-soft);
+  box-shadow: var(--shadow-float);
+}
+.onboard-kicker { font-size: 11px; letter-spacing: 0.08em; color: var(--accent); font-weight: 600; }
+.onboard-head h2 { margin: 4px 0 6px; font-size: 20px; letter-spacing: -0.01em; }
+.onboard-head p { margin: 0 0 14px; font-size: 12.5px; line-height: 1.65; color: var(--ink-2); }
+.onboard-sec {
+  padding: 12px 0 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.onboard-sec h3 { margin: 0 0 8px; font-size: 13px; }
+.onboard-sec h3 .muted { font-weight: 400; font-size: 11px; }
+.onboard-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.onboard-note { margin: 12px 0 0; font-size: 11px; line-height: 1.6; color: var(--ink-3); }
+.feature-row { border-top: 1px dashed var(--line-soft); padding-top: 8px; margin-top: 2px; }
+
+/* ---------------- 复核面板 ---------------- */
+
+.review-panel {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--gap) + 244px);
+  transform: translateX(-50%);
+  z-index: 46;
+  width: min(680px, calc(100vw - 2 * var(--gap)));
+  max-height: 42vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.review-panel[hidden] { display: none !important; }
+.review-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.review-item {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+}
+.review-item input { margin-top: 3px; }
+.review-item .rv-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; }
+.review-item .rv-cmd { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+.review-item .rv-reason { font-size: 11.5px; color: var(--ink-2); line-height: 1.55; margin-top: 3px; }
+.review-note { font-size: 11px; color: var(--ink-3); line-height: 1.6; }
+
+/* ---------------- 君主卡 / 记忆 / 情报 ---------------- */
+
+.crown-wrap { display: flex; flex-direction: column; gap: 12px; padding: 2px 2px 8px; }
+.crown-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.crown-name { font-size: 16px; font-weight: 600; }
+.crown-sub { font-size: 11.5px; color: var(--ink-2); }
+.crown-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.crown-cell { padding: 8px 10px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line-soft); }
+.crown-cell .k { font-size: 10.5px; color: var(--ink-3); }
+.crown-cell .v { font-size: 13px; font-weight: 600; margin-top: 2px; }
+.crown-persona { width: 100%; min-height: 76px; resize: vertical; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; line-height: 1.6; }
+.mem-row { display: flex; gap: 8px; padding: 5px 0; border-bottom: 1px dashed var(--line-soft); font-size: 11.5px; line-height: 1.55; }
+.mem-row:last-child { border-bottom: 0; }
+.mem-year { flex: 0 0 auto; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.mem-src { flex: 0 0 auto; font-size: 10px; color: var(--accent); }
+.audit-chip { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 10px; font-weight: 600; }
+.audit-chip.allow { background: rgba(46, 154, 88, 0.14); color: var(--ok); }
+.audit-chip.soften { background: rgba(185, 124, 12, 0.14); color: var(--warn); }
+.audit-chip.reject { background: rgba(224, 68, 58, 0.14); color: var(--err); }

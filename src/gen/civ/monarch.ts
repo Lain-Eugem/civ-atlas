@@ -25,7 +25,7 @@ export const MONARCH_MAX_COUNTRIES = 12;
 export const MONARCH_MAX_ORDERS = 3;
 
 /** 君主能下的命令(和 compileMonarchOrders 一一对应) */
-export const MONARCH_KINDS = ['policy', 'declare', 'ally', 'halt', 'boost', 'protect', 'press'] as const;
+export const MONARCH_KINDS = ['policy', 'declare', 'ally', 'halt', 'boost', 'protect', 'press', 'intel'] as const;
 export type MonarchKind = (typeof MONARCH_KINDS)[number];
 
 /** 第 y 年各国几州(y≥civ.endYear 时直接用 civ.polity) */
@@ -84,6 +84,7 @@ export function monarchOrderText(civ: Civ, v: Intervention): string {
   if (v.kind === 'boost') return `推一把发展${v.mul ? `(快 ${v.mul} 倍)` : '(直接进下一个时代)'}${until}`;
   if (v.kind === 'halt') return `停止扩张${until}`;
   if (v.kind === 'protect') return `自保${until}`;
+  if (v.kind === 'intel') return `派人渗透 ${target(v.b)}${v.result ? `(结果:${v.result})` : ''}`;
   return v.kind;
 }
 
@@ -114,6 +115,10 @@ export interface MonarchBrief {
   wars: string[];
   /** 给 LLM 的完整中文简报 */
   text: string;
+  /** 简报的易变段(含年份、局势);分层提示词时放进 user */
+  textVolatile: string;
+  /** 简报的稳定段(命令契约、输出格式;不含年份);分层提示词时放进 system */
+  textStable: string;
 }
 
 /** 现在能下的命令说明(给简报用) */
@@ -134,7 +139,10 @@ const COMMAND_HELP = `## 你能下的命令(每回合 0–${MONARCH_MAX_ORDERS} 
   保护自己:别的国家不能把你灭掉(但仍可能丢州)。
 - {"kind":"press","b":国家编号}
   坚持打:这一仗以后不许引擎自己议和(打满年限、僵持、国库窘迫、对方求和都不算数),直到你下 ally/halt、对方亡国或 until 到期。
-  b 可省略;不写 b 就管你参与的所有仗。`;
+  b 可省略;不写 b 就管你参与的所有仗。
+- {"kind":"intel","b":国家编号,"focus":"all"}
+  派人渗透某国,打探人口、稳定度、税收。focus 可选 all/pop/stability/tax。
+  成不成、拿到哪几样由裁决层判定;没探到的字段下一轮仍是"未知",不要凭想象编数字。`;
 
 /** 一次为多个国家写简报(编年史只算一遍) */
 export function buildMonarchBriefs(
@@ -220,13 +228,21 @@ function buildOne(
     out.push('## 天下最近发生的事(编年史)');
     for (const e of latest) out.push(`- ${monarchEntryLine(e)}`);
   }
+  // 稳定段(命令契约/输出格式,不含年份)与易变段(局势)分开:调用方把稳定段放进 system,
+  // 让服务商的前缀缓存能跨回合命中(mcp/prompt.ts)。text 保持原样 = 易变段 + 稳定段。
+  const textVolatile = out.join('\n');
+  const stable: string[] = [
+    COMMAND_HELP,
+    '',
+    '## 输出格式',
+    '只输出一个 JSON 对象,不要解释、不要代码块标记:',
+    `{"reason":"一句话说明今年为什么这么决定","commands":[{"kind":"policy","preset":"expand"}]}`,
+    'commands 可以是空数组(今年什么也不做)。',
+    '可选:加 "remember":[{"text":"我记住的一件事","weight":0.6}](每回合最多 2 条,每条 60 字以内),写进你的独立记忆库。',
+  ];
+  const textStable = stable.join('\n');
   out.push('');
-  out.push(COMMAND_HELP);
-  out.push('');
-  out.push('## 输出格式');
-  out.push('只输出一个 JSON 对象,不要解释、不要代码块标记:');
-  out.push(`{"reason":"一句话说明今年为什么这么决定","commands":[{"kind":"policy","preset":"expand"}]}`);
-  out.push('commands 可以是空数组(今年什么也不做)。');
+  out.push(textStable);
 
   const cap = alive ? capitalAt(me!, Y) : -1;
   return {
@@ -249,6 +265,8 @@ function buildOne(
     neighbors: near.map((q) => ({ id: q, name: monarchName(civ.polities[q], Y), size: size.get(q) ?? 0 })),
     wars: wars.slice(0, 4).map(monarchEntryLine),
     text: out.join('\n'),
+    textVolatile,
+    textStable,
   };
 }
 
@@ -400,6 +418,36 @@ export function compileMonarchOrders(civ: Civ, year: number, polityId: number, r
       const v = cleanIntervention(built);
       if (!v) {
         rejected.push({ order, reason: 'press 参数不合法(until 要是不早于今年的年份)' });
+        continue;
+      }
+      commands.push(v);
+      taken += 1;
+      continue;
+    }
+    // intel:派人渗透(不需要接壤;结果由裁决层判定后写进 result,见 mcp/intel.ts)
+    if (kind === 'intel') {
+      const target = asPolityId(order.b ?? order.target);
+      if (target === null) {
+        rejected.push({ order, reason: '渗透要给目标国家编号 b(如 {"kind":"intel","b":6,"focus":"all"})' });
+        continue;
+      }
+      if (target === polityId) {
+        rejected.push({ order, reason: '不能渗透自己的国家' });
+        continue;
+      }
+      const tp = civ.polities[target];
+      if (!tp || !polityAlive(tp, Y) || (size.get(target) ?? 0) === 0) {
+        rejected.push({ order, reason: `P${target} 今年不在世,无从渗透` });
+        continue;
+      }
+      const focus = order.focus;
+      if (focus !== undefined && focus !== 'all' && focus !== 'pop' && focus !== 'stability' && focus !== 'tax') {
+        rejected.push({ order, reason: 'intel 的 focus 只能是 all / pop / stability / tax' });
+        continue;
+      }
+      const v = cleanIntervention({ kind: 'intel', from: Y, a: myKey, b: polityKey(civ, target), ...(focus !== undefined ? { focus } : {}) });
+      if (!v) {
+        rejected.push({ order, reason: 'intel 参数不合法' });
         continue;
       }
       commands.push(v);

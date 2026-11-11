@@ -39,7 +39,7 @@ import {
   type RulerView,
   type Session,
 } from './engine';
-import { setupMonarch, monarchRound, monarchStatus, verifySession } from './monarch';
+import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, setMonarchCard, verifySession } from './monarch';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
@@ -590,6 +590,13 @@ function stateView(s: Session): Record<string, unknown> {
     magic: magicView(s),
     // 让前端能直接拿到君主信息(与 polities[].ruler 相同,单独列一份方便调试)
     monarchOn: !!s.monarch,
+    // 双开关 / 复核 / 角色卡 / 记忆 / 情报
+    features: s.features,
+    review: s.review,
+    cards: s.cards ? [...s.cards.values()] : [],
+    memory: s.memory ? [...s.memory.values()] : [],
+    intel: s.intel ?? {},
+    pendingPlan: !!s.pendingPlan,
   };
 }
 
@@ -600,6 +607,8 @@ function stateView(s: Session): Record<string, unknown> {
 const baseCache = new Map<string, Buffer>();
 /** 高清瓦片:key = worldId | 画法 | LOD | 球面展开坐标上的块号 */
 const tileCache = new Map<string, Buffer>();
+/** 每块瓦片自己的海岸 / 湖岸线(按该块的倍率追的,和这块地形严丝合缝) */
+const tileLines = new Map<string, { sea: number[][]; lake: number[][] }>();
 const TILE_CACHE_MAX = 192;
 /** 矢量层(海岸线 / 波纹 / 符号):按世界缓存一份 JSON */
 const vectorCache = new Map<string, string>();
@@ -658,10 +667,60 @@ function sendPng(res: ServerResponse, png: Buffer): void {
   res.end(png);
 }
 
+/**
+ * 地形底图与瓦片:同一个 worldId / 画法 / 倍率 / 块号永远对应同一张图(世界是不可变的),
+ * 所以让浏览器长期缓存。前端 URL 上带 v=,改了渲染算法就把 MAP_VER 加一。
+ *
+ * 效果:刷新页面、来回切倍率都不再走网络,直接命中磁盘缓存;服务端那 192 块的
+ * 上限也就不会被"同一批块反复重传"挤掉。
+ */
+function sendImmutablePng(res: ServerResponse, png: Buffer): void {
+  res.writeHead(200, {
+    'content-type': 'image/png',
+    'cache-control': 'public, max-age=31536000, immutable',
+  });
+  res.end(png);
+}
+
+/** 瓦片自带的海岸线,和瓦片同 key、同缓存策略 */
+function sendImmutableJson(res: ServerResponse, body: unknown): void {
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'public, max-age=31536000, immutable',
+  });
+  res.end(JSON.stringify(body));
+}
+
 
 function styleOf(q: URLSearchParams): TerrainStyle {
   const s = q.get('style');
   return isTerrainStyle(s) ? s : 'fantasy';
+}
+
+interface TileQuery {
+  worldId: string;
+  style: TerrainStyle;
+  S: number;
+  x: number;
+  y: number;
+  size: number;
+  key: string;
+}
+
+/** /api/map/tile 与 /api/map/coast 共用一套参数,不合法就抛(路由里翻成 400) */
+function parseTileQuery(q: URLSearchParams): TileQuery {
+  const worldId = q.get('worldId') ?? '';
+  if (!worldId) throw new Error('缺 worldId');
+  const S = Number(q.get('S'));
+  const x = Number(q.get('x'));
+  const y = Number(q.get('y'));
+  const size = Number(q.get('size'));
+  if (!Number.isFinite(S) || S < 0.25 || S > 24) throw new Error('S 超出范围');
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('x / y 必须是数字');
+  if (!Number.isInteger(size) || size < 16 || size > 1024) throw new Error('size 超出范围');
+  const style = styleOf(q);
+  if (style === 'classic') throw new Error('classic 画法没有高清瓦片');
+  return { worldId, style, S, x, y, size, key: `${worldId}|${style}|${S}|${x}|${y}|${size}` };
 }
 
 function getBasePng(worldId: string, style: TerrainStyle): Buffer {
@@ -677,11 +736,15 @@ function getBasePng(worldId: string, style: TerrainStyle): Buffer {
 }
 
 /** 缓存按 LRU 简单封顶,免得反复放大把内存吃光 */
-function cacheTile(key: string, png: Buffer): void {
+function cacheTile(key: string, png: Buffer, lines?: { sea: number[][]; lake: number[][] }): void {
   tileCache.set(key, png);
+  if (lines) tileLines.set(key, lines);
   if (tileCache.size > TILE_CACHE_MAX) {
     const oldest = tileCache.keys().next().value;
-    if (oldest !== undefined) tileCache.delete(oldest);
+    if (oldest !== undefined) {
+      tileCache.delete(oldest);
+      tileLines.delete(oldest);
+    }
   }
 }
 
@@ -789,7 +852,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
   if (method === 'GET' && pathname === '/api/map/base') {
     const worldId = url.searchParams.get('worldId') ?? '';
     if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
-    sendPng(res, getBasePng(worldId, styleOf(url.searchParams)));
+    sendImmutablePng(res, getBasePng(worldId, styleOf(url.searchParams)));
     return true;
   }
 
@@ -809,28 +872,37 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
   }
 
   // 放大后按屏幕现算的一块(同主站 tileWorker):(x, y) 是球面展开平面上的坐标,可以越过南北极
-  if (method === 'GET' && pathname === '/api/map/tile') {
-    const q = url.searchParams;
-    const worldId = q.get('worldId') ?? '';
-    const S = Number(q.get('S'));
-    const x = Number(q.get('x'));
-    const y = Number(q.get('y'));
-    const size = Number(q.get('size'));
-    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
-    if (!Number.isFinite(S) || S < 0.25 || S > 24) { fail(res, 400, 'S 超出范围'); return true; }
-    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
-    if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
-    const style = styleOf(q);
-    if (style === 'classic') { fail(res, 400, 'classic 画法没有高清瓦片'); return true; }
-    const key = `${worldId}|${style}|${S}|${x}|${y}|${size}`;
-    let png = tileCache.get(key);
-    if (!png) {
-      const rec = getWorldRecord(worldId);
-      const map = renderTile(rec.world, style, S, x, y, size);
-      png = encodePng(map.width, map.height, map.rgba);
-      cacheTile(key, png);
+  if (method === 'GET' && (pathname === '/api/map/tile' || pathname === '/api/map/coast')) {
+    let t: TileQuery;
+    try {
+      t = parseTileQuery(url.searchParams);
+    } catch (e) {
+      fail(res, 400, e instanceof Error ? e.message : '瓦片参数不合法');
+      return true;
     }
-    sendPng(res, png);
+    const render = (): { png: Buffer; sea: number[][]; lake: number[][] } => {
+      const rec = getWorldRecord(t.worldId);
+      const map = renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
+      return { png: encodePng(map.width, map.height, map.rgba), sea: map.sea, lake: map.lake };
+    };
+    if (pathname === '/api/map/tile') {
+      let png = tileCache.get(t.key);
+      if (!png) {
+        const r = render();
+        cacheTile(t.key, r.png, { sea: r.sea, lake: r.lake });
+        png = r.png;
+      }
+      sendImmutablePng(res, png);
+      return true;
+    }
+    // 海岸线:按这块瓦片自己的倍率追的,和这块的地形严丝合缝(1 倍底图追的那份放大后会对不上)
+    let lines = tileLines.get(t.key);
+    if (!lines) {
+      const r = render();
+      lines = { sea: r.sea, lake: r.lake };
+      cacheTile(t.key, r.png, lines);
+    }
+    sendImmutableJson(res, lines);
     return true;
   }
 
@@ -1021,12 +1093,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const magicField = args.magicField === true
         ? (Number.isFinite(Number(args.magicStrength)) ? Number(args.magicStrength) : true)
         : undefined;
+      const features = {
+        llm: args.features && typeof args.features === 'object' ? (args.features as Record<string, unknown>).llm !== false : true,
+        jev: args.features && typeof args.features === 'object' ? (args.features as Record<string, unknown>).jev === true : false,
+      };
       const { session, summary } = openSession({
         worldId,
         startYear,
         stepYears,
         maxRounds,
         mode: 'monarch',
+        features,
+        review: args.review === true,
         ...(dmPreset ? { dmPreset: true } : {}),
         ...(magicField !== undefined ? { magicField } : {}),
       });
@@ -1072,6 +1150,42 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const round = await monarchRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
       ownerCache.delete(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
+      return true;
+    }
+
+    // 复核模式:先出方案(不推演),玩家/DM 勾选后再提交
+    if (pathname === '/api/monarch/plan') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const plan = await monarchPlan(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
+      sendJson(res, 200, { plan, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/monarch/commit') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const reject = Array.isArray(args.reject)
+        ? (args.reject as { polityId?: unknown; index?: unknown }[])
+            .map((r) => ({ polityId: Number(r.polityId), index: Number(r.index) }))
+            .filter((r) => Number.isInteger(r.polityId) && Number.isInteger(r.index))
+        : undefined;
+      const round = await monarchCommit(s, reject ? { reject } : {});
+      ownerCache.delete(s.id);
+      sendJson(res, 200, { round, state: stateView(s) });
+      return true;
+    }
+
+    // 玩家 / DM 改角色卡(只改文案与档位,不改编号)
+    if (pathname === '/api/monarch/card') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const polityId = num(args, 'polityId', 0);
+      const card = setMonarchCard(s, Math.round(polityId), args.patch);
+      sendJson(res, 200, { card, state: stateView(s) });
       return true;
     }
 

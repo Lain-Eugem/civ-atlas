@@ -42,10 +42,17 @@ import {
   providerView,
   type LlmProviderInput,
   type LlmProviderSettings,
+  type ParsedDecision,
 } from './llm';
 import { decideDm, type DmDecisionOutcome } from './dm';
-import { pettyDigest, settlePetty, type PettySettlement } from './petty';
-import { MONARCH_SYSTEM_PROMPT, monarchUserPrompt } from './prompt';
+import { pettyDigest, pettyRuntime, settlePetty, type PettySettlement } from './petty';
+import { monarchMessages } from './prompt';
+import { cardIsCurrent, cleanCardInput, monarchCard } from '../src/gen/civ/monarchCard';
+import { addMemory, cleanMemoryWrites, deriveEngineMemories, memoryBook, type MemoryEntry } from '../src/gen/civ/monarchMemory';
+import { foreignIntel, regionTable } from '../src/gen/civ/monarchIntel';
+import { auditMonarchCommands, softenCommand, type AuditEntry, type AuditVerdict } from './monarch-audit';
+import { resolveIntel, type IntelResolution } from './intel';
+import type { JevSettings } from './petty-client';
 
 export interface MonarchRunConfig {
   polities: 'all' | number[] | number;
@@ -101,6 +108,8 @@ export function setupMonarch(s: Session, input: MonarchSetupInput): MonarchSetup
   };
   s.monarch = { config: config as unknown as Record<string, unknown>, rounds: [] };
   s.mode = 'monarch';
+  // 配了君主 = 打开「LLM 扮演」这一开关(老调用方常常先开 auto 会话再配君主,不能因此被挡住)
+  s.features.llm = true;
   const monarchs = aliveMonarchs(s.civ, s.play.year).filter((p) => ids.includes(p.id));
   return {
     sessionId: s.id,
@@ -128,6 +137,9 @@ export function monarchStatus(s: Session): Record<string, unknown> | null {
     sessionId: s.id,
     year: s.play.year,
     rounds: s.rounds,
+    features: { ...s.features },
+    review: s.review,
+    pendingPlan: !!s.pendingPlan,
     configured: {
       polities: cfg.polities,
       maxOrders: cfg.maxOrders,
@@ -173,8 +185,17 @@ export interface MonarchDecisionRecord {
   rawCommands: unknown[];
   commands: Intervention[];
   rejected: MonarchReject[];
+  /** 高影响命令的审核结论(其余命令由玩家 / DM 在复核里决定) */
+  audits?: AuditVerdict[];
+  /** 本国的渗透判定 */
+  intel?: IntelResolution[];
+  /** 君主自主写下的记忆(提交回合时才进记忆库) */
+  remember?: MemoryEntry[];
   error?: string;
   ms?: number;
+  /** 提示词 tokens 与前缀缓存命中(分层是否有效的证据) */
+  promptTokens?: number;
+  cachedTokens?: number;
 }
 
 export interface MonarchRoundResult {
@@ -209,10 +230,71 @@ export interface MonarchRoundResult {
   events: TurnResult['events'];
   finished: boolean;
   fingerprint: string;
+  /** 本回合的审核与渗透汇总 */
+  audits?: AuditVerdict[];
+  intel?: { source: 'jev' | 'rule'; resolutions: IntelResolution[]; error?: string };
 }
 
-/** 跑一个君主回合:简报 → 并发 LLM/mock → 编译命令 → 统一 turnStep → 写日志 */
-export async function monarchRound(s: Session, opts: { years?: number } = {}): Promise<MonarchRoundResult> {
+/** 一回合的方案(尚未推演):复核模式下先给人看,再由 monarchCommit 落地 */
+export interface MonarchPlan {
+  sessionId: string;
+  round: number;
+  fromYear: number;
+  years: number;
+  decisions: MonarchDecisionRecord[];
+  /** commands[i] 来自哪个国家的第几条命令(复核按它否决) */
+  commandRefs: { polityId: number; index: number }[];
+  commands: Intervention[];
+  audits: AuditVerdict[];
+  audit: { source: 'jev' | 'rule'; error?: string };
+  intel: { source: 'jev' | 'rule'; resolutions: IntelResolution[]; error?: string };
+  briefs: { polityId: number; name: string; text: string }[];
+  /** 同回合小事件与 DM 命令(提交时一起进引擎) */
+  pettyCommands: Intervention[];
+  dmCommands: Intervention[];
+  petty?: MonarchRoundResult['petty'];
+  dm?: MonarchRoundResult['dm'];
+  createdAt: number;
+}
+
+/** 本局的 Jev 客户端:双开关里 Jev 关着 = null(审核/渗透都退化为确定性规则) */
+function jevFor(s: Session): JevSettings | null {
+  if (!s.features.jev) return null;
+  return pettyRuntime(s.id)?.config.client ?? null;
+}
+
+/** 建卡/换卡:君主换人时重建角色卡,旧君主的记忆保留并记一笔"继位" */
+function ensureCards(s: Session, ids: readonly number[], year: number): void {
+  s.cards ??= new Map();
+  s.memory ??= new Map();
+  for (const id of ids) {
+    const prev = s.cards.get(id);
+    if (!prev || !cardIsCurrent(s.civ, prev, year)) {
+      const card = monarchCard(s.civ, id, year);
+      if (card) {
+        s.cards.set(id, card);
+        if (prev) {
+          const book = s.memory.get(id) ?? memoryBook(id);
+          addMemory(book, { year, kind: 'dynasty', text: `${prev.name} 之后由 ${card.name} 继位`, weight: 0.5, source: 'engine' });
+          s.memory.set(id, book);
+        }
+      }
+    }
+    if (!s.memory.has(id)) s.memory.set(id, memoryBook(id));
+  }
+}
+
+/** 把 decisions 里的命令摊平(带引用),渗透/审核之后再摊一次 */
+function flatten(decisions: readonly MonarchDecisionRecord[]): { commands: Intervention[]; refs: { polityId: number; index: number }[] } {
+  const commands: Intervention[] = [];
+  const refs: { polityId: number; index: number }[] = [];
+  for (const d of decisions) d.commands.forEach((v, index) => { commands.push(v); refs.push({ polityId: d.polityId, index }); });
+  return { commands, refs };
+}
+
+/** 跑一个回合的方案:简报 → 并发 LLM/mock → 编译 → 渗透判定 → 高影响命令审核;不推演 */
+export async function monarchPlan(s: Session, opts: { years?: number } = {}): Promise<MonarchPlan> {
+  if (!s.features.llm) throw new Error('本局没有打开「LLM 扮演」;仅 Jev 时请用小事件回合(civ_petty_round)');
   const cfg = configOf(s);
   if (s.rounds >= s.maxRounds) throw new Error(`会话已经跑满 ${s.maxRounds} 回合`);
   if (s.endYear !== undefined && s.play.year >= s.endYear) throw new Error(`会话已经到第 ${s.play.year} 年(>= endYear ${s.endYear})`);
@@ -220,23 +302,20 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
   const year = Math.floor(s.play.year);
   const ids = pickMonarchIds(s.civ, s.play.year, cfg.polities);
   if (!ids.length) throw new Error(`第 ${year} 年没有在世的君主可接管`);
+  ensureCards(s, ids, year);
   const briefs = buildMonarchBriefs(s.civ, s.play, ids);
   const turnIndex = s.rounds;
 
   const settled = await Promise.all(
-    briefs.map(async (brief): Promise<{ brief: MonarchBrief; source: 'mock' | 'llm'; decision: unknown; ms?: number; error?: string }> => {
-      if (cfg.mock) {
-        return { brief, source: 'mock', decision: mockDecision(brief, turnIndex) };
-      }
+    briefs.map(async (brief): Promise<{ brief: MonarchBrief; source: 'mock' | 'llm'; decision: ParsedDecision; ms?: number; promptTokens?: number; cachedTokens?: number; error?: string }> => {
+      const card = s.cards!.get(brief.polityId) ?? null;
+      const memory = s.memory!.get(brief.polityId);
+      const regions = regionTable(s.civ, brief.polityId, year);
+      const intel = brief.neighbors.map((n) => foreignIntel(s.civ, n.id, year, s.intel?.[String(brief.polityId)]?.[String(n.id)]));
+      if (cfg.mock) return { brief, source: 'mock', decision: mockDecision(brief, turnIndex) };
       try {
-        const reply = await askLlm(
-          [
-            { role: 'system', content: MONARCH_SYSTEM_PROMPT },
-            { role: 'user', content: monarchUserPrompt(brief) },
-          ],
-          cfg.provider,
-        );
-        return { brief, source: 'llm', decision: parseDecision(reply.text), ms: reply.ms };
+        const reply = await askLlm(monarchMessages({ brief, card, memory, regions, intel }), cfg.provider);
+        return { brief, source: 'llm', decision: parseDecision(reply.text), ms: reply.ms, promptTokens: reply.promptTokens, cachedTokens: reply.cachedTokens };
       } catch (e) {
         return { brief, source: 'llm', decision: { reason: '', commands: [] }, error: e instanceof Error ? e.message : String(e) };
       }
@@ -246,26 +325,16 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
   // 命令按国家编号固定顺序落地,和 LLM 的返回快慢无关
   const ordered = [...settled].sort((a, b) => a.brief.polityId - b.brief.polityId);
   const decisions: MonarchDecisionRecord[] = [];
-  const allCommands: Intervention[] = [];
+  const auditEntries: AuditEntry[] = [];
   for (const item of ordered) {
     const brief = item.brief;
     if (item.error) {
-      decisions.push({
-        polityId: brief.polityId,
-        name: brief.name,
-        key: brief.key,
-        source: 'error',
-        reason: '',
-        rawCommands: [],
-        commands: [],
-        rejected: [],
-        error: item.error,
-      });
+      decisions.push({ polityId: brief.polityId, name: brief.name, key: brief.key, source: 'error', reason: '', rawCommands: [], commands: [], rejected: [], error: item.error });
       continue;
     }
-    const parsed = item.decision as { reason?: string; commands?: unknown[] };
+    const parsed = item.decision;
     const compiled = compileMonarchOrders(s.civ, s.play.year, brief.polityId, parsed.commands ?? []);
-    allCommands.push(...compiled.commands);
+    const card = s.cards!.get(brief.polityId);
     decisions.push({
       polityId: brief.polityId,
       name: brief.name,
@@ -275,8 +344,54 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
       rawCommands: parsed.commands ?? [],
       commands: compiled.commands,
       rejected: compiled.rejected,
+      ...(parsed.remember ? { remember: cleanMemoryWrites(parsed.remember, year) } : {}),
       ...(item.ms !== undefined ? { ms: item.ms } : {}),
+      ...(item.promptTokens !== undefined ? { promptTokens: item.promptTokens } : {}),
+      ...(item.cachedTokens !== undefined ? { cachedTokens: item.cachedTokens } : {}),
     });
+    if (card) auditEntries.push({ polityId: brief.polityId, brief, card, commands: compiled.commands });
+  }
+
+  const jev = jevFor(s);
+
+  // 渗透:判定成败并写回命令的 result(命令史里就有"拿到了什么",回放逐位一致)
+  const flat0 = flatten(decisions);
+  const intelOut = await resolveIntel(s, flat0.commands, jev);
+  if (intelOut.resolutions.length) {
+    flat0.refs.forEach((ref, i) => {
+      const d = decisions.find((x) => x.polityId === ref.polityId);
+      if (d) d.commands[ref.index] = intelOut.commands[i]!;
+    });
+    for (const d of decisions) {
+      const mine = intelOut.resolutions.filter((r) => r.polityId === d.polityId);
+      if (mine.length) d.intel = mine;
+    }
+  }
+
+  // 高影响命令(declare/press/destroy/cede)的合理性审核;其余命令留给玩家 / DM 复核
+  const audit = await auditMonarchCommands(s, auditEntries, jev);
+  const allAudits: AuditVerdict[] = [];
+  for (const d of decisions) {
+    if (!d.commands.length) continue;
+    const kept: Intervention[] = [];
+    const mine: AuditVerdict[] = [];
+    d.commands.forEach((v, index) => {
+      const verdict = audit.verdicts.get(`${d.polityId}:${index}`);
+      if (!verdict) { kept.push(v); return; }
+      mine.push(verdict);
+      if (verdict.outcome === 'allow') { kept.push(v); return; }
+      if (verdict.outcome === 'reject') {
+        d.rejected.push({ order: d.rawCommands[index] ?? v, reason: `审核退回:${verdict.reason}` });
+        return;
+      }
+      // 降级:换成一条更保守的等价命令(宣战→守成,坚持打→停止扩张)
+      const soft = compileMonarchOrders(s.civ, s.play.year, d.polityId, [softenCommand(v.kind)]);
+      if (soft.commands.length) kept.push(...soft.commands);
+      d.rejected.push({ order: d.rawCommands[index] ?? v, reason: `审核降级为「${v.kind === 'press' ? '停止扩张' : '守成'}」:${verdict.reason}` });
+    });
+    d.commands = kept;
+    if (mine.length) d.audits = mine;
+    allAudits.push(...mine);
   }
 
   // 同一回合的「小事件裁决层」:先结算小事,结果作为既定事实给 DM,再和君主命令一起交给引擎
@@ -294,15 +409,7 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
         digest: pettyDigest(pettySettlement),
       };
     } catch (e) {
-      petty = {
-        source: s.petty && (s.petty.config as { mock?: boolean }).mock === true ? 'mock' : 'jev',
-        events: 0,
-        decisions: 0,
-        commands: 0,
-        fallback: 0,
-        digest: '',
-        error: e instanceof Error ? e.message : String(e),
-      };
+      petty = { source: s.petty && (s.petty.config as { mock?: boolean }).mock === true ? 'mock' : 'jev', events: 0, decisions: 0, commands: 0, fallback: 0, digest: '', error: e instanceof Error ? e.message : String(e) };
     }
   }
 
@@ -313,30 +420,57 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     try {
       const out = await decideDm(s, undefined, petty?.digest);
       dmCommands.push(...out.commands);
-      dm = {
-        source: out.source,
-        reason: out.reason,
-        decisions: out.decisions,
-        commands: out.commands.length,
-        rejected: out.rejected.length,
-        notes: out.notes,
-      };
+      dm = { source: out.source, reason: out.reason, decisions: out.decisions, commands: out.commands.length, rejected: out.rejected.length, notes: out.notes };
     } catch (e) {
-      dm = {
-        source: 'llm',
-        reason: '',
-        decisions: [],
-        commands: 0,
-        rejected: 0,
-        notes: [],
-        error: e instanceof Error ? e.message : String(e),
-      };
+      dm = { source: 'llm', reason: '', decisions: [], commands: 0, rejected: 0, notes: [], error: e instanceof Error ? e.message : String(e) };
     }
   }
 
-  const engineCommands = [...allCommands, ...(pettySettlement?.commands ?? []), ...dmCommands];
+  const flat = flatten(decisions);
+  const plan: MonarchPlan = {
+    sessionId: s.id,
+    round: s.rounds + 1,
+    fromYear: year,
+    years: Math.max(1, Math.round(opts.years ?? s.stepYears)),
+    decisions,
+    commandRefs: flat.refs,
+    commands: flat.commands,
+    audits: allAudits,
+    audit: { source: audit.source, ...(audit.error ? { error: audit.error } : {}) },
+    intel: { source: intelOut.source, resolutions: intelOut.resolutions, ...(intelOut.error ? { error: intelOut.error } : {}) },
+    briefs: briefs.map((b) => ({ polityId: b.polityId, name: b.name, text: b.text })),
+    pettyCommands: pettySettlement?.commands ?? [],
+    dmCommands,
+    ...(petty ? { petty } : {}),
+    ...(dm ? { dm } : {}),
+    createdAt: Date.now(),
+  };
+  s.pendingPlan = plan;
+  return plan;
+}
+
+/** 提交一个已出的方案:可按 {polityId,index} 否决若干条(玩家 / DM 复核),再统一推演并写日志 */
+export async function monarchCommit(s: Session, opts: { reject?: readonly { polityId: number; index: number }[] } = {}): Promise<MonarchRoundResult> {
+  const plan = s.pendingPlan as MonarchPlan | undefined;
+  if (!plan) throw new Error('没有待提交的回合方案;先跑 civ_monarch_plan(或直接用 civ_monarch_round)');
+  const drop = new Set((opts.reject ?? []).map((r) => `${r.polityId}:${r.index}`));
+  const kept = plan.commands.filter((_, i) => {
+    const ref = plan.commandRefs[i]!;
+    return !drop.has(`${ref.polityId}:${ref.index}`);
+  });
+  const dropped = plan.commandRefs.filter((ref) => drop.has(`${ref.polityId}:${ref.index}`));
+  const engineCommands = [...kept, ...plan.pettyCommands, ...plan.dmCommands];
   submitOrders(s, engineCommands);
-  const turn = turnStep(s, { years: opts.years });
+  const turn = turnStep(s, { years: plan.years });
+
+  // 记忆库:本回合的引擎事实(战败/饥荒/背盟……)+ 君主自己写下的
+  s.memory ??= new Map();
+  for (const d of plan.decisions) {
+    const book = s.memory.get(d.polityId) ?? memoryBook(d.polityId);
+    for (const m of deriveEngineMemories(s.civ, d.polityId, turn.fromYear, turn.toYear)) addMemory(book, m);
+    for (const m of d.remember ?? []) addMemory(book, m);
+    s.memory.set(d.polityId, book);
+  }
 
   const record: Record<string, unknown> = {
     sessionId: s.id,
@@ -344,15 +478,18 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     fromYear: turn.fromYear,
     toYear: turn.toYear,
     years: turn.years,
-    year,
-    decisions,
+    decisions: plan.decisions,
+    audits: plan.audits,
+    audit: plan.audit,
+    intel: plan.intel,
+    ...(dropped.length ? { rejectedByReview: dropped } : {}),
     engineRejected: turn.rejected,
     changes: turn.polities,
     events: turn.events,
     fingerprint: turn.fingerprint,
-    briefs: briefs.map((b) => ({ polityId: b.polityId, name: b.name, text: b.text })),
-    ...(petty ? { petty } : {}),
-    ...(dm ? { dm } : {}),
+    briefs: plan.briefs,
+    ...(plan.petty ? { petty: plan.petty } : {}),
+    ...(plan.dm ? { dm: plan.dm } : {}),
   };
   s.monarch!.rounds.push(record);
   const path = join(s.logDir, `monarch-round-${String(turn.round).padStart(4, '0')}.json`);
@@ -361,11 +498,14 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     round: turn.round,
     fromYear: turn.fromYear,
     toYear: turn.toYear,
-    decisions: decisions.map((d) => ({ polityId: d.polityId, source: d.source, commands: d.commands.length, rejected: d.rejected.length, error: d.error ?? null })),
-    ...(petty ? { petty: { source: petty.source, events: petty.events, decisions: petty.decisions, commands: petty.commands, fallback: petty.fallback, error: petty.error ?? null } } : {}),
-    ...(dm ? { dm: { source: dm.source, decisions: dm.decisions.length, commands: dm.commands, error: dm.error ?? null } } : {}),
+    decisions: plan.decisions.map((d) => ({ polityId: d.polityId, source: d.source, commands: d.commands.length, rejected: d.rejected.length, error: d.error ?? null, cachedTokens: d.cachedTokens ?? null })),
+    audits: plan.audits.map((a) => ({ polityId: a.polityId, kind: a.kind, outcome: a.outcome, source: a.source })),
+    intel: plan.intel.resolutions,
+    ...(plan.petty ? { petty: { source: plan.petty.source, events: plan.petty.events, decisions: plan.petty.decisions, commands: plan.petty.commands, fallback: plan.petty.fallback, error: plan.petty.error ?? null } } : {}),
+    ...(plan.dm ? { dm: { source: plan.dm.source, decisions: plan.dm.decisions.length, commands: plan.dm.commands, error: plan.dm.error ?? null } } : {}),
     fingerprint: turn.fingerprint,
   }) + '\n');
+  s.pendingPlan = undefined;
 
   return {
     sessionId: s.id,
@@ -373,15 +513,32 @@ export async function monarchRound(s: Session, opts: { years?: number } = {}): P
     fromYear: turn.fromYear,
     toYear: turn.toYear,
     years: turn.years,
-    decisions,
-    ...(petty ? { petty } : {}),
-    ...(dm ? { dm } : {}),
+    decisions: plan.decisions,
+    ...(plan.petty ? { petty: plan.petty } : {}),
+    ...(plan.dm ? { dm: plan.dm } : {}),
+    audits: plan.audits,
+    intel: plan.intel,
     engineRejected: turn.rejected,
     changes: turn.polities,
     events: turn.events,
     finished: turn.finished,
     fingerprint: turn.fingerprint,
   };
+}
+
+/** 跑一个完整的君主回合(不等复核):plan → commit;复核模式下界面用 plan / commit 两步 */
+export async function monarchRound(s: Session, opts: { years?: number } = {}): Promise<MonarchRoundResult> {
+  await monarchPlan(s, opts);
+  return monarchCommit(s);
+}
+
+/** 玩家 / DM 改某国的角色卡 */
+export function setMonarchCard(s: Session, polityId: number, patch: unknown): unknown {
+  const base = s.cards?.get(polityId);
+  if (!base) throw new Error(`P${polityId} 还没有角色卡;先跑一个回合的方案`);
+  const next = cleanCardInput(patch, base);
+  s.cards!.set(polityId, next);
+  return next;
 }
 
 /* ------------------------------------------------------------------ *

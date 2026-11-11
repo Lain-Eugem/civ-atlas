@@ -307,6 +307,7 @@ export type InterventionInfo = (
   | { kind: 'move'; a: string; city: string; from: number }
   | { kind: 'halt'; a: string; from: number; until?: number }
   | { kind: 'press'; a: string; b?: string; from: number; until?: number }
+  | { kind: 'intel'; a: string; b: string; from: number; focus?: 'tax' | 'pop' | 'stability' | 'all'; result?: 'none' | 'partial' | 'full' | 'blown' }
   | {
       kind: 'petty';
       a: string;

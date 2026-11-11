@@ -739,6 +739,7 @@ export type InterventionKind =
   | 'move'
   | 'halt'
   | 'press'
+  | 'intel'
   | 'petty'
   | 'story'
   | 'crown'
@@ -883,6 +884,7 @@ export type Intervention = (
   | { kind: 'move'; a: string; city: string; from: number }
   | { kind: 'halt'; a: string; from: number; until?: number }
   | { kind: 'press'; a: string; b?: string; from: number; until?: number }
+  | { kind: 'intel'; a: string; b: string; from: number; focus?: 'tax' | 'pop' | 'stability' | 'all'; result?: 'none' | 'partial' | 'full' | 'blown' }
   | { kind: 'petty'; a: string; from: number; effect: PettyIvEffect }
   | { kind: 'story'; from: number; title: string; text?: string; a?: string; effects?: StoryIvEffect[] }
   | { kind: 'crown'; a: string; char: number; from: number; born: number; until?: number; abdicate?: true; after?: true; keep?: true; leanings: RulerLeanings }
@@ -1996,7 +1998,7 @@ function folkRenamed(civ: Civ, f: Faith, cultures: readonly Culture[]): string |
 /** 干预年份的上限(推演引擎能预约的最远时刻) */
 export const INTERVENTION_YEAR_MAX = 65535;
 
-export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'petty', 'story', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
+export const INTERVENTION_KINDS: readonly InterventionKind[] = ['protect', 'ally', 'declare', 'unity', 'cede', 'found', 'move', 'halt', 'press', 'intel', 'petty', 'story', 'crown', 'policy', 'destroy', 'death', 'temper', 'disaster', 'treaty', 'neutral', 'regent', 'marry', 'keep', 'boost', 'trek', 'stay', 'appoint'];
 
 /** 人物键的几段(格式见 personKey):国家键、身份、生成时的名字、生年(取整)、同名同年的第几个(0 起);格式不对 = null */
 export interface PersonKeyParts {
@@ -2393,6 +2395,16 @@ export function tidyIntervention(x: unknown): Intervention | null {
       if (b === undefined) return null;
       const base = b === null ? { kind, a, from } : { kind, a, b, from };
       v = until !== null ? { ...base, until } : base;
+    } else if (kind === 'intel') {
+      // 渗透他国:只记"派了人、拿到哪几样",不改历史(引擎里没有它的效果,interventions.ts 不收);
+      // result 由编排层(Jev 判定 + 确定性抽签)写上,随命令史落盘,回放时逐位一致。
+      const b = o.b;
+      if (!isPolityKey(b) || b === a) return null;
+      const focus = o.focus;
+      if (focus !== undefined && focus !== 'tax' && focus !== 'pop' && focus !== 'stability' && focus !== 'all') return null;
+      const result = o.result;
+      if (result !== undefined && result !== 'none' && result !== 'partial' && result !== 'full' && result !== 'blown') return null;
+      v = { kind, a, b, from, ...(focus !== undefined ? { focus } : {}), ...(result !== undefined ? { result } : {}) };
     } else if (kind === 'petty') {
       const e = o.effect;
       if (!e || typeof e !== 'object') return null;

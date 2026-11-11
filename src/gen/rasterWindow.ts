@@ -368,11 +368,16 @@ function coverWindow(src: ZoomSource, W: number, H: number, x0: number, y0: numb
     const n3z = nrm[q + 8];
     const tv = t + 1;
     for (let s = -1; s <= 1; s++) {
-      // 东西相连:三角形的列范围挪一整圈再试
-      const c0 = Math.max(x0, lo === lo ? xa + s * W : xa) - x0;
-      const c1 = Math.min(x0 + w - 1, lo === lo ? xb + s * W : xb) - x0;
+      // 东西相连:三角形的列范围挪一整圈再试。
+      // 起止列 / 行必须是整数:cosLon / cosLat 按下标取,带小数的下标会取到 undefined,
+      // 整段三角形就被静默跳过(窗口起点带小数时,瓦片底部会留下一条没铺到的横带)。
+      // 这里往外取整,多算的一列 / 一行由下面的三角形内测试挡掉。
+      const c0 = Math.max(0, Math.floor((lo === lo ? xa + s * W : xa) - x0));
+      const c1 = Math.min(w - 1, Math.ceil((lo === lo ? xb + s * W : xb) - x0));
       if (c0 > c1 || (lo !== lo && s !== 0)) continue;
-      for (let py = ya - y0; py <= yb - y0; py++) {
+      const py0 = Math.max(0, Math.floor(ya - y0));
+      const py1 = Math.min(h - 1, Math.ceil(yb - y0));
+      for (let py = py0; py <= py1; py++) {
         const cl = cosLat[py];
         const sl = sinLat[py];
         const e1 = n1z * sl;

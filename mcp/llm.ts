@@ -67,6 +67,9 @@ export interface LlmReply {
   text: string;
   model: string;
   ms: number;
+  /** 服务商回的用量(有就给):提示词 tokens 与前缀缓存命中数,用来验证分层是否有效 */
+  promptTokens?: number;
+  cachedTokens?: number;
 }
 
 /** 调一次 OpenAI 兼容的 /chat/completions;失败抛出带 HTTP 状态和正文的错误 */
@@ -94,7 +97,21 @@ export async function askLlm(messages: readonly LlmMessage[], s: LlmProviderSett
   const choice = (data as { choices?: { message?: { content?: unknown } }[] }).choices?.[0];
   const content = choice?.message?.content;
   if (typeof content !== 'string') throw new Error('LLM 返回里没有 choices[0].message.content');
-  return { text: content, model: s.model, ms: Date.now() - started };
+  const usage = (data as { usage?: { prompt_tokens?: unknown; prompt_cache_hit_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } } }).usage;
+  const promptTokens = typeof usage?.prompt_tokens === 'number' ? usage.prompt_tokens : undefined;
+  const cachedTokens =
+    typeof usage?.prompt_cache_hit_tokens === 'number'
+      ? usage.prompt_cache_hit_tokens
+      : typeof usage?.prompt_tokens_details?.cached_tokens === 'number'
+        ? usage.prompt_tokens_details.cached_tokens
+        : undefined;
+  return {
+    text: content,
+    model: s.model,
+    ms: Date.now() - started,
+    ...(promptTokens !== undefined ? { promptTokens } : {}),
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+  };
 }
 
 async function fetchJson(url: string, body: string, s: LlmProviderSettings): Promise<Response> {
@@ -106,6 +123,8 @@ async function fetchJson(url: string, body: string, s: LlmProviderSettings): Pro
 export interface ParsedDecision {
   reason: string;
   commands: unknown[];
+  /** 君主自主写入的记忆(清洗在 src/gen/civ/monarchMemory.ts) */
+  remember?: unknown[];
 }
 
 /** 从 LLM 的文本里抠出 {"reason":...,"commands":[...]};允许 ```json 代码块和前后废话 */
@@ -122,10 +141,11 @@ export function parseDecision(text: string): ParsedDecision {
   } catch (e) {
     throw new Error(`LLM 输出的 JSON 解析失败: ${e instanceof Error ? e.message : String(e)}`);
   }
-  const o = obj as { reason?: unknown; commands?: unknown };
+  const o = obj as { reason?: unknown; commands?: unknown; remember?: unknown };
   return {
     reason: typeof o.reason === 'string' ? o.reason : '',
     commands: Array.isArray(o.commands) ? o.commands : [],
+    ...(Array.isArray(o.remember) ? { remember: o.remember } : {}),
   };
 }
 

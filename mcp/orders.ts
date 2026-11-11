@@ -78,6 +78,11 @@ export const ORDER_KINDS: { kind: string; fields: string; note: string }[] = [
   { kind: 'temper', fields: 'a, person, leanings', note: '改某人的性格倾向' },
   { kind: 'disaster', fields: 'type: plague|famine|quake|pandemic, level: 1|2|3, city?/a?/region?/regions?', note: '天灾' },
   {
+    kind: 'intel',
+    fields: 'a(国键), b(目标国键), focus?: all|pop|stability|tax, result?: none|partial|full|blown',
+    note: '派人渗透他国:只记"谁摸谁的底、拿到哪几样",不改历史;result 由裁决层(Jev + 确定性抽签)写上,随命令史回放',
+  },
+  {
     kind: 'petty',
     fields: 'a(国键), effect: { type: "sack", loss: 1|2|3, city 或 region } | { type: "dev", years: 1..20 }',
     note: '小事件落地的既有事实:sack = 某城折损(人口下滑,之后会恢复),dev = 推一把发展;一般由小事件裁决层自动生成,君主不要手填',

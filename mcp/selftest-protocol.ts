@@ -112,7 +112,7 @@ function main(): void {
       ok(Array.isArray(polities) && polities.length > 0, 'civ_state_get 返回国家列表', polities?.length);
 
       const cat = payload(await call('civ_orders_catalog', {}));
-      ok((cat.kinds as unknown[]).length === 26, 'civ_orders_catalog 返回 26 种命令', (cat.kinds as unknown[])?.length);
+      ok((cat.kinds as unknown[]).length === 27, 'civ_orders_catalog 返回 27 种命令', (cat.kinds as unknown[])?.length);
 
       const sub = payload(
         await call('civ_orders_submit', {

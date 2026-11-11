@@ -601,6 +601,8 @@ function ivText(civ: Civ, v: Intervention): string {
       return `${id(v.a, 'polity', 'P')} 禁止扩张${until(v.until)}`;
     case 'press':
       return `${id(v.a, 'polity', 'P')} 坚持打${v.b !== undefined ? `(只管与 ${id(v.b, 'polity', 'P')} 的仗)` : ''}${until(v.until)}`;
+    case 'intel':
+      return `${id(v.a, 'polity', 'P')} 派人渗透 ${id(v.b, 'polity', 'P')}${v.result ? `(结果:${v.result})` : ''}`;
     case 'petty':
       return `${id(v.a, 'polity', 'P')} 小事件(${v.effect.type === 'dev' ? `发展 ${v.effect.years} 年` : `折损 ${v.effect.loss} 级`})`;
     case 'story':
@@ -945,6 +947,7 @@ const OP_WORDS: Record<string, string> = {
   unity: '禁止分裂',
   halt: '禁止扩张',
   press: '坚持打',
+  intel: '渗透',
   petty: '小事件',
   story: '故事事件',
   ally: '结盟',
@@ -1463,6 +1466,7 @@ const KIND_LABEL: Record<Intervention['kind'], string> = {
   unity: '禁止分裂',
   halt: '禁止扩张',
   press: '坚持打',
+  intel: '渗透',
   petty: '小事件',
   story: '故事事件',
   ally: '结盟',

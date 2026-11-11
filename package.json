@@ -31,6 +31,8 @@
     "mcp:selftest:field-plugin": "node mcp/.build/mcp/selftest-field-plugin.js",
     "mcp:selftest:plugin-loader": "node mcp/.build/mcp/selftest-plugin-loader.js",
     "mcp:selftest:tile-field": "node mcp/.build/mcp/selftest-tile-field.js",
+    "mcp:selftest:coast": "node mcp/.build/mcp/selftest-coast.js",
+    "mcp:selftest:monarch-sandbox": "node mcp/.build/mcp/selftest-monarch-sandbox.js",
     "mcp:serve": "node mcp/.build/mcp/server.js",
     "mcp:viewer": "node mcp/.build/mcp/viewer.js --port 5190"
   },
