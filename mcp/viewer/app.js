@@ -26,7 +26,17 @@
     ch: 480,
     dpr: 1,
     view: { k: 1, x: 0, y: 0 },
-    draw: { k: 1, ox: 0, oy: 0 },
+    draw: { k: 1, ox: 0, oy: 0, P: 1, H: 1 },
+    // 地形画法 + 放大后现算的高清瓦片(坐标锚在世界展开平面,不是屏幕,所以拖动时缓存照样命中)
+    style: 'fantasy',
+    tiles: new Map(),
+    tilePending: new Set(),
+    tileTimer: 0,
+    tileSeq: 0,
+    tileRetry: 0,
+    lod: 0,
+    vec: null,
+    vecWorldId: null,
     sel: null,
     grid: null,
     colors: {},
@@ -104,11 +114,20 @@
     magicLegendBar: $('#magicLegendBar'),
     magicLegendTicks: $('#magicLegendTicks'),
     btnWorld: $('#btnWorld'),
+    btnEmptyCreate: $('#btnEmptyCreate'),
     btnSession: $('#btnSession'),
     btnRound: $('#btnRound'),
     btnAuto: $('#btnAuto'),
     btnVerify: $('#btnVerify'),
     btnExport: $('#btnExport'),
+    paramsPanel: $('#paramsPanel'),
+    btnParams: $('#btnParams'),
+    btnParamsClose: $('#btnParamsClose'),
+    zoomIn: $('#zoomIn'),
+    zoomOut: $('#zoomOut'),
+    zoomReset: $('#zoomReset'),
+    zoomVal: $('#zoomVal'),
+    mapStyle: $('#mapStyle'),
     status: $('#status'),
     hint: $('#hint'),
     map: $('#map'),
@@ -252,8 +271,10 @@
    * 地图
    * ------------------------------------------------------------------ */
 
+  // 地图铺满窗口:缩放基准取两向里较大的那个,整张图永远盖住舞台。
+  // 横向多出来的部分可以无限拖,拖到头会接上另一侧(和主站一样,世界东西相连)。
   function fitScale() {
-    return Math.min(S.cw / Math.max(1, S.mapW), S.ch / Math.max(1, S.mapH));
+    return Math.max(S.cw / Math.max(1, S.mapW), S.ch / Math.max(1, S.mapH));
   }
 
   function resizeCanvas() {
@@ -264,34 +285,382 @@
     S.dpr = Math.min(2, window.devicePixelRatio || 1);
     el.map.width = Math.round(S.cw * S.dpr);
     el.map.height = Math.round(S.ch * S.dpr);
+    normalizeView();
     draw();
   }
 
+  // 纵向不再夹住:世界是球面,越过极点会接到另一侧。只把累积的位移折回偶数层
+  // (两层 = 绕极点转一整圈 360°,画面完全相同),免得长时间拖动后坐标变成很大的浮点数。
+  function normalizeView() {
+    const H = Math.max(1, S.mapH * fitScale() * S.view.k);
+    if (Math.abs(S.view.y) > H * 8) {
+      const even = 2 * Math.round(S.view.y / (2 * H));
+      S.view.y -= even * H;
+    }
+    const P = Math.max(1, S.mapW * fitScale() * S.view.k);
+    if (Math.abs(S.view.x) > P * 8) S.view.x -= Math.round(S.view.x / P) * P;
+  }
+
+  // 世界 x 折算回 [0, mapW):拖出去的那一份按同一条经线算
+  function wrapX(mx) {
+    const w = Math.max(1, S.mapW);
+    return ((mx % w) + w) % w;
+  }
+
+  /**
+   * 当前视图。ox / oyAbs 是"第 0 层、第 0 份主图左上角"的屏幕位置(不再取模,
+   * 因为纵向层的奇偶决定要不要镜像);ox 另给一个落到 [-P, 0) 的版本用来横向平铺。
+   */
+  function viewMetrics() {
+    const k = fitScale() * S.view.k;
+    const P = S.mapW * k;
+    const H = S.mapH * k;
+    const oxAbs = (S.cw - P) / 2 + S.view.x;
+    const oyAbs = (S.ch - H) / 2 + S.view.y;
+    const ox = ((oxAbs % P) + P) % P - P;
+    return { k, P, H, ox, oxAbs, oyAbs };
+  }
+
   function draw() {
-    if (!el.map || !ctx || !S.baseImg) return;
+    if (!el.map || !ctx) return;
     const { cw, ch, dpr } = S;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
+    if (!S.baseImg) {
+      updateZoomLabel();
+      return;
+    }
 
-    const fit = fitScale();
-    const k = fit * S.view.k;
-    const ox = (cw - S.mapW * k) / 2 + S.view.x;
-    const oy = (ch - S.mapH * k) / 2 + S.view.y;
-    S.draw = { k, ox, oy };
-
+    const { k, P, H, ox, oxAbs, oyAbs } = viewMetrics();
+    S.draw = { k, ox, oy: oyAbs, P, H, oxAbs };
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(S.baseImg, ox, oy, S.mapW * k, S.mapH * k);
-    // 场叠加层:只把渲染层给的 PNG 贴上去,数值不动
-    if (S.field.on && S.field.img) ctx.drawImage(S.field.img, ox, oy, S.mapW * k, S.mapH * k);
-    // 本局动态层(魔力):也是渲染层给的 PNG,贴在底图之上、国界之下
-    if (S.magic.on && S.magic.img) ctx.drawImage(S.magic.img, ox, oy, S.mapW * k, S.mapH * k);
-    if (S.ownersImg) ctx.drawImage(S.ownersImg, ox, oy, S.mapW * k, S.mapH * k);
 
-    if (S.state) drawLabels(ctx, ox, oy, k);
+    // 可见的纵向层(可正可负)。奇数层 = 越过一次极点:整张图上下翻转 + 横向挪半圈,
+    // 这正是球面在极点的真实接法,和主站地球仪跨极一致;地形、气候、疆域都跟着接上。
+    const n0 = Math.floor((0 - oyAbs) / H);
+    const n1 = Math.floor((ch - oyAbs) / H);
+    const mCount = Math.max(1, Math.ceil(cw / P) + 1);
+    const rects = [];
+    for (let n = n0; n <= n1; n++) {
+      const yTop = oyAbs + n * H;
+      if (yTop > ch || yTop + H < 0) continue;
+      const odd = ((n % 2) + 2) % 2 === 1;
+      for (let m = 0; m <= mCount; m++) {
+        const x = ox + m * P - (odd ? P / 2 : 0);
+        if (x > cw || x + P < 0) continue;
+        rects.push({ x, yTop, odd });
+      }
+    }
+    // 每层先铺底图,再把现算的高清瓦片盖在底图上,最后才叠场 / 魔力 / 疆域,
+    // 这样国家颜色不会被地形盖掉。
+    for (const r of rects) {
+      ctx.save();
+      if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
+      ctx.drawImage(S.baseImg, r.x, r.yTop, P, H);
+      ctx.restore();
+    }
+    const nextLod = currentLod();
+    if (nextLod !== S.lod) S.tileSeq++;  // 换档时让上一档还没发完的请求作废(缓存留着,来回缩放还能用)
+    S.lod = nextLod;
+    drawHiTiles();
+    for (const r of rects) {
+      ctx.save();
+      if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
+      const overlays = [S.field.on ? S.field.img : null, S.magic.on ? S.magic.img : null, S.ownersImg];
+      for (const img of overlays) if (img) ctx.drawImage(img, r.x, r.yTop, P, H);
+      ctx.restore();
+    }
+    // 墨线 / 波纹 / 符号是矢量,按固定屏幕线宽画在最上层,放大多少倍都不变粗
+    drawVectors(rects, k, P, H);
+    for (const r of rects) {
+      // 文字不能跟着翻转,单独按镜像后的位置画
+      if (S.state) drawLabels(ctx, r.x, r.yTop, k, r.odd, H);
+    }
+    scheduleTiles();
+    updateZoomLabel();
   }
 
-  function drawLabels(c, ox, oy, k) {
+  /* ------------------------------------------------------------------ *
+   * 放大后按倍数现算的高清地形(和主站 tileWorker 同一套 rasterizeWindow)
+   *
+   * 底图是 1 倍主图(2048 × 1024),够缩小时用;放大到超过它以后,服务端按当前
+   * 倍数把屏幕上那几块重新铺像素 + 上色,前端只负责贴。块的坐标锚在球面展开
+   * 平面上(不是屏幕上),所以拖动时已经算过的块还能接着用。
+   * ------------------------------------------------------------------ */
+  const TILE = 512;
+  const LOD_MAX = 16;
+
+  function currentLod() {
+    const kd = fitScale() * S.view.k * S.dpr;
+    // 1 倍底图(2048 宽)本身够缩小时用。高分屏上 100% 的 kd 也可能 > 1,但那样
+    // 只会生成 1.4 倍的低档瓦片,和整图拼起来反而出现细线 / 色块(见"缩小错乱"),
+    // 所以只有真正放大到 2 倍档才现算,最小档也从 2 倍起。
+    if (kd <= 1.8 || S.style === 'classic') return 0;
+    // √2 一档:倍数小幅变化时不必重算,又能在 2 / 4 / 8 倍明显提分辨率
+    return clamp(2 ** (Math.round(Math.log2(kd) * 2) / 2), 2, LOD_MAX);
+  }
+
+  function clearTiles() {
+    S.tiles.clear();
+    S.tilePending.clear();
+    S.tileSeq++;
+    S.tileRetry = 0;
+    if (S.tileTimer) clearTimeout(S.tileTimer);
+    S.tileTimer = 0;
+  }
+
+  function scheduleTiles() {
+    if (!S.worldId || S.style === 'classic' || !S.lod) return;
+    if (S.tileTimer) clearTimeout(S.tileTimer);
+    S.tileTimer = setTimeout(() => { S.tileTimer = 0; void loadHiTiles(); }, 180);
+  }
+
+  /** 当前视口需要哪些块,以及每块贴在屏幕哪里 */
+  function tileGrid() {
+    if (!S.lod || !S.baseImg || !S.worldId) return null;
+    const { k, oxAbs, oyAbs } = viewMetrics();
+    const f = S.lod / k;
+    const step = TILE * k / S.lod;
+    return {
+      lod: S.lod, step, oxAbs, oyAbs,
+      i0: Math.floor((-oxAbs * f) / TILE),
+      i1: Math.floor(((S.cw - oxAbs) * f) / TILE),
+      j0: Math.floor((-oyAbs * f) / TILE),
+      j1: Math.floor(((S.ch - oyAbs) * f) / TILE),
+    };
+  }
+
+  function drawHiTiles() {
+    const g = tileGrid();
+    if (!g) return;
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        const img = S.tiles.get(`${g.lod}|${i}|${j}`);
+        if (!img) continue;
+        ctx.drawImage(img, g.oxAbs + i * g.step, g.oyAbs + j * g.step, g.step + 0.6, g.step + 0.6);
+      }
+    }
+  }
+
+  async function loadHiTiles() {
+    const g = tileGrid();
+    if (!g) return;
+    const seq = S.tileSeq;
+    const style = S.style;   // 换画法时旧任务必须整批作废,否则会用新画法 + 旧倍数发请求
+    const want = [];
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        const key = `${g.lod}|${i}|${j}`;
+        if (!S.tiles.has(key) && !S.tilePending.has(key)) want.push({ i, j, key });
+      }
+    }
+    if (!want.length) return;
+    // 屏幕中间的先算,观感上先清楚起来;最多一批 3 块并发
+    const cx = (g.i0 + g.i1) / 2;
+    const cy = (g.j0 + g.j1) / 2;
+    want.sort((a, b) => (Math.abs(a.i - cx) + Math.abs(a.j - cy)) - (Math.abs(b.i - cx) + Math.abs(b.j - cy)));
+    const jobs = want.slice(0, 16);
+    for (const w of jobs) S.tilePending.add(w.key);
+    const stale = () => seq !== S.tileSeq || S.style !== style || S.lod !== g.lod;
+    const one = async (w) => {
+      if (stale()) { S.tilePending.delete(w.key); return; }
+      const url = `/api/map/tile?worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(style)}`
+        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}`;
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const img = await createImageBitmap(await r.blob());
+        if (stale()) return;
+        S.tiles.set(w.key, img);
+        if (S.tiles.size > 160) {
+          const first = S.tiles.keys().next().value;
+          if (first) S.tiles.delete(first);
+        }
+        draw();
+      } catch (_) {
+        // 单块失败(代理超时等)就继续用拉伸的底图,晚点再试一次,不打断对局
+        if (!stale() && S.tileRetry < 3) {
+          S.tileRetry++;
+          setTimeout(() => scheduleTiles(), 1400);
+        }
+      } finally {
+        S.tilePending.delete(w.key);
+      }
+    };
+    for (let p = 0; p < jobs.length; p += 3) await Promise.all(jobs.slice(p, p + 3).map(one));
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 矢量细节层(主站 render/detail.ts 的做法):海岸线、近岸波纹、山/树符号
+   *
+   * 底图与高清瓦片里的墨线 / 波纹已经在服务端去掉,这里按固定屏幕线宽画。
+   * 所以放大到 1200% 墨线仍是 1.15px、符号按倍数分级变多,而不是把位图拉糊。
+   * ------------------------------------------------------------------ */
+  function withBox(line) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let i = 0; i < line.length; i += 2) {
+      const x = line[i], y = line[i + 1];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+    return { p: line, x0, y0, x1, y1 };
+  }
+
+  function loadVectors() {
+    if (S.style !== 'fantasy') return;
+    if (S.vec && S.vecWorldId === S.worldId) return;
+    const wid = S.worldId;
+    fetch(`/api/map/vectors?worldId=${encodeURIComponent(wid)}`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then((v) => {
+        if (wid !== S.worldId) return;
+        v.coast = v.coast.map(withBox);
+        v.lake = v.lake.map(withBox);
+        v.ripple = v.ripple.map((group) => group.map(withBox));
+        v.coastFine = v.coastFine.map(withBox);
+        v.lakeFine = v.lakeFine.map(withBox);
+        v.rippleFine = v.rippleFine.map((group) => group.map(withBox));
+        S.vec = v;
+        S.vecWorldId = wid;
+        draw();
+      })
+      .catch(() => {
+        // 拿不到矢量层多半是监视台进程还是旧代码(没重启),此时位图墨线已被服务端抹掉,
+        // 画面会缺描边。明确提示,别让用户以为是地图坏了。
+        S.vec = null;
+        toast('矢量地图数据加载失败:请关掉旧窗口、重新双击 启动.bat', true);
+      });
+  }
+
+  function drawGlyph(g, x, y, unit) {
+    const kind = g[2];
+    // 后几级(放大后才出现)的符号画小一点:像主站那样一级一级补细节,而不是一起撑成大三角
+    const tier = 1 / (1 + Math.log2(Math.max(1, g[7])) * 0.55);
+    const s = clamp(g[3] * unit * tier, 2.5, 24);
+    const w = s * (0.75 + g[6] * 0.12);
+    ctx.lineWidth = clamp(s * 0.085, 0.8, 1.5);
+    ctx.strokeStyle = 'rgba(58,45,34,0.78)';
+    ctx.fillStyle = 'rgba(238,228,201,0.82)';
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    if (kind === 0 || kind === 7) {          // 山 / 火山
+      ctx.moveTo(x - w, y);
+      ctx.lineTo(x - w * 0.12, y - s * 0.9);
+      ctx.lineTo(x + w, y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - w * 0.12, y - s * 0.9);
+      ctx.lineTo(x + w * 0.16, y - s * 0.45);
+      ctx.lineTo(x + w * 0.38, y);
+      ctx.stroke();
+      if (kind === 7) {
+        ctx.beginPath();
+        ctx.moveTo(x - w * 0.12, y - s * 0.9);
+        ctx.quadraticCurveTo(x + w * 0.1, y - s * 1.3, x, y - s * 1.55);
+        ctx.stroke();
+      }
+    } else if (kind === 1) {                 // 丘陵
+      ctx.moveTo(x - s * 0.7, y);
+      ctx.quadraticCurveTo(x, y - s * 0.85, x + s * 0.7, y);
+      ctx.stroke();
+    } else if (kind === 5) {                 // 沙丘
+      ctx.moveTo(x - s * 0.6, y);
+      ctx.quadraticCurveTo(x - s * 0.1, y - s * 0.45, x + s * 0.6, y);
+      ctx.stroke();
+    } else if (kind === 6) {                 // 草丛
+      for (let i = -1; i <= 1; i++) {
+        ctx.moveTo(x + i * s * 0.18, y);
+        ctx.lineTo(x + i * s * 0.18 + s * 0.12, y - s * 0.5);
+      }
+      ctx.stroke();
+    } else {                                 // 沼泽
+      ctx.moveTo(x - s * 0.5, y);
+      ctx.lineTo(x + s * 0.5, y);
+      ctx.moveTo(x - s * 0.35, y - s * 0.22);
+      ctx.lineTo(x + s * 0.2, y - s * 0.22);
+      ctx.stroke();
+    }
+  }
+
+  function drawVectors(rects, k, P, H) {
+    const v = S.vec;
+    if (!v || S.style !== 'fantasy' || !rects.length) return;
+    const { cw, ch } = S;
+    const W = S.mapW;
+    const sx = P / S.mapW;              // 屏幕像素 / 整图像素
+    const sy = H / S.mapH;
+    const relK = S.view.k;              // 1 = 默认视图;符号的分级 / 收缩按相对倍数算
+    const gs = relK <= 1.35 ? 1 : Math.pow(relK / 1.35, -0.22);
+    const unit = gs * sx;               // 符号大小:比地图放大得慢,不会撑满屏幕
+    const fine = relK >= 2.5;           // 放大后换成没怎么抽稀的线,曲线才不会被放大成折线
+    const coast = fine ? v.coastFine : v.coast;
+    const lake = fine ? v.lakeFine : v.lake;
+    const ripples = fine ? v.rippleFine : v.ripple.slice(0, 2);
+
+    for (const r of rects) {
+      const fx = (px) => r.x + px * sx;
+      const fy = (py) => (r.odd ? r.yTop + H - py * sy : r.yTop + py * sy);
+      // 逐线段裁剪,而不是整条折线的包围盒:长海岸线可能横跨整幅地图,用整条线的
+      // bbox 判断会漏画局部;一次塞进超长路径描边也可能丢后半段。每 3000 段 flush 一次。
+      const strokeLines = (lists, color, lw) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        let seg = 0;
+        for (const list of lists) {
+          for (const b of list) {
+            const p = b.p;
+            // 东西相连:跨 180° 经线的海岸线会伸出左右边界,要在另一侧再补一份,
+            // 否则那段海岸只在"某一份平铺副本"里出现,拖到屏幕边缘就没了(主站 chunkPath / wrapShifts 同款)。
+            const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
+            for (const sh of shifts) {
+              for (let i = 0; i + 3 < p.length; i += 2) {
+                const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
+                const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
+                if (!Number.isFinite(x0 + y0 + x1 + y1)) continue;
+                if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
+                  || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) continue;
+                ctx.moveTo(x0, y0);
+                ctx.lineTo(x1, y1);
+                if (++seg >= 3000) { ctx.stroke(); ctx.beginPath(); seg = 0; }
+              }
+            }
+          }
+        }
+        ctx.stroke();
+      };
+      ctx.save();
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      strokeLines(ripples, 'rgba(58,45,34,0.17)', 1);
+      strokeLines([lake, coast], 'rgba(58,45,34,0.86)', 1.15);
+      ctx.restore();
+      for (const g of v.glyphs) {
+        if (g[7] > relK + 0.01) continue;   // z:放大后逐级出现更多符号
+        const gy = r.odd ? r.yTop + H - g[1] * sy : r.yTop + g[1] * sy;
+        if (gy < -24 || gy > ch + 24) continue;
+        // 贴着 ±180° 经线的符号也在另一侧补一份,免得拖到边缘时缺一截
+        const shifts = g[0] < 24 ? [0, W] : g[0] > W - 24 ? [0, -W] : [0];
+        for (const sh of shifts) {
+          const gx = r.x + (g[0] + sh) * sx;   // 位置跟着地图,不跟着符号缩放
+          if (gx < -24 || gx > cw + 24) continue;
+          drawGlyph(g, gx, gy, unit);
+        }
+      }
+    }
+  }
+
+  function updateZoomLabel() {
+    if (el.zoomVal) el.zoomVal.textContent = `${Math.round(S.view.k * 100)}%`;
+  }
+
+  function drawLabels(c, ox, oy, k, odd, H) {
     const state = S.state;
     const list = (state.polities || []).slice(0, 16);
     if (S.sel !== null) {
@@ -304,7 +673,7 @@
     for (const p of list) {
       if (!p.capital) continue;
       const sx = ox + p.capital.x * S.mapW * k;
-      const sy = oy + p.capital.y * S.mapH * k;
+      const sy = odd ? oy + H - p.capital.y * S.mapH * k : oy + p.capital.y * S.mapH * k;
       if (sx < -40 || sy < -20 || sx > S.cw + 40 || sy > S.ch + 20) continue;
       const selected = p.id === S.sel;
       c.save();
@@ -324,20 +693,88 @@
     }
   }
 
+  /** 屏幕点 → 主图上的 (mx, my)。跨极层按 draw() 用的同一套镜像 / 半圈偏移反算。 */
+  function mapPointAt(x, y) {
+    const { k, ox, oy } = S.draw;
+    const ux = wrapX((x - ox) / k);
+    const vy = (y - oy) / k;
+    const n = Math.floor(vy / S.mapH);
+    const odd = ((n % 2) + 2) % 2 === 1;
+    const mx = odd ? wrapX(ux - S.mapW / 2) : ux;
+    const my = odd ? (n + 1) * S.mapH - vy : vy - n * S.mapH;
+    if (my < 0 || my > S.mapH) return null;
+    return { mx, my };
+  }
+
   function pickPolity(clientX, clientY) {
     if (!el.map || !S.grid) return null;
     const rect = el.map.getBoundingClientRect();
-    const x = clientX - rect.left;
-    const y = clientY - rect.top;
-    const { k, ox, oy } = S.draw;
-    const mx = (x - ox) / k;
-    const my = (y - oy) / k;
-    if (mx < 0 || my < 0 || mx > S.mapW || my > S.mapH) return null;
-    const gx = Math.floor((mx / S.mapW) * S.grid.w);
-    const gy = Math.floor((my / S.mapH) * S.grid.h);
+    const p = mapPointAt(clientX - rect.left, clientY - rect.top);
+    if (!p) return null;
+    const gx = Math.floor((p.mx / S.mapW) * S.grid.w);
+    const gy = Math.floor((p.my / S.mapH) * S.grid.h);
     if (gx < 0 || gy < 0 || gx >= S.grid.w || gy >= S.grid.h) return null;
     const id = S.grid.owner[gy * S.grid.w + gx];
     return typeof id === 'number' && id >= 0 ? id : null;
+  }
+
+  // 以 (px, py) 为中心缩放(px/py 是画布内坐标);横向回环时锚点照样对得上
+  function zoomAt(factor, px, py) {
+    if (!S.baseImg) return;
+    const fit = fitScale();
+    const k0 = fit * S.view.k;
+    const { oxAbs, oy } = S.draw;
+    const wx = (px - oxAbs) / k0;
+    const wy = (py - oy) / k0;
+    const next = clamp(S.view.k * factor, 1, 12);
+    if (Math.abs(next - S.view.k) < 1e-4) return;
+    S.view.k = next;
+    const k2 = fit * next;
+    S.view.x = px - wx * k2 - (S.cw - S.mapW * k2) / 2;
+    S.view.y = py - wy * k2 - (S.ch - S.mapH * k2) / 2;
+    normalizeView();
+    draw();
+  }
+
+  function resetView() {
+    S.view = { k: 1, x: 0, y: 0 };
+    normalizeView();
+    draw();
+  }
+
+  // 浮窗的开关:参数抽屉、面板收起、缩放按钮
+  function bindChrome() {
+    const setParams = (on) => {
+      if (!el.paramsPanel) return;
+      el.paramsPanel.hidden = !on;
+      document.body.classList.toggle('params-open', on);
+      if (el.btnParams) el.btnParams.setAttribute('aria-expanded', on ? 'true' : 'false');
+    };
+    el.btnParams?.addEventListener('click', () => setParams(el.paramsPanel ? el.paramsPanel.hidden : false));
+    el.btnParamsClose?.addEventListener('click', () => setParams(false));
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && el.paramsPanel && !el.paramsPanel.hidden) setParams(false);
+    });
+
+    for (const btn of $$('[data-fold]')) {
+      btn.addEventListener('click', () => {
+        const panel = document.getElementById(btn.dataset.fold);
+        if (!panel) return;
+        const folded = panel.classList.toggle('folded');
+        btn.setAttribute('aria-label', folded ? '展开面板' : '收起面板');
+        btn.title = folded ? '展开' : '收起';
+      });
+    }
+
+    el.zoomIn?.addEventListener('click', () => zoomAt(1.5, S.cw / 2, S.ch / 2));
+    el.zoomOut?.addEventListener('click', () => zoomAt(1 / 1.5, S.cw / 2, S.ch / 2));
+    el.zoomReset?.addEventListener('click', () => resetView());
+
+    // 窄屏先把国家面板收起来,地图留大点
+    if (window.innerWidth < 860) {
+      const side = document.getElementById('sidePanel');
+      if (side) side.classList.add('folded');
+    }
   }
 
   function bindMap() {
@@ -360,6 +797,7 @@
       drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
       S.view.x = drag.ox + dx;
       S.view.y = drag.oy + dy;
+      normalizeView();
       draw();
     });
     el.map.addEventListener('pointerup', (e) => {
@@ -374,33 +812,26 @@
       el.map.classList.remove('dragging');
     });
     el.map.addEventListener('pointerleave', () => setFieldTipVisible(false));
+    el.map.addEventListener('dblclick', (e) => {
+      if (!S.baseImg) return;
+      const rect = el.map.getBoundingClientRect();
+      zoomAt(1.6, e.clientX - rect.left, e.clientY - rect.top);
+    });
     el.map.addEventListener('wheel', (e) => {
       if (!S.baseImg) return;
       e.preventDefault();
       const rect = el.map.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const py = e.clientY - rect.top;
-      const { k, ox, oy } = S.draw;
-      const wx = (px - ox) / k;
-      const wy = (py - oy) / k;
-      const next = clamp(S.view.k * Math.exp(-e.deltaY * 0.0012), 1, 12);
-      if (Math.abs(next - S.view.k) < 1e-4) return;
-      S.view.k = next;
-      const fit = fitScale();
-      const k2 = fit * next;
-      S.view.x = px - wx * k2 - (S.cw - S.mapW * k2) / 2;
-      S.view.y = py - wy * k2 - (S.ch - S.mapH * k2) / 2;
-      draw();
+      zoomAt(Math.exp(-e.deltaY * 0.0012), e.clientX - rect.left, e.clientY - rect.top);
     }, { passive: false });
   }
 
-  async function loadBaseMap() {
+  async function loadBaseMap(keepView = false) {
     if (!S.worldId) return;
     el.mapLoading.classList.remove('hidden');
     el.mapLoadingText.textContent = '地图绘制中…';
     el.mapEmpty.classList.add('hidden');
     try {
-      const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(S.worldId)}`);
+      const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(S.style)}`);
       if (!r.ok) {
         let msg = `HTTP ${r.status}`;
         try { msg = (await r.json()).error || msg; } catch (_) { /* ignore */ }
@@ -410,8 +841,10 @@
       S.baseImg = await createImageBitmap(blob);
       S.mapW = S.baseImg.width;
       S.mapH = S.baseImg.height;
-      S.view = { k: 1, x: 0, y: 0 };
+      if (!keepView) S.view = { k: 1, x: 0, y: 0 };
+      clearTiles();
       resizeCanvas();
+      void loadVectors();
     } catch (e) {
       toast(`地图生成失败:${e instanceof Error ? e.message : String(e)}`, true);
     } finally {
@@ -488,10 +921,9 @@
     const rect = el.map.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    const { k, ox, oy } = S.draw;
-    const mx = (x - ox) / k;
-    const my = (y - oy) / k;
-    if (mx < 0 || my < 0 || mx > S.mapW || my > S.mapH) return setFieldTipVisible(false);
+    const p = mapPointAt(x, y);
+    if (!p) return setFieldTipVisible(false);
+    const { mx, my } = p;
     const lon = ((mx / S.mapW) * 360 - 180).toFixed(1);
     const lat = (90 - (my / S.mapH) * 180).toFixed(1);
     const lines = [];
@@ -822,7 +1254,7 @@
     const warHtml = wars
       .map((w) => {
         const others = (w.polities || []).filter((id) => id !== p.id).map((id) => nameOfPolity(st, id));
-        return `<div class="ev-row" style="grid-template-columns: 1fr; border-bottom: 1px dashed #18232e;"><div class="ev-text">与 ${others.map(esc).join('、')}:${esc(w.text)} <span class="muted">(${w.year}–${w.end} 年)</span></div></div>`;
+        return `<div class="ev-row war-line"><div class="ev-text">与 ${others.map(esc).join('、')}:${esc(w.text)} <span class="muted">(${w.year}–${w.end} 年)</span></div></div>`;
       })
       .join('') || '<span class="muted">现在没有在打的仗</span>';
 
@@ -882,7 +1314,7 @@
         const label = d.kind === 'trade' ? '小贸易' : d.kind === 'disaster' ? '天灾' : d.kind === 'story' ? '故事事件' : 'DM';
         return `
           <div class="dec-item">
-            <span class="pol-dot" style="background:#8a7cff"></span>
+            <span class="pol-dot dm"></span>
             <div class="dec-country"><span class="name">${esc(label)}</span><span class="badge">DM</span></div>
             <div class="dec-body">
               <div class="dec-reason${d.summary || d.note ? '' : ' empty'}">${esc(d.summary || d.note || '（没有说明）')}</div>
@@ -1072,6 +1504,9 @@
     if (el.btnMagicNow) el.btnMagicNow.disabled = !hasSession || S.busy;
     el.btnAuto.textContent = S.autoOn ? '暂停自动播放' : '自动播放';
     el.btnAuto.classList.toggle('playing', S.autoOn);
+    // 已经有世界了就把「创建世界」从主按钮降级,免得一直抢眼
+    el.btnWorld.classList.toggle('cta', !hasWorld);
+    el.btnWorld.classList.toggle('quiet', hasWorld);
   }
 
   /* ------------------------------------------------------------------ *
@@ -1104,6 +1539,8 @@
       setHint(`世界 ${d.worldId} 已生成(${fmtInt(d.cells)} 地块)。下一步:设置起始年,点「开始会话」。`);
       await loadBaseMap();
       if (S.baseImg) el.mapEmpty.classList.add('hidden');
+      if (el.mapTitle) el.mapTitle.textContent = '世界已就绪';
+      if (el.mapSub) el.mapSub.textContent = '主站同款地形画法 · 东西与跨极都能无限拖动 · 放大会现算高清 · 下一步点「② 开始会话」';
       refreshButtons();
       toast(`世界已创建:${d.worldId}`);
     } catch (e) {
@@ -1301,7 +1738,17 @@
    * ------------------------------------------------------------------ */
 
   function bind() {
+    if (el.mapStyle) {
+      el.mapStyle.value = S.style;
+      el.mapStyle.addEventListener('change', () => {
+        S.style = el.mapStyle.value;
+        if (!S.worldId) return;
+        clearTiles();
+        void loadBaseMap(true);   // 换画法不重置缩放 / 拖动位置
+      });
+    }
     el.btnWorld.addEventListener('click', () => { void createWorld(); });
+    if (el.btnEmptyCreate) el.btnEmptyCreate.addEventListener('click', () => { void createWorld(); });
     el.btnSession.addEventListener('click', () => { void startSession(); });
     el.btnRound.addEventListener('click', () => { void runRound(); });
     el.btnAuto.addEventListener('click', () => {
@@ -1417,6 +1864,7 @@
       new ResizeObserver(() => resizeCanvas()).observe(el.mapWrap);
     }
     bindMap();
+    bindChrome();
 
     el.provider.disabled = el.mock.checked;
     el.apiKey.disabled = el.mock.checked;

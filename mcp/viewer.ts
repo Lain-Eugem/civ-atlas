@@ -55,6 +55,7 @@ import {
   type FieldStyle,
 } from './field-render';
 import { DEFAULT_MAGIC_STYLE, renderMagicMap, magicDataJson, magicLegendOf, magicLayerOf } from './magic-render';
+import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
 
@@ -248,10 +249,12 @@ function mix(c0: RGB, c1: RGB, t: number, out: Uint8Array, o: number): void {
 }
 
 /* ------------------------------------------------------------------ *
- * 三角形栅格化(等距圆柱主图,1024 像素宽)
+ * 三角形栅格化(等距圆柱主图,2048 像素宽)
+ * 地图在页面上是铺满整个窗口的,1024 宽会被放大到 1.7 倍以上而发虚;
+ * 2048 宽在常见屏幕上正好是 1:1 左右。点击选国用的是下面另算的 240 格网格,不受这里影响。
  * ------------------------------------------------------------------ */
 
-const MAP_OUT_W = 1024;
+const MAP_OUT_W = 2048;
 
 function triangleFill(
   px: Uint8Array,
@@ -595,6 +598,11 @@ function stateView(s: Session): Record<string, unknown> {
  * ------------------------------------------------------------------ */
 
 const baseCache = new Map<string, Buffer>();
+/** 高清瓦片:key = worldId | 画法 | LOD | 球面展开坐标上的块号 */
+const tileCache = new Map<string, Buffer>();
+const TILE_CACHE_MAX = 192;
+/** 矢量层(海岸线 / 波纹 / 符号):按世界缓存一份 JSON */
+const vectorCache = new Map<string, string>();
 const ownerCache = new Map<string, { fingerprint: string; json: Record<string, unknown> }>();
 const chronCache = new Map<string, { fingerprint: string; entries: EventView[]; total: number }>();
 /** 场的计算层帧缓存:键 = worldId|kind|seed|scale;同世界同参数只算一次 */
@@ -651,14 +659,30 @@ function sendPng(res: ServerResponse, png: Buffer): void {
 }
 
 
-function getBasePng(worldId: string): Buffer {
-  const hit = baseCache.get(worldId);
+function styleOf(q: URLSearchParams): TerrainStyle {
+  const s = q.get('style');
+  return isTerrainStyle(s) ? s : 'fantasy';
+}
+
+function getBasePng(worldId: string, style: TerrainStyle): Buffer {
+  const key = `${worldId}|${style}`;
+  const hit = baseCache.get(key);
   if (hit) return hit;
   const rec = getWorldRecord(worldId);
-  const map = renderWorldMap(rec.world);
+  // classic = 改造前沙盒自己的三角栅格底图,留作对照 / 兜底;其余三种直接跑主站的渲染管线
+  const map = style === 'classic' ? renderWorldMap(rec.world) : renderWhole(rec.world, style);
   const png = encodePng(map.width, map.height, map.rgba);
-  baseCache.set(worldId, png);
+  baseCache.set(key, png);
   return png;
+}
+
+/** 缓存按 LRU 简单封顶,免得反复放大把内存吃光 */
+function cacheTile(key: string, png: Buffer): void {
+  tileCache.set(key, png);
+  if (tileCache.size > TILE_CACHE_MAX) {
+    const oldest = tileCache.keys().next().value;
+    if (oldest !== undefined) tileCache.delete(oldest);
+  }
 }
 
 function getOwnerMap(s: Session): { png: Buffer; grid: { w: number; h: number; owner: number[] }; colors: Record<string, string>; fingerprint: string; width: number; height: number } {
@@ -765,9 +789,48 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
   if (method === 'GET' && pathname === '/api/map/base') {
     const worldId = url.searchParams.get('worldId') ?? '';
     if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
-    const png = getBasePng(worldId);
-    res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store' });
-    res.end(png);
+    sendPng(res, getBasePng(worldId, styleOf(url.searchParams)));
+    return true;
+  }
+
+  // 矢量层:墨线、近岸波纹、山/树符号,放大后按固定屏幕线宽画,不随倍率变粗
+  if (method === 'GET' && pathname === '/api/map/vectors') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    let json = vectorCache.get(worldId);
+    if (!json) {
+      const rec = getWorldRecord(worldId);
+      json = JSON.stringify(renderVectors(rec.world));
+      vectorCache.set(worldId, json);
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
+    return true;
+  }
+
+  // 放大后按屏幕现算的一块(同主站 tileWorker):(x, y) 是球面展开平面上的坐标,可以越过南北极
+  if (method === 'GET' && pathname === '/api/map/tile') {
+    const q = url.searchParams;
+    const worldId = q.get('worldId') ?? '';
+    const S = Number(q.get('S'));
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    const size = Number(q.get('size'));
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    if (!Number.isFinite(S) || S < 0.25 || S > 24) { fail(res, 400, 'S 超出范围'); return true; }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
+    const style = styleOf(q);
+    if (style === 'classic') { fail(res, 400, 'classic 画法没有高清瓦片'); return true; }
+    const key = `${worldId}|${style}|${S}|${x}|${y}|${size}`;
+    let png = tileCache.get(key);
+    if (!png) {
+      const rec = getWorldRecord(worldId);
+      const map = renderTile(rec.world, style, S, x, y, size);
+      png = encodePng(map.width, map.height, map.rgba);
+      cacheTile(key, png);
+    }
+    sendPng(res, png);
     return true;
   }
 

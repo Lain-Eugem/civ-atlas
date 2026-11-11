@@ -4,6 +4,7 @@ snaps
 *.log
 .DS_Store
 .claude/
+.workbuddy/
 
 mcp/.build/
 mcp/.runs/

@@ -357,7 +357,18 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 
 ## 浏览器查看器(阶段 4)
 
-不想配 MCP 客户端时,可以直接用浏览器看多 Agent 对局:
+不想配 MCP 客户端时,可以直接用浏览器看多 Agent 对局。**推荐用主站的开发服务器**:一个 `pnpm dev` 就能同时打开主站和监视台,不用另开端口。
+
+```powershell
+# 在仓库根目录
+pnpm dev
+# 主站   http://127.0.0.1:5188
+# 沙盒   http://127.0.0.1:5188/sandbox/     (首页左下角也有入口)
+```
+
+`scripts/lib/sandboxViewer.ts` 会在开发服务器启动后自动做三件事:`mcp/.build` 缺了或比 `mcp/*.ts` 旧就重新构建一次、起一个只监听本机的监视台进程(随机空闲端口)、把 `/sandbox/*` 和 `/api/*` 转给它。这套只在 `pnpm dev` 时生效,生产构建没有。
+
+也可以单独起监视台(不跑主站时):
 
 ```powershell
 # 先构建,再启动(仓库根目录)
@@ -366,14 +377,35 @@ node mcp/.build/mcp/viewer.js --port 5190
 # 浏览器打开 http://127.0.0.1:5190
 ```
 
-查看器是**独立进程**(零新依赖,只监听 127.0.0.1),内置前端在 `mcp/viewer/`:
+查看器是**独立进程**(零新依赖,只监听 127.0.0.1),内置前端在 `mcp/viewer/`(浅色界面照主站的 `src/ui/theme.css`;系统跟随深浅色):
 
-- 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策、**魔力场与强度**;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。
-- 地图:基础地形(海拔 + 雪线 + 光照)与各国疆域两层叠加,滚轮缩放、拖动平移、点击选国、国都标注。
-- 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争)。
-- 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹)。
+- 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策、**魔力场与强度**;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。参数收在顶栏「参数」打开的浮窗里。
+- 地图:**铺满整个窗口**当背景。顶栏「画法」切换主站同款的四种地形(默认手绘羊皮纸);东西相连,越过南北极也会按球面接法(纬度镜像 + 经度挪半圈)接到另一侧,所以**上下左右都能无限拖**;放大超过 1 倍底图后按 √2 分档现算高清块,越放大越锐利;滚轮 / 双击 / 右下角按钮缩放,「复位」回到默认视图。点选国家、hover 数值、国都标注都按同一套跨极变换反算。
+- 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争),可收起到只剩标题条。
+- 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹),同样可收起。
+- 左侧行动栏:创建世界 → 开始会话 → 跑一回合 → 自动播放,以及回放对账、导出会话;这三块都是浮在地图上的玻璃卡片,地图始终露在中间。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base`(PNG)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/vectors?worldId=`(海岸线 / 波纹 / 符号 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+
+### 地形渲染:复用主站的管线
+
+`mcp/terrain.ts` 直接调用主站那些「纯计算,worker / Node 都能跑」的入口,没有另写一套画法,也没加运行时依赖:
+
+| 环节 | 用的模块 |
+|---|---|
+| 1 倍整张主图 | `src/gen/raster.ts` 的 `rasterize(world, 1, false)`,2048 × 1024 |
+| 上色 | `src/render/fantasy.ts` 的 `fantasyFullPixels`;写实风用 `realistic.ts` 的 `realisticPixels` / `realisticWindowPixels` |
+| 放大现算一块 | `src/gen/rasterWindow.ts` 的 `zoomSource` + `rasterizeWindow` |
+| 矢量细节层 | `src/render/fantasy.ts` 的 `fantasyCoastLines` / `seaRippleLines` / `planGlyphs` / `simplifyLine` → 浏览器 Canvas 画 |
+| 编码 | 仍然是 `mcp/png.ts` 手写 zlib,不碰 canvas / sharp |
+
+- **分辨率**:底图是 1 倍主图,够缩小时用;放大后前端按 √2 分档请求 `/api/map/tile`,服务端只铺视口那几块,按当前倍数重新栅格化 + 上色。手绘风的窗口像素层会重算全局场,低频颜色和整图不同,所以 `alignColors()` 按 32 × 32 小格把颜色拉回整张底图,只留下现算出来的高频细节 —— 不然拼起来会有方块色差。
+  `currentLod()` 的门槛是 `k × dpr > 1.8` 且最小档为 2 倍:**高分屏上 100% 视图不再启用低档瓦片**。之前 1.41 倍档被启用时,它和整图底图拼在一起会出现水平细线和矩形色块(缩小后尤其明显);现在 100% 一律只用整张底图。
+- **矢量层**:`/api/map/vectors` 返回抽稀过的海岸线、湖岸线、三圈近岸波纹和 3.3k 个地形符号(约 1.3 MB,每个世界只算一次并缓存)。服务端用 `cleanInk()` 把像素层里的墨线 / 波纹 / 冰缘墨线抹掉(照主站 `fantasyBaseClean` 的顺序),浏览器再用 Canvas 按**固定屏幕线宽 1–1.15px** 重画:墨线不随倍率变粗、波纹不会被拉成粗带、符号按 `g.z` 分级出现且尺寸按 `glyphScale(k)` 收缩。低倍率用抽稀版线,放大到 2.5 倍以上换成精细版(`tol=0.12`),否则折角会被放大成多边形。
+  前端按**每一小段线段**做视口裁剪(不是整条折线的包围盒:长海岸线横跨整幅地图时,整条 bbox 判断会漏画局部,出现"一半有描边一半没有"),并且每 3000 段 `stroke()` 一次,避免上万段塞进同一个路径时后半段丢失。跨 180° 经线的海岸线坐标会伸出左右边界(`fantasyCoastLines` 里 3 条线就占了近一半点数),前端照主站 `chunkPath` / `wrapShifts` 的做法,对 `x1 > W` 的线在另一侧补一份 `x − W`、对 `x0 < 0` 的补 `x + W`,贴着边界的符号同样补一份 —— 否则那段海岸只在某一份平铺副本里出现,把地图拖到屏幕边缘时就整段消失,移回中间又出现。换档时 `S.tileSeq++` 让上一档没发完的瓦片请求作废,避免不同倍数混在一起。矢量接口取不到(监视台进程还是旧代码)时会明确弹提示让用户重启,因为此时位图墨线已被服务端抹掉。
+- **跨极**:`/api/map/tile` 的 `(x, y)` 是球面展开坐标,可以出上下边。`n = floor(y / H)` 为奇数时(越过一次极点),按 `(x − W/2, (n+1)H − y)` 取源窗口、渲染结果上下翻回来;这是球面在极点的真实接法,和 main 的地球仪跨极一致。前端底图、疆域 / 场图层、国都标注用同一套变换逐层平铺。
+- **构建补丁**:`src/render/labels/fonts.ts` 里有一句 Vite 专属的 `import.meta.env.BASE_URL`,CommonJS 产物里是语法错误。`mcp/build-compat.cjs` 在每次构建后把产物里的它换成 `'./'`(不改上游源码);`mcp/build.ps1` 和 `scripts/lib/sandboxViewer.ts` 都会调用。因此 tsc 会报那两条 TS1343/TS2339,但产物完整,构建脚本以「关键产物在不在」判成败。
+- 首次生成底图约 2–3 秒(世界生成另算),放大后高清块会在几秒内逐块变清晰;瓦片缓存在服务端(最多 192 块)和浏览器里,拖动时按世界坐标复用。
 
 注意:查看器进程内的世界/会话表是内存里的,关掉进程就没了;日志仍写在 `mcp/.runs/`。查看器不改变引擎的确定性,只是把同一套 `mcp/engine.ts` / `mcp/monarch.ts` 搬到 HTTP 后面。
 

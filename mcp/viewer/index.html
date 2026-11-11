@@ -3,239 +3,284 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>文明与地图 · 多 Agent 沙盒监视台</title>
+<meta name="color-scheme" content="light dark">
+<title>文明与地图 · 多 Agent 沙盒</title>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
 
-<header class="topbar">
-  <div class="brand">
-    <span class="brand-mark">civ<span class="dot">.</span>atlas</span>
-    <span class="brand-sep">/</span>
-    <span class="brand-sub">多 Agent 沙盒监视台</span>
-  </div>
-  <div class="topbar-right">
-    <span id="status" class="status">未创建世界</span>
-    <span class="topbar-note">本地进程 · 只监听 127.0.0.1</span>
-  </div>
-</header>
+<!-- 地图铺满整个窗口当背景,界面都是浮在它上面的玻璃卡片 -->
+<div class="stage" id="mapWrap">
+  <canvas id="map" width="1024" height="512"></canvas>
 
-<main class="page">
+  <div class="map-empty" id="mapEmpty">
+    <svg class="empty-mark" viewBox="0 0 64 64" aria-hidden="true">
+      <circle cx="32" cy="32" r="21" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 5"/>
+      <path d="M22 38c4-9 10-13 20-14-2 9-7 15-15 17-2 .5-4 .5-5-1z" fill="currentColor" opacity=".55"/>
+      <circle cx="45" cy="21" r="2.2" fill="currentColor"/>
+    </svg>
+    <div class="empty-title">还没有地图</div>
+    <div class="empty-sub">创建世界后,这颗星球的地形与各国疆域会铺满整个窗口,左右可以无限拖动</div>
+    <button class="btn primary empty-cta" id="btnEmptyCreate" type="button">创建世界</button>
+  </div>
 
-  <!-- 参数栏 -->
-  <section class="panel controls" aria-label="参数">
-    <div class="control-row">
-      <label class="field"><span>种子</span><input id="seed" type="number" value="7" min="0" step="1"></label>
-      <label class="field"><span>地块数</span>
-        <select id="cells">
-          <option value="12000">12,000</option>
-          <option value="20000">20,000</option>
-          <option value="34043" selected>34,043</option>
-          <option value="60000">60,000</option>
-        </select>
-      </label>
-      <label class="field"><span>起始年</span><input id="startYear" type="number" value="2500" min="1" max="60000" step="1"></label>
-      <label class="field"><span>每回合年数</span><input id="stepYears" type="number" value="5" min="1" max="100" step="1"></label>
-      <label class="field"><span>回合数</span><input id="maxRounds" type="number" value="12" min="1" max="200" step="1"></label>
-      <label class="field"><span>君主范围</span>
-        <select id="polities">
-          <option value="all">全部在世国家</option>
-          <option value="8">前 8 大国</option>
-          <option value="5">前 5 大国</option>
-          <option value="2">前 2 大国</option>
-        </select>
-      </label>
-      <label class="field check"><input id="dmPreset" type="checkbox" checked><span>DM 规则预设</span></label>
-      <label class="field check"><input id="magicField" type="checkbox" checked><span>魔力场</span></label>
-      <label class="field"><span>魔力强度</span><input id="magicStrength" type="number" value="1" min="0" max="3" step="0.5"></label>
-      <label class="field check"><input id="mock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
+  <div class="map-loading hidden" id="mapLoading"><span class="spinner"></span><span id="mapLoadingText">地图生成中…</span></div>
+  <div class="map-tip">东西相连、越过极点接到另一侧 · 拖动可无限平移 · 滚轮 / 双击缩放(自动提高清晰度)· 点击国家</div>
+  <div class="field-tip hidden" id="fieldTip"></div>
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="多 Agent 沙盒">
+      <span class="brand-mark">civ<span class="dot">.</span>atlas</span>
+      <span class="brand-sep"></span>
+      <span class="brand-sub">多 Agent 沙盒</span>
+    </a>
+
+    <div class="hud">
+      <span class="hud-year" id="mapTitle">地图</span>
+      <span class="hud-sep" aria-hidden="true"></span>
+      <span class="hud-sub" id="mapSub">还没有世界。创建后可以点击国家查看详情。</span>
     </div>
 
-    <details class="llm-row">
-      <summary>真模型设置 <span class="muted">(取消 mock 时使用;Key 只存在这个进程的内存里)</span></summary>
-      <div class="control-row">
-        <label class="field"><span>服务商</span>
-          <select id="provider">
-            <option value="deepseek">DeepSeek</option>
-            <option value="bailian">阿里云百炼</option>
-            <option value="custom">自定义(OpenAI 兼容)</option>
-          </select>
-        </label>
-        <label class="field grow"><span>接口地址</span><input id="baseUrl" type="text" placeholder="留空用服务商默认"></label>
-        <label class="field"><span>模型</span><input id="model" type="text" placeholder="deepseek-chat / qwen-plus"></label>
-        <label class="field grow"><span>API Key</span><input id="apiKey" type="password" placeholder="sk-…" autocomplete="off"></label>
-        <label class="field"><span>温度</span><input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1"></label>
-      </div>
-    </details>
-
-    <details class="llm-row" id="dmRow">
-      <summary>DM 小决策 <span class="muted">(另一台设备的本地模型 / mock:天灾、小贸易;Key 只存在这个进程的内存里)</span></summary>
-      <div class="control-row">
-        <label class="field check"><input id="dmEnable" type="checkbox"><span>本局启用 DM</span></label>
-        <label class="field check"><input id="dmMock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
-        <label class="field grow"><span>OpenAI 兼容地址</span><input id="dmBaseUrl" type="text" placeholder="http://192.168.1.20:8000/v1"></label>
-        <label class="field"><span>模型</span><input id="dmModel" type="text" placeholder="openjev"></label>
-        <label class="field grow"><span>API Key(可留空)</span><input id="dmKey" type="password" placeholder="本地模型通常不需要" autocomplete="off"></label>
-        <label class="field"><span>每回合上限</span><input id="dmMax" type="number" value="2" min="1" max="5" step="1"></label>
-      </div>
-      <div class="control-row">
-        <button id="btnDmConnect" class="btn" disabled>连接 / 测试 DM</button>
-        <span class="hint grow" id="dmStatusLine">DM 未连接。填地址和模型后点「连接 / 测试 DM」;天灾会写成引擎命令,小贸易只记叙事。</span>
-      </div>
-    </details>
-
-    <details class="llm-row" id="pettyRow">
-      <summary>小事件裁决层 <span class="muted">(官方 Jev / mock:天灾、边境、民生小事;先结算小事,再让君主决策)</span></summary>
-      <div class="control-row">
-        <label class="field check"><input id="pettyEnable" type="checkbox"><span>本局启用小事件</span></label>
-        <label class="field check"><input id="pettyMock" type="checkbox" checked><span>mock 裁决(不联网)</span></label>
-        <label class="field"><span>画像</span>
-          <select id="pettyProfile">
-            <option value="L1">L1(只 P0)</option>
-            <option value="L2" selected>L2(P0+P1)</option>
-            <option value="L3">L3(全开)</option>
-          </select>
-        </label>
-        <label class="field"><span>每批最多问题</span><input id="pettyMax" type="number" value="8" min="1" max="16" step="1"></label>
-        <label class="field grow"><span>API Key(可留空;也可用 JEV_API_KEY)</span><input id="pettyKey" type="password" placeholder="官方 Jev 需要" autocomplete="off"></label>
-      </div>
-      <div class="control-row">
-        <button id="btnPettyConnect" class="btn" disabled>连接 / 测试 Jev</button>
-        <span class="hint grow" id="pettyStatusLine">未连接。官方 Jev 默认 https://api.defapi.org + typesafe/jev-1.14.0;离线演示勾 mock。</span>
-      </div>
-    </details>
-
-    <details class="llm-row" id="fieldRow">
-      <summary>自定义场 · 原型 <span class="muted">(魔脉 / 矿产 / 辐射:计算层给精确数值,渲染层只上色;改样式不重算)</span></summary>
-      <div class="control-row">
-        <label class="field check"><input id="fieldEnable" type="checkbox"><span>显示场叠加层</span></label>
-        <label class="field"><span>场</span>
-          <select id="fieldKind">
-            <option value="magic" selected>魔脉浓度</option>
-            <option value="ore">矿产资源</option>
-            <option value="radiation">辐射本底</option>
-          </select>
-        </label>
-        <label class="field"><span>色带</span>
-          <select id="fieldRamp">
-            <option value="ember" selected>余烬</option>
-            <option value="viridis">青绿</option>
-            <option value="magma">岩浆</option>
-            <option value="ice">寒冰</option>
-          </select>
-        </label>
-        <label class="field"><span>拉伸</span>
-          <select id="fieldStretch">
-            <option value="p1p99" selected>1%–99%</option>
-            <option value="minmax">最小–最大</option>
-          </select>
-        </label>
-        <label class="field"><span>透明度 <b id="fieldOpacityVal">0.85</b></span><input id="fieldOpacity" type="range" min="0.05" max="1" step="0.05" value="0.85"></label>
-      </div>
-      <div class="control-row">
-        <label class="field check"><input id="fieldContour" type="checkbox" checked><span>等高线</span></label>
-        <label class="field check"><input id="fieldGlow" type="checkbox" checked><span>辉光</span></label>
-        <label class="field check"><input id="fieldHillshade" type="checkbox" checked><span>地形浮雕</span></label>
-        <label class="field check"><input id="fieldSmooth" type="checkbox" checked><span>显示平滑(只影响图)</span></label>
-        <label class="field"><span>变体种子(可空)</span><input id="fieldSeed" type="number" placeholder="默认" min="0" max="999999" step="1"></label>
-        <label class="field"><span>尺度</span><input id="fieldScale" type="number" value="1" min="0.25" max="4" step="0.25"></label>
-      </div>
-      <div class="control-row">
-        <button id="btnFieldApply" class="btn" disabled>生成 / 刷新场</button>
-        <button id="btnFieldOff" class="btn" disabled>关闭叠加</button>
-        <button id="btnFieldData" class="btn" disabled>导出数值 JSON</button>
-        <span class="hint grow" id="fieldStatusLine">先创建世界,再生成场。PNG 只是上色;数值以计算层和 hover 为准。</span>
-      </div>
-      <div class="field-legend-wrap hidden" id="fieldLegendWrap">
-        <div class="field-legend-head"><span id="fieldLegendName">魔脉浓度</span><span class="field-legend-hash" id="fieldLegendHash"></span></div>
-        <div class="field-legend-bar" id="fieldLegendBar"></div>
-        <div class="field-legend-ticks" id="fieldLegendTicks"></div>
-        <div class="field-legend-unit">0–1 相对浓度 · 图例刻度为真实数值 · hover 看原始值</div>
-      </div>
-    </details>
-
-    <details class="llm-row" id="magicRow">
-      <summary>本局动态层 · 魔力 <span class="muted">(逐年演化:灵脉渗出 → 邻州扩散 → 人口耗散;每 50 年存一帧,真影响城上限)</span></summary>
-      <div class="control-row">
-        <label class="field check"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
-        <label class="field"><span>图层年份</span><select id="magicYearPick"></select></label>
-        <button id="btnMagicNow" class="btn">回到本回合</button>
-        <span class="hint grow" id="magicStatusLine">开一个带「魔力场」的会话后,这里会出现逐年图层。</span>
-      </div>
-      <div class="field-legend-wrap hidden" id="magicLegendWrap">
-        <div class="field-legend-head"><span id="magicLegendName">魔力浓度</span><span class="field-legend-hash" id="magicLegendHash"></span></div>
-        <div class="field-legend-bar" id="magicLegendBar"></div>
-        <div class="field-legend-ticks" id="magicLegendTicks"></div>
-        <div class="field-legend-unit">按州记的浓度(0–100;图层色带 0–60)· 每像素取所属州的值 · hover 看精确值</div>
-      </div>
-    </details>
-
-    <div class="control-row actions">
-      <button id="btnWorld" class="btn">① 创建世界</button>
-      <button id="btnSession" class="btn" disabled>② 开始会话</button>
-      <button id="btnRound" class="btn primary" disabled>③ 跑一回合</button>
-      <button id="btnAuto" class="btn" disabled>自动播放</button>
-      <button id="btnVerify" class="btn" disabled>回放对账</button>
-      <button id="btnExport" class="btn" disabled>导出会话</button>
-      <span class="grow"></span>
-      <span class="hint" id="hint">先创建世界。同种子 + 同参数 = 同一个世界,同命令 = 同一段历史。</span>
+    <div class="topbar-right">
+      <span id="status" class="status">未创建世界</span>
+      <label class="style-pick" title="和主站同一套地形画法;放大后会按倍数现算高清块">
+        <span>画法</span>
+        <select id="mapStyle" aria-label="地图画法">
+          <option value="fantasy">手绘羊皮纸</option>
+          <option value="satellite">卫星写实</option>
+          <option value="geo">地理图</option>
+          <option value="classic">原沙盒地形</option>
+        </select>
+      </label>
+      <button id="btnParams" class="btn ghost" type="button" aria-expanded="false" aria-controls="paramsPanel">参数</button>
+      <a class="topbar-link" href="/" title="回到地图">回到地图</a>
     </div>
-  </section>
+  </header>
 
-  <!-- 地图 + 侧栏 -->
-  <section class="main-grid">
-    <section class="panel map-panel" aria-label="地图">
-      <div class="panel-head">
-        <div>
-          <div class="panel-title" id="mapTitle">地图</div>
-          <div class="panel-sub" id="mapSub">还没有世界。创建后可以点击国家查看详情。</div>
-        </div>
-        <div class="legend" id="legend"></div>
+  <!-- 左侧行动栏 -->
+  <nav class="dock" id="dock" aria-label="对局操作">
+    <button id="btnWorld" class="dock-btn cta" type="button"><b>①</b> 创建世界</button>
+    <button id="btnSession" class="dock-btn" type="button" disabled><b>②</b> 开始会话</button>
+    <button id="btnRound" class="dock-btn hot" type="button" disabled><b>③</b> 跑一回合</button>
+    <button id="btnAuto" class="dock-btn" type="button" disabled>自动播放</button>
+    <span class="dock-sep" aria-hidden="true"></span>
+    <button id="btnVerify" class="dock-btn quiet" type="button" disabled>回放对账</button>
+    <button id="btnExport" class="dock-btn quiet" type="button" disabled>导出会话</button>
+  </nav>
+
+  <!-- 参数浮窗(点顶栏「参数」打开) -->
+  <aside class="panel params" id="paramsPanel" hidden aria-label="对局参数">
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">对局参数</div>
+        <div class="panel-sub">同种子 + 同参数 = 同一个世界,同命令 = 同一段历史</div>
       </div>
-      <div class="map-wrap" id="mapWrap">
-        <canvas id="map" width="1024" height="512"></canvas>
-        <div class="map-empty" id="mapEmpty">
-          <div class="empty-mark">◍</div>
-          <div class="empty-title">还没有地图</div>
-          <div class="empty-sub">点「创建世界」,这里会画出一张 1024 像素宽的等距圆柱地图</div>
-        </div>
-        <div class="map-loading hidden" id="mapLoading"><span class="spinner"></span><span id="mapLoadingText">地图生成中…</span></div>
-        <div class="map-tip">滚轮缩放 · 拖动平移 · 点击国家</div>
-        <div class="field-tip hidden" id="fieldTip"></div>
+      <button class="fold-btn" id="btnParamsClose" type="button" aria-label="关闭参数">✕</button>
+    </div>
+    <div class="params-body">
+      <div class="control-row">
+        <label class="field"><span>种子</span><input id="seed" type="number" value="7" min="0" step="1"></label>
+        <label class="field"><span>地块数</span>
+          <select id="cells">
+            <option value="12000">12,000</option>
+            <option value="20000">20,000</option>
+            <option value="34043" selected>34,043</option>
+            <option value="60000">60,000</option>
+          </select>
+        </label>
+        <label class="field"><span>起始年</span><input id="startYear" type="number" value="2500" min="1" max="60000" step="1"></label>
+      </div>
+      <div class="control-row">
+        <label class="field"><span>每回合年数</span><input id="stepYears" type="number" value="5" min="1" max="100" step="1"></label>
+        <label class="field"><span>回合数</span><input id="maxRounds" type="number" value="12" min="1" max="200" step="1"></label>
+        <label class="field"><span>君主范围</span>
+          <select id="polities">
+            <option value="all">全部在世国家</option>
+            <option value="8">前 8 大国</option>
+            <option value="5">前 5 大国</option>
+            <option value="2">前 2 大国</option>
+          </select>
+        </label>
+      </div>
+      <div class="control-row">
+        <label class="field check"><input id="dmPreset" type="checkbox" checked><span>DM 规则预设</span></label>
+        <label class="field check"><input id="magicField" type="checkbox" checked><span>魔力场</span></label>
+        <label class="field check"><input id="mock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
+        <label class="field narrow"><span>魔力强度</span><input id="magicStrength" type="number" value="1" min="0" max="3" step="0.5"></label>
       </div>
 
-    </section>
+      <!-- 高级设置:模型、DM、小事件、场都收在这里,默认折叠 -->
+      <details class="llm-row advanced" id="advancedRow">
+        <summary>高级设置 <span class="muted">真模型 · DM 小决策 · 小事件裁决 · 自定义场 · 魔力图层</span></summary>
+        <div class="advanced-body">
 
-  <!-- 底部 -->
-  <section class="panel bottom-panel" aria-label="日志">
-    <nav class="tabs" id="tabs">
-      <button class="tab active" data-tab="decisions">AI 决策</button>
-      <button class="tab" data-tab="chronicle">编年史</button>
-      <button class="tab" data-tab="rounds">回合日志</button>
-      <span class="grow"></span>
+          <details class="llm-row">
+            <summary>真模型设置 <span class="muted">(取消 mock 时使用;Key 只存在这个进程的内存里)</span></summary>
+            <div class="control-row">
+              <label class="field"><span>服务商</span>
+                <select id="provider">
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="bailian">阿里云百炼</option>
+                  <option value="custom">自定义(OpenAI 兼容)</option>
+                </select>
+              </label>
+              <label class="field grow"><span>接口地址</span><input id="baseUrl" type="text" placeholder="留空用服务商默认"></label>
+              <label class="field"><span>模型</span><input id="model" type="text" placeholder="deepseek-chat / qwen-plus"></label>
+              <label class="field grow"><span>API Key</span><input id="apiKey" type="password" placeholder="sk-…" autocomplete="off"></label>
+              <label class="field narrow"><span>温度</span><input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1"></label>
+            </div>
+          </details>
+
+          <details class="llm-row" id="dmRow">
+            <summary>DM 小决策 <span class="muted">(另一台设备的本地模型 / mock:天灾、小贸易;Key 只存在这个进程的内存里)</span></summary>
+            <div class="control-row">
+              <label class="field check"><input id="dmEnable" type="checkbox"><span>本局启用 DM</span></label>
+              <label class="field check"><input id="dmMock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
+              <label class="field grow"><span>OpenAI 兼容地址</span><input id="dmBaseUrl" type="text" placeholder="http://192.168.1.20:8000/v1"></label>
+              <label class="field"><span>模型</span><input id="dmModel" type="text" placeholder="openjev"></label>
+              <label class="field grow"><span>API Key(可留空)</span><input id="dmKey" type="password" placeholder="本地模型通常不需要" autocomplete="off"></label>
+              <label class="field narrow"><span>每回合上限</span><input id="dmMax" type="number" value="2" min="1" max="5" step="1"></label>
+            </div>
+            <div class="control-row">
+              <button id="btnDmConnect" class="btn" type="button" disabled>连接 / 测试 DM</button>
+              <span class="hint grow" id="dmStatusLine">DM 未连接。填地址和模型后点「连接 / 测试 DM」;天灾会写成引擎命令,小贸易只记叙事。</span>
+            </div>
+          </details>
+
+          <details class="llm-row" id="pettyRow">
+            <summary>小事件裁决层 <span class="muted">(官方 Jev / mock:天灾、边境、民生小事;先结算小事,再让君主决策)</span></summary>
+            <div class="control-row">
+              <label class="field check"><input id="pettyEnable" type="checkbox"><span>本局启用小事件</span></label>
+              <label class="field check"><input id="pettyMock" type="checkbox" checked><span>mock 裁决(不联网)</span></label>
+              <label class="field"><span>画像</span>
+                <select id="pettyProfile">
+                  <option value="L1">L1(只 P0)</option>
+                  <option value="L2" selected>L2(P0+P1)</option>
+                  <option value="L3">L3(全开)</option>
+                </select>
+              </label>
+              <label class="field narrow"><span>每批最多问题</span><input id="pettyMax" type="number" value="8" min="1" max="16" step="1"></label>
+              <label class="field grow"><span>API Key(可留空;也可用 JEV_API_KEY)</span><input id="pettyKey" type="password" placeholder="官方 Jev 需要" autocomplete="off"></label>
+            </div>
+            <div class="control-row">
+              <button id="btnPettyConnect" class="btn" type="button" disabled>连接 / 测试 Jev</button>
+              <span class="hint grow" id="pettyStatusLine">未连接。官方 Jev 默认 https://api.defapi.org + typesafe/jev-1.14.0;离线演示勾 mock。</span>
+            </div>
+          </details>
+
+          <details class="llm-row" id="fieldRow">
+            <summary>自定义场 · 原型 <span class="muted">(魔脉 / 矿产 / 辐射:计算层给精确数值,渲染层只上色;改样式不重算)</span></summary>
+            <div class="control-row">
+              <label class="field check"><input id="fieldEnable" type="checkbox"><span>显示场叠加层</span></label>
+              <label class="field"><span>场</span>
+                <select id="fieldKind">
+                  <option value="magic" selected>魔脉浓度</option>
+                  <option value="ore">矿产资源</option>
+                  <option value="radiation">辐射本底</option>
+                </select>
+              </label>
+              <label class="field"><span>色带</span>
+                <select id="fieldRamp">
+                  <option value="ember" selected>余烬</option>
+                  <option value="viridis">青绿</option>
+                  <option value="magma">岩浆</option>
+                  <option value="ice">寒冰</option>
+                </select>
+              </label>
+              <label class="field"><span>拉伸</span>
+                <select id="fieldStretch">
+                  <option value="p1p99" selected>1%–99%</option>
+                  <option value="minmax">最小–最大</option>
+                </select>
+              </label>
+              <label class="field"><span>透明度 <b id="fieldOpacityVal">0.85</b></span><input id="fieldOpacity" type="range" min="0.05" max="1" step="0.05" value="0.85"></label>
+            </div>
+            <div class="control-row">
+              <label class="field check"><input id="fieldContour" type="checkbox" checked><span>等高线</span></label>
+              <label class="field check"><input id="fieldGlow" type="checkbox" checked><span>辉光</span></label>
+              <label class="field check"><input id="fieldHillshade" type="checkbox" checked><span>地形浮雕</span></label>
+              <label class="field check"><input id="fieldSmooth" type="checkbox" checked><span>显示平滑(只影响图)</span></label>
+              <label class="field narrow"><span>变体种子(可空)</span><input id="fieldSeed" type="number" placeholder="默认" min="0" max="999999" step="1"></label>
+              <label class="field narrow"><span>尺度</span><input id="fieldScale" type="number" value="1" min="0.25" max="4" step="0.25"></label>
+            </div>
+            <div class="control-row">
+              <button id="btnFieldApply" class="btn" type="button" disabled>生成 / 刷新场</button>
+              <button id="btnFieldOff" class="btn" type="button" disabled>关闭叠加</button>
+              <button id="btnFieldData" class="btn" type="button" disabled>导出数值 JSON</button>
+              <span class="hint grow" id="fieldStatusLine">先创建世界,再生成场。PNG 只是上色;数值以计算层和 hover 为准。</span>
+            </div>
+            <div class="field-legend-wrap hidden" id="fieldLegendWrap">
+              <div class="field-legend-head"><span id="fieldLegendName">魔脉浓度</span><span class="field-legend-hash" id="fieldLegendHash"></span></div>
+              <div class="field-legend-bar" id="fieldLegendBar"></div>
+              <div class="field-legend-ticks" id="fieldLegendTicks"></div>
+              <div class="field-legend-unit">0–1 相对浓度 · 图例刻度为真实数值 · hover 看原始值</div>
+            </div>
+          </details>
+
+          <details class="llm-row" id="magicRow">
+            <summary>本局动态层 · 魔力 <span class="muted">(逐年演化:灵脉渗出 → 邻州扩散 → 人口耗散;每 50 年存一帧,真影响城上限)</span></summary>
+            <div class="control-row">
+              <label class="field check"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
+              <label class="field"><span>图层年份</span><select id="magicYearPick"></select></label>
+              <button id="btnMagicNow" class="btn" type="button">回到本回合</button>
+              <span class="hint grow" id="magicStatusLine">开一个带「魔力场」的会话后,这里会出现逐年图层。</span>
+            </div>
+            <div class="field-legend-wrap hidden" id="magicLegendWrap">
+              <div class="field-legend-head"><span id="magicLegendName">魔力浓度</span><span class="field-legend-hash" id="magicLegendHash"></span></div>
+              <div class="field-legend-bar" id="magicLegendBar"></div>
+              <div class="field-legend-ticks" id="magicLegendTicks"></div>
+              <div class="field-legend-unit">按州记的浓度(0–100;图层色带 0–60)· 每像素取所属州的值 · hover 看精确值</div>
+            </div>
+          </details>
+        </div>
+      </details>
+
+      <div class="hint" id="hint">先创建世界。同种子 + 同参数 = 同一个世界,同命令 = 同一段历史。</div>
+    </div>
+  </aside>
+
+  <!-- 国家(右侧浮窗) -->
+  <aside class="panel side-panel" id="sidePanel" aria-label="国家">
+    <div class="panel-head side-head">
+      <div class="side-head-text">
+        <div class="panel-title">国家</div>
+        <div class="panel-sub" id="polSub">—</div>
+      </div>
+      <span class="chip" id="roundChip">第 0 / 0 回合</span>
+      <button class="fold-btn" type="button" data-fold="sidePanel" aria-label="收起国家面板">▴</button>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="polity-list" id="polityList"></div>
+    <div class="polity-detail" id="polityDetail">
+      <div class="side-empty">选中一个国家,看它的君主、邻国和正在打的仗。</div>
+    </div>
+  </aside>
+
+  <!-- 日志(底部浮窗) -->
+  <section class="panel bottom-panel" id="logPanel" aria-label="日志">
+    <div class="panel-head log-head">
+      <nav class="tabs" id="tabs">
+        <button class="tab active" type="button" data-tab="decisions">AI 决策</button>
+        <button class="tab" type="button" data-tab="chronicle">编年史</button>
+        <button class="tab" type="button" data-tab="rounds">回合日志</button>
+      </nav>
       <span class="tab-note" id="tabNote"></span>
-    </nav>
+      <button class="fold-btn" type="button" data-fold="logPanel" aria-label="收起日志">▾</button>
+    </div>
     <div class="tab-body" id="tabBody">
       <div class="side-empty">跑一回合后,这里会列出每个君主的理由和命令。</div>
     </div>
   </section>
 
-    <aside class="panel side-panel" aria-label="国家">
-      <div class="panel-head side-head">
-        <div>
-          <div class="panel-title">国家</div>
-          <div class="panel-sub" id="polSub">—</div>
-        </div>
-        <span class="chip" id="roundChip">第 0 / 0 回合</span>
-      </div>
-      <div class="polity-list" id="polityList"></div>
-      <div class="polity-detail" id="polityDetail">
-        <div class="side-empty">选中一个国家,看它的君主、邻国和正在打的仗。</div>
-      </div>
-    </aside>
-  </section>
-
-</main>
+  <!-- 缩放 -->
+  <div class="zoom-dock" role="group" aria-label="缩放">
+    <button id="zoomOut" type="button" aria-label="缩小">−</button>
+    <span class="zoom-val" id="zoomVal">100%</span>
+    <button id="zoomIn" type="button" aria-label="放大">＋</button>
+    <button id="zoomReset" type="button" title="回到默认视图">复位</button>
+  </div>
+</div>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <div class="busy" id="busy"><div class="busy-card"><span class="spinner big"></span><div><div class="busy-title" id="busyTitle">AI 君主思考中…</div><div class="busy-sub" id="busySub"></div></div></div></div>

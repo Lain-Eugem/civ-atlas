@@ -12,6 +12,7 @@ import { inlineIconsPlugin } from './scripts/lib/inlineIcons';
 import { beianPagesPlugin } from './scripts/lib/beian';
 import { loadScreenPlugin } from './scripts/lib/loadScreen';
 import { checkPagePlugin } from './scripts/lib/sandboxCheckPage';
+import { sandboxViewerPlugin } from './scripts/lib/sandboxViewer';
 import { readWhatsNew } from './scripts/lib/whatsNew';
 import { beianRecords } from './src/ui/beian';
 import { SOURCE_URL } from './src/ui/links';
@@ -155,6 +156,9 @@ export default defineConfig({
         });
       },
     },
+    // 多 Agent 沙盒监视台:同一个开发服务器(scripts/lib/sandboxViewer.ts),pnpm dev 后打开 /sandbox/ 即可,
+    // 不用再单独起 5190;只在开发时挂,生产构建没有这一层
+    sandboxViewerPlugin(),
   ],
   build: {
     rollupOptions: {
@@ -176,7 +180,10 @@ export default defineConfig({
       },
     },
   },
-  server: { port: 5188, strictPort: true },
+  // 显式绑 IPv4 回环:默认的 'localhost' 在 Windows 上会被解析成 ::1,只监听 IPv6,
+  // 而浏览器访问 localhost 走的是 127.0.0.1,于是报「拒绝连接」。绑 127.0.0.1 两边都对得上,
+  // 也仍然只对本机开放(不设 host: true,免得把带 Key 的沙盒接口暴露到局域网)。
+  server: { host: '127.0.0.1', port: 5188, strictPort: true },
   // 只跑 tests/ 下的单测;本地工具目录(.claude/)里的不算。
   // 先后和分份(PR 检查上分几台机器跑)按各文件大概多久排,见 tests/lib/shardSequencer.ts
   test: {
