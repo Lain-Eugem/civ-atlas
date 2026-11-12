@@ -54,7 +54,7 @@ import {
   type FieldRamp,
   type FieldStyle,
 } from './field-render';
-import { DEFAULT_MAGIC_STYLE, renderMagicMap, magicDataJson, magicLegendOf, magicLayerOf } from './magic-render';
+import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf } from './magic-render';
 import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
@@ -620,6 +620,8 @@ const fieldFrames = new Map<string, FieldFrame>();
 const fieldPngs = new Map<string, { png: Buffer; legend: unknown }>();
 /** 「魔力」动态图层的 PNG 缓存:键 = sessionId|年份 */
 const magicPngs = new Map<string, { png: Buffer; legend: unknown; frameYear: number | null }>();
+/** 「魔力」高清瓦片缓存:键 = sessionId|年份|S|x|y|size(每块只算一次) */
+const magicTilePngs = new Map<string, Buffer>();
 
 function optNum(v: string | null): number | undefined {
   if (v === null || v === '') return undefined;
@@ -1037,6 +1039,33 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)));
     if (!data) { fail(res, 404, '没有魔力图层'); return true; }
     sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year) });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/magic/tile') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const layer = magicLayerOf(s.civ);
+    if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const S = Number(q.get('S'));
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    const size = Number(q.get('size'));
+    if (!Number.isFinite(S) || S < 0.25 || S > 24) { fail(res, 400, 'S 超出范围'); return true; }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
+    const asked = optNum(q.get('year'));
+    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
+    const key = `${s.id}|${year}|${S}|${x}|${y}|${size}`;
+    const hit = magicTilePngs.get(key);
+    if (hit) { sendPng(res, hit); return true; }
+    const out = renderMagicTile(s.world, s.civ, year, S, x, y, size, DEFAULT_MAGIC_STYLE);
+    if (!out) { fail(res, 404, '没有魔力图层'); return true; }
+    if (magicTilePngs.size > 512) magicTilePngs.clear();
+    magicTilePngs.set(key, out.png);
+    sendPng(res, out.png);
     return true;
   }
 

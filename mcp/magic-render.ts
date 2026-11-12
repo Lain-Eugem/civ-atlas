@@ -7,6 +7,7 @@
  */
 import type { Raster } from '../src/gen/raster';
 import { rasterize, sphereField } from '../src/gen/raster';
+import { sphereCoverWindow } from '../src/gen/rasterWindow';
 import type { World } from '../src/gen/world';
 import type { Civ } from '../src/gen/civ/types';
 import { encodePng } from './png';
@@ -184,32 +185,17 @@ export interface MagicPixels {
   frameYear: number | null;
 }
 
-/**
- * 魔力图层的 RGBA 像素(2048 级,和地形底图同分辨率)。
- * 观感:低值只留一层薄雾,值越高颜色越实、越亮,高值外面再加一圈柔光。
- */
-export function renderMagicPixels(world: World, civ: Civ, year: number, style: MagicRenderStyle = DEFAULT_MAGIC_STYLE): MagicPixels | null {
-  const layer = magicLayerOf(civ);
-  if (!layer) return null;
-  const w = Math.max(512, Math.round(world.width));
-  const h = Math.max(256, Math.round(world.height));
+interface MagicLayerLike {
+  colors: string[];
+  min: number;
+  max: number;
+}
+
+/** 把连续场 t + 辉光场 glow 上色成 RGBA(低值近透明,高值实色 + 柔光) */
+function paintMagic(t: Float32Array, glow: Float32Array, w: number, h: number, layer: MagicLayerLike, opacityIn: number): Uint8Array {
   const n = w * h;
-  const { values, frame } = magicValuesAt(layer, year);
-  const span = Math.max(1e-6, layer.max - layer.min);
-  const t = magicFieldOf(world, civ, values, layer.min, span, w, h);
-  // 三角形插值在州界上的折线再用约 2px 的柔化抹一下;州内是常数,不会被抹淡
-  blurField(t, w, h, Math.max(1, Math.round(w / 1024)));
-
-  // 高值掩膜单独糊开当辉光(半径约 10px)
-  const glow = new Float32Array(n);
-  for (let p = 0; p < n; p++) {
-    const tv = t[p]!;
-    if (tv > 0.55) glow[p] = (tv - 0.55) / 0.45;
-  }
-  blurField(glow, w, h, Math.max(2, Math.round(w / 190)));
-
   const rgba = new Uint8Array(n * 4);
-  const opacity = Math.min(1, Math.max(0.05, style.opacity));
+  const opacity = Math.min(1, Math.max(0.05, opacityIn));
   const hot = rampColor(layer.colors, 0.92);
   for (let p = 0; p < n; p++) {
     const tv = Math.min(1, Math.max(0, t[p]!));
@@ -233,7 +219,82 @@ export function renderMagicPixels(world: World, civ: Civ, year: number, style: M
     rgba[o + 2] = Math.round(B);
     rgba[o + 3] = Math.round(alpha * 255);
   }
-  return { width: w, height: h, rgba, frameYear: frame };
+  return rgba;
+}
+
+/** 高值掩膜糊开当辉光(radius 按画面像素给) */
+function glowOf(t: Float32Array, w: number, h: number, radius: number): Float32Array {
+  const n = w * h;
+  const glow = new Float32Array(n);
+  for (let p = 0; p < n; p++) {
+    const tv = t[p]!;
+    if (tv > 0.55) glow[p] = (tv - 0.55) / 0.45;
+  }
+  blurField(glow, w, h, radius);
+  return glow;
+}
+
+/**
+ * 魔力图层的 RGBA 像素(2048 级,和地形底图同分辨率)。
+ * 观感:低值只留一层薄雾,值越高颜色越实、越亮,高值外面再加一圈柔光。
+ */
+export function renderMagicPixels(world: World, civ: Civ, year: number, style: MagicRenderStyle = DEFAULT_MAGIC_STYLE): MagicPixels | null {
+  const layer = magicLayerOf(civ);
+  if (!layer) return null;
+  const w = Math.max(512, Math.round(world.width));
+  const h = Math.max(256, Math.round(world.height));
+  const { values, frame } = magicValuesAt(layer, year);
+  const span = Math.max(1e-6, layer.max - layer.min);
+  const t = magicFieldOf(world, civ, values, layer.min, span, w, h);
+  // 三角形插值在州界上的折线再用约 2px 的柔化抹一下;州内是常数,不会被抹淡
+  blurField(t, w, h, Math.max(1, Math.round(w / 1024)));
+  const glow = glowOf(t, w, h, Math.max(2, Math.round(w / 190)));
+  return { width: w, height: h, rgba: paintMagic(t, glow, w, h, layer, style.opacity), frameYear: frame };
+}
+
+/**
+ * 魔力图层的一块高清瓦片(给查看器放大后按 LOD 贴图用)。
+ * 坐标与地形瓦片一致:S 倍主图上从 (x0, y0) 开始的 size × size 像素;
+ * 球面覆盖复用 rasterWindow 的窗口化三角形覆盖,模糊 / 辉光半径按瓦片像素算,
+ * 所以放大到多少倍,柔边和光晕在屏幕上都是固定几像素,不会像整张 2048 图那样被拉糊。
+ */
+export function renderMagicTilePixels(world: World, civ: Civ, year: number, S: number, x0: number, y0: number, size: number, style: MagicRenderStyle = DEFAULT_MAGIC_STYLE): MagicPixels | null {
+  const layer = magicLayerOf(civ);
+  if (!layer) return null;
+  const mesh = world.mesh;
+  const { values, frame } = magicValuesAt(layer, year);
+  const span = Math.max(1e-6, layer.max - layer.min);
+  const of = civ.regions.of;
+  const cells = new Float32Array(mesh.n);
+  for (let c = 0; c < mesh.n; c++) {
+    const region = of[c]!;
+    const v = region >= 0 && region < values.length ? values[region]! : NaN;
+    cells[c] = Number.isFinite(v) ? (v - layer.min) / span : 0;
+  }
+  const cov = sphereCoverWindow(world, S, x0, y0, size, size);
+  const tris = mesh.triangles;
+  const t = new Float32Array(size * size);
+  for (let p = 0; p < t.length; p++) {
+    const ti = cov.tri[p]! - 1;
+    if (ti < 0) continue;
+    const a = tris[3 * ti]!;
+    const b = tris[3 * ti + 1]!;
+    const c = tris[3 * ti + 2]!;
+    const ua = cov.wa[p]!;
+    const ub = cov.wb[p]!;
+    t[p] = ua * cells[a]! + ub * cells[b]! + (1 - ua - ub) * cells[c]!;
+  }
+  // 半径按瓦片像素(≈屏幕像素)给:512 块 → 2px 柔化、4px 辉光
+  blurField(t, size, size, Math.max(1, Math.round(size / 256)));
+  const glow = glowOf(t, size, size, Math.max(2, Math.round(size / 128)));
+  return { width: size, height: size, rgba: paintMagic(t, glow, size, size, layer, style.opacity), frameYear: frame };
+}
+
+/** 渲染一块魔力瓦片 PNG */
+export function renderMagicTile(world: World, civ: Civ, year: number, S: number, x0: number, y0: number, size: number, style: MagicRenderStyle = DEFAULT_MAGIC_STYLE): { width: number; height: number; png: Buffer; frameYear: number | null } | null {
+  const px = renderMagicTilePixels(world, civ, year, S, x0, y0, size, style);
+  if (!px) return null;
+  return { width: px.width, height: px.height, png: encodePng(px.width, px.height, px.rgba), frameYear: px.frameYear };
 }
 
 /** 渲染魔力图层 PNG(分辨率与地形底图一致;低值透明,高值实色 + 柔光) */

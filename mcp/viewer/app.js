@@ -57,7 +57,12 @@
     plan: null,
     toastTimer: 0,
     field: { on: false, img: null, data: null, legend: null, kind: 'magic' },
+    // 魔力层:整张 2048 图用于缩小时;放大后按地形同款瓦片贴,柔边/光晕按瓦片像素算
     magic: { on: false, img: null, data: null, legend: null, meta: null, year: null },
+    magicTiles: new Map(),
+    magicPending: new Set(),
+    magicSeq: 0,
+    magicTimer: 0,
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -561,10 +566,14 @@
     if (nextLod !== S.lod) S.tileSeq++;  // 换档时让上一档还没发完的请求作废(缓存留着,来回缩放还能用)
     S.lod = nextLod;
     drawHiTiles();
+    drawMagicHiTiles();
+    const magicSharp = S.magic.on && magicTilesCoverView();
     for (const r of rects) {
       ctx.save();
       if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
-      const overlays = [S.field.on ? S.field.img : null, S.magic.on ? S.magic.img : null, S.ownersImg];
+      // 魔力层:缩小时用整张 2048 图;放大后等当前层瓦片全部到齐再切瓦片(避免缺块闪烁)。
+      const magicFlat = S.magic.on && !magicSharp ? S.magic.img : null;
+      const overlays = [S.field.on ? S.field.img : null, magicFlat, S.ownersImg];
       for (const img of overlays) if (img) ctx.drawImage(img, r.x, r.yTop, P, H);
       ctx.restore();
     }
@@ -575,6 +584,7 @@
       if (S.state) drawLabels(ctx, r.x, r.yTop, k, r.odd, H);
     }
     scheduleTiles();
+    scheduleMagicTiles();
     updateZoomLabel();
   }
 
@@ -794,6 +804,106 @@
         }
       } finally {
         S.tilePending.delete(w.key);
+      }
+    };
+    for (let p = 0; p < jobs.length; p += 3) await Promise.all(jobs.slice(p, p + 3).map(one));
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 魔力层的高清瓦片
+   *
+   * 整张魔力图固定 2048,柔边/光晕也是按 2048 的像素算的;放大到十几倍时
+   * 被拉成几十像素宽,糊成一片。这里跟地形一样按当前 LOD 向服务端要 512 的块
+   * (/api/magic/tile),柔边和光晕在服务端按瓦片像素重新算,屏幕上始终是 2~4 像素。
+   * 块的坐标锚在世界展开平面上,和地形瓦片同一套 tileGridAt,所以叠得严丝合缝。
+   * ------------------------------------------------------------------ */
+  function magicTileKey(lod, i, j) {
+    return `${lod}|${i}|${j}|${S.magic.year}`;
+  }
+
+  function clearMagicTiles() {
+    S.magicTiles.clear();
+    S.magicPending.clear();
+    S.magicSeq++;
+    if (S.magicTimer) clearTimeout(S.magicTimer);
+    S.magicTimer = 0;
+  }
+
+  function scheduleMagicTiles() {
+    if (!S.magic.on || S.style === 'classic' || !S.lod) return;
+    if (S.magicTimer) clearTimeout(S.magicTimer);
+    S.magicTimer = setTimeout(() => { S.magicTimer = 0; void loadMagicTiles(); }, 180);
+  }
+
+  /** 当前层魔力瓦片是否已全部到齐(到齐才从整图切到瓦片,避免中间缺块闪一下) */
+  function magicTilesCoverView() {
+    if (!S.magic.on || !S.lod || !S.magicTiles.size) return false;
+    const g = tileGridAt(S.lod);
+    if (!g || g.step < 4) return false;
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        if (!S.magicTiles.has(magicTileKey(g.lod, i, j))) return false;
+      }
+    }
+    return true;
+  }
+
+  /** 已缓存的魔力块:当前层到齐后画(低倍率整图负责兜底) */
+  function drawMagicHiTiles() {
+    if (!S.magic.on || !S.lod || !S.magicTiles.size) return;
+    if (!magicTilesCoverView()) return;
+    const g = tileGridAt(S.lod);
+    if (!g) return;
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        const img = S.magicTiles.get(magicTileKey(g.lod, i, j));
+        if (img) ctx.drawImage(img, g.oxAbs + i * g.step, g.oyAbs + j * g.step, g.step + 0.6, g.step + 0.6);
+      }
+    }
+  }
+
+  async function loadMagicTiles() {
+    if (!S.magic.on || !S.magic.img || !S.sessionId || !S.lod) return;
+    const g = tileGrid();
+    if (!g) return;
+    const seq = S.magicSeq;
+    const year = S.magic.year;
+    const want = [];
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        const key = magicTileKey(g.lod, i, j);
+        if (!S.magicTiles.has(key) && !S.magicPending.has(key)) want.push({ i, j, key });
+      }
+    }
+    if (!want.length) return;
+    const cx = (g.i0 + g.i1) / 2;
+    const cy = (g.j0 + g.j1) / 2;
+    want.sort((a, b) => (Math.abs(a.i - cx) + Math.abs(a.j - cy)) - (Math.abs(b.i - cx) + Math.abs(b.j - cy)));
+    const jobs = want.slice(0, 16);
+    for (const w of jobs) S.magicPending.add(w.key);
+    const stale = () => seq !== S.magicSeq || S.magic.year !== year || S.lod !== g.lod;
+    const one = async (w) => {
+      if (stale()) { S.magicPending.delete(w.key); return; }
+      const qs = `sessionId=${encodeURIComponent(S.sessionId)}&year=${encodeURIComponent(String(year))}`
+        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}`;
+      try {
+        const r = await fetch(`/api/magic/tile?${qs}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const img = await createImageBitmap(await r.blob());
+        if (stale()) { if (img.close) img.close(); return; }
+        S.magicTiles.set(w.key, img);
+        while (S.magicTiles.size > 64) {
+          const first = S.magicTiles.keys().next().value;
+          if (first === undefined) break;
+          const old = S.magicTiles.get(first);
+          if (old && old.close) { try { old.close(); } catch (_) { /* ignore */ } }
+          S.magicTiles.delete(first);
+        }
+        requestDraw();
+      } catch (_) {
+        // 单块失败就继续用整张图兜底,不打断对局
+      } finally {
+        S.magicPending.delete(w.key);
       }
     };
     for (let p = 0; p < jobs.length; p += 3) await Promise.all(jobs.slice(p, p + 3).map(one));
@@ -1433,6 +1543,7 @@
       try { S.magic.img.close(); } catch (_) { /* ignore */ }
     }
     S.magic.img = null;
+    clearMagicTiles();
     if (el.magicLegendWrap) el.magicLegendWrap.classList.add('hidden');
     if (el.magicYearPick) el.magicYearPick.innerHTML = '';
     if (el.magicStatusLine && !quiet) el.magicStatusLine.textContent = '这个会话没有开「魔力场」(创建会话时勾「魔力场」)。';
@@ -1475,6 +1586,7 @@
       S.magic.data = decodeMagicData(dataRaw);
       S.magic.legend = dataRaw.legend;
       S.magic.year = pick;
+      clearMagicTiles();
       S.magic.on = !!(el.magicEnable && el.magicEnable.checked);
       if (S.magic.on) renderMagicLegend();
       updateMagicStatus(meta, pick);
@@ -2337,9 +2449,11 @@
     }
     if (el.btnOnboardSkip) {
       el.btnOnboardSkip.addEventListener('click', () => {
-        saveCfg({ ...cfgFromForm(), onboarded: true, features: { llm: false, jev: false }, mock: true });
+        // 跳过不等于关掉君主：保留 LLM 扮演、切成 mock，这样「先演示」时君主仍会开口。
+        saveCfg({ ...cfgFromForm(), onboarded: true, features: { llm: true, jev: false }, mock: true });
         if (el.mock) el.mock.checked = true;
-        if (el.featLlm) el.featLlm.checked = false;
+        if (el.featLlm) el.featLlm.checked = true;
+        if (el.featJev) el.featJev.checked = false;
         hideOnboard();
         toast('已跳过:先用 mock 离线演示;随时点顶栏「参数」补 Key。');
       });

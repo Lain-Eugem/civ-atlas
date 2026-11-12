@@ -325,7 +325,7 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 
 - **引擎侧**:三张按州记的表——`vein`(灵脉,约 1/16 的州有,一次生成后不变)、`rural`(接官方乡村人口表)、`magic`(每 5 年按 `spread/seep/fade/drain` 扩散、渗出、衰减、被人口耗散);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(强度 1 时 0–100 浓度≈1–2 倍)。图层每 50 年存一帧(`keep=50`),跟着 `Civ.simLayers` 一起存档/回放。
 - **开关**:`civ_session_open` 加 `magicField: true`(默认强度 1)或 `magicField: number`(0–3,0.5 一档);`civ_state_get` 返回 `magic`(强度 + 图层元数据/统计)。**不给 `magicField` 时,引擎行为和官方规则逐字节一致**;`magicField: 0` 只记图层、不改数值,也拿来做确定性对账。
-- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;PNG 与地形底图同为 2048×1024——先把州值经 `sphereField` 按球面三角形重心插值铺成连续场(州内常数、州界一圈线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,仍按 1024 最近地块网格采样)。
+- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;整张 PNG 与地形底图同为 2048×1024——先把州值经 `sphereField` 按球面三角形重心插值铺成连续场(州内常数、州界一圈线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,仍按 1024 最近地块网格采样)。放大超过约 2 倍后,查看器改用 `renderMagicTilePixels` 的窗口化瓦片(与地形瓦片同一网格 `x=i*512,y=j*512`,按瓦片自己的倍率做球面覆盖、模糊与辉光,所以放大不糊),路由 `GET /api/magic/tile?sessionId=&year=&S=&x=&y=&size=`;瓦片没铺满前用整张 2048 图兜底。
 - **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与州魔力浓度。
 - **自检**:`node mcp/.build/mcp/selftest-magic.js`(34 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
 
@@ -431,7 +431,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹),同样可收起。
 - 左侧行动栏:创建世界 → 开始会话 → 跑一回合 → 自动播放,以及回放对账、导出会话;这三块都是浮在地图上的玻璃卡片,地图始终露在中间。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data|tile`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 ### 地形渲染:复用主站的管线
 
@@ -480,6 +480,8 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **可配置场(阶段A,已完成)**:`src/gen/civ/fieldPlugin.ts` 把玩家给的 `FieldSpec`(密度/源强/扩散/渗出/衰减/人口耗散/强度/图层 + 1–6 条 `influences`)变成本地 `SimPlugin`;`civ_session_open` 的 `fields`(最多 4 份)、`civ_field_catalog` 列出可接的影响口(`city.capacity`/`war.odds`/`unrest.add` 等)与示例 spec;`civ_state_get` 返回 `fields`/`layers`;玩家自己决定影响哪些数值;不给 `fields` 或强度 0 时官方指纹逐字节不变;自检 46 项。
 - **官方 .civplugin 加载器(阶段B,已完成)**:`mcp/plugin-loader.ts` 在 mcp 的 CommonJS 产物里用 QuickJS 直装官方推演插件(文件或源码目录,最多 4 个);`civ_session_open` 加 `plugins` 路径数组,插件与内置魔力场/自定义场同走 `CivParams.plugins`;summary/session.json 记插件 id,`civ_state_get.layers` 能看插件图层;非 sim 插件/坏路径/重复 id/超上限都有中文错误;自检 22 项。
 - **地块级场(阶段C,已完成)**:`FieldSpec.unit` 支持 `tile`(按世界全部 mesh 地块逐年演化);插件层 Host 支持 tile 表/图层(内存按地块、落盘按 `cell`),`fieldPlugin` 把地块值聚合成州均值后接影响口;`civ_state_get.layers` 带 `unit: "tile"`;官方 `.civplugin` 接口第 1 版不动;自检 30 项。
+- **君主沙盒四功能(已完成)**:首次引导(LLM/Jev 两把 Key)、LLM 扮演与 Jev 判断双开关、君主角色卡 + 独立记忆、高影响命令 Jev 审核(soften/reject)+ 玩家/DM 复核;回合拆成 `monarchPlan`/`monarchCommit`;新增第 27 种干预 `intel`(渗透,含 blown 冷却)与逐州属性/情报注入提示词;自检 45 项。
+- **单端口沙盒与地形渲染(已完成)**:`scripts/lib/sandboxViewer.ts` 把查看器挂到同一个 `pnpm dev` 的 `/sandbox/`(自动构建 MCP + 代理 viewer 子进程),地形复用上游 raster/render 管线(手绘/卫星/地理/经典四种画法、放大按 √2 分档只算可见瓦片、跨极拖动、矢量墨线、按瓦片追海岸线);自检 18 项(coast)。
 
 ## 目录
 
@@ -491,6 +493,8 @@ mcp/
   prompt.ts          君主系统提示词
   llm.ts             DeepSeek/百炼/自定义 OpenAI 兼容 + mock 决策
   dm.ts              DM 小决策(OpenAI 兼容 oracle + 天灾/小贸易/故事事件编译 + 日志)
+  intel.ts           渗透情报编排(Jev + 确定性抽签,blown 冷却)
+  monarch-audit.ts   高影响命令审核(declare/press/destroy/cede 的 allow/soften/reject)
   petty-client.ts    官方 Jev 客户端(POST /api/v1/decisions,鉴权/解析/错误映射)
   petty-budget.ts    token 估算 + P0/P1/P2 预算打包
   petty-queue.ts     严格串行优先队列(超时/背压/熔断/降级)
@@ -510,11 +514,16 @@ mcp/
   selftest-field-plugin.ts 可配置场自检(46 项,spec 校验/影响口/确定性)
   selftest-plugin-loader.ts 官方 .civplugin 加载器自检(22 项,QuickJS/会话/回放)
   selftest-tile-field.ts   地块级场自检(30 项,按地块演化/落盘往返/回放)
+  selftest-monarch-sandbox.ts 君主沙盒四功能自检(45 项,引导/双开关/君主卡/审核/复核)
+  selftest-coast.ts        地形瓦片海岸线自检(18 项,瓦片与底图偏差)
   plugin-loader.ts   官方 .civplugin 加载器(CJS 里用 QuickJS wasm + simPluginsOn)
   vite-url.d.ts      mcp 构建认 Vite 的 `?url` 导入(只给类型)
+  build-compat.cjs   tsc 产物里 `import.meta.env.BASE_URL` 的构建兼容补丁(只改 .build)
+  terrain.ts         地形渲染(2048 底图 + 512 瓦片 + 矢量层,复用上游 raster/风格)
+  coast-trace.ts     按瓦片自己的倍率追水陆边界(marching squares,Douglas–Peucker 抽稀)
   png.ts             纯 Node PNG 编码(渲染层共用)
   field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
-  magic-render.ts    魔力图层渲染(2048 球面插值连续场 + 平滑/辉光,PNG + 图例)
+  magic-render.ts    魔力图层渲染(2048 球面插值连续场 + 平滑/辉光;放大后按 LOD 现算窗口化瓦片)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图 + 场叠加)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1
