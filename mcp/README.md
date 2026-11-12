@@ -323,11 +323,11 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 
 静态场只能看;这一层把「魔脉」做成**跟着历史逐年变化、并且真的影响推演**的场,思路来自引擎自带的官方示例插件 `examples/plugins/magic/`(表卡 + 影响口 + 图层,不依赖 QuickJS,内联成原生 `SimPlugin`,见 `src/gen/civ/magicPlugin.ts`):
 
-- **引擎侧**:三张按州记的表——`vein`(灵脉,约 1/16 的州有,一次生成后不变)、`rural`(接官方乡村人口表)、`magic`(每 5 年按 `spread/seep/fade/drain` 扩散、渗出、衰减、被人口耗散);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(强度 1 时 0–100 浓度≈1–2 倍)。图层每 50 年存一帧(`keep=50`),跟着 `Civ.simLayers` 一起存档/回放。
+- **引擎侧**:两张按地块记的表——`vein`(灵脉,约 6% 的地块有,一次生成后不变)、`magic`(每 5 年按 `spread/seep/fade/drain` 在相邻地块间扩散、渗入、自然消退);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(先把地块值按州求均值,跳过水面;强度 1 时 0–100 浓度≈1–2 倍)。图层每 100 年存一帧(`keep=100`,地块图层的格数固定,字节上限 7.8 MB),跟着 `Civ.simLayers` 一起存档/回放。
 - **开关**:`civ_session_open` 加 `magicField: true`(默认强度 1)或 `magicField: number`(0–3,0.5 一档);`civ_state_get` 返回 `magic`(强度 + 图层元数据/统计)。**不给 `magicField` 时,引擎行为和官方规则逐字节一致**;`magicField: 0` 只记图层、不改数值,也拿来做确定性对账。
-- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;整张 PNG 与地形底图同为 2048×1024——先把州值经 `sphereField` 按球面三角形重心插值铺成连续场(州内常数、州界一圈线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,仍按 1024 最近地块网格采样)。放大超过约 2 倍后,查看器改用 `renderMagicTilePixels` 的窗口化瓦片(与地形瓦片同一网格 `x=i*512,y=j*512`,按瓦片自己的倍率做球面覆盖、模糊与辉光,所以放大不糊),路由 `GET /api/magic/tile?sessionId=&year=&S=&x=&y=&size=`;瓦片没铺满前用整张 2048 图兜底。
-- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与州魔力浓度。
-- **自检**:`node mcp/.build/mcp/selftest-magic.js`(34 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
+- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;整张 PNG 与地形底图同为 2048×1024——先把每块地的值经 `sphereField` 按球面三角形重心插值铺成连续场(相邻地块之间线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,`grid` 存地块编号、水面为 −1,并带 `unit`/`count`)。放大超过约 2 倍后,查看器改用 `renderMagicTilePixels` 的窗口化瓦片(与地形瓦片同一网格 `x=i*512,y=j*512`,按瓦片自己的倍率做球面覆盖、模糊与辉光,所以放大不糊),路由 `GET /api/magic/tile?sessionId=&year=&S=&x=&y=&size=`;瓦片没铺满前用整张 2048 图兜底。
+- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与地块魔力浓度。
+- **自检**:`node mcp/.build/mcp/selftest-magic.js`(35 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
 
 ## 可配置场(阶段A:玩家自己造「铲子」)
 
@@ -476,7 +476,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**MCP 工具增至 20 个(现在 21)**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
 - **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录随后增到 27 种(新增 `intel`)、查看器标成「故事事件」。
 - **自定义场原型(已完成)**:`src/gen/field.ts`(计算层,魔脉/矿产/辐射三种、逐字节确定、FNV-1a hash)+ `mcp/field-render.ts`(渲染层,色带/拉伸/等高线/辉光/浮雕/透明度,只读数值)+ `mcp/png.ts` + 查看器「自定义场」面板与 `/api/field/*`;计算与渲染彻底分开,改样式不再重算;自检 43 项。
-- **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/rural/magic 三张表 + `city.capacity` 影响口 + 每 50 年一帧图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,PNG + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 34 项。
+- **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/magic 两张按地块记的表 + `city.capacity` 影响口(按州聚合)+ 每 100 年一帧地块图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,2048 PNG / LOD 瓦片 + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 35 项。
 - **可配置场(阶段A,已完成)**:`src/gen/civ/fieldPlugin.ts` 把玩家给的 `FieldSpec`(密度/源强/扩散/渗出/衰减/人口耗散/强度/图层 + 1–6 条 `influences`)变成本地 `SimPlugin`;`civ_session_open` 的 `fields`(最多 4 份)、`civ_field_catalog` 列出可接的影响口(`city.capacity`/`war.odds`/`unrest.add` 等)与示例 spec;`civ_state_get` 返回 `fields`/`layers`;玩家自己决定影响哪些数值;不给 `fields` 或强度 0 时官方指纹逐字节不变;自检 46 项。
 - **官方 .civplugin 加载器(阶段B,已完成)**:`mcp/plugin-loader.ts` 在 mcp 的 CommonJS 产物里用 QuickJS 直装官方推演插件(文件或源码目录,最多 4 个);`civ_session_open` 加 `plugins` 路径数组,插件与内置魔力场/自定义场同走 `CivParams.plugins`;summary/session.json 记插件 id,`civ_state_get.layers` 能看插件图层;非 sim 插件/坏路径/重复 id/超上限都有中文错误;自检 22 项。
 - **地块级场(阶段C,已完成)**:`FieldSpec.unit` 支持 `tile`(按世界全部 mesh 地块逐年演化);插件层 Host 支持 tile 表/图层(内存按地块、落盘按 `cell`),`fieldPlugin` 把地块值聚合成州均值后接影响口;`civ_state_get.layers` 带 `unit: "tile"`;官方 `.civplugin` 接口第 1 版不动;自检 30 项。
@@ -510,7 +510,7 @@ mcp/
   selftest-petty-core.ts   小事件核心自检(58 项,不联网)
   selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
   selftest-field.ts        自定义场自检(43 项,确定性/数值/渲染)
-  selftest-magic.ts        魔力动态层自检(34 项,引擎影响/图层/回放)
+  selftest-magic.ts        魔力动态层自检(35 项,引擎影响/地块图层/回放)
   selftest-field-plugin.ts 可配置场自检(46 项,spec 校验/影响口/确定性)
   selftest-plugin-loader.ts 官方 .civplugin 加载器自检(22 项,QuickJS/会话/回放)
   selftest-tile-field.ts   地块级场自检(30 项,按地块演化/落盘往返/回放)
@@ -523,7 +523,7 @@ mcp/
   coast-trace.ts     按瓦片自己的倍率追水陆边界(marching squares,Douglas–Peucker 抽稀)
   png.ts             纯 Node PNG 编码(渲染层共用)
   field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
-  magic-render.ts    魔力图层渲染(2048 球面插值连续场 + 平滑/辉光;放大后按 LOD 现算窗口化瓦片)
+  magic-render.ts    魔力图层渲染(逐地块值 2048 球面插值连续场 + 平滑/辉光;放大后按 LOD 现算窗口化瓦片)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图 + 场叠加)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1

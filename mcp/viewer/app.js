@@ -63,6 +63,7 @@
     magicPending: new Set(),
     magicSeq: 0,
     magicTimer: 0,
+    magicLoading: false,
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -882,6 +883,10 @@
     const jobs = want.slice(0, 16);
     for (const w of jobs) S.magicPending.add(w.key);
     const stale = () => seq !== S.magicSeq || S.magic.year !== year || S.lod !== g.lod;
+    /** 换档作废时把还没发的 pending 一起清掉,否则它们会永远留在 Set 里挡住重试 */
+    const dropRest = (from) => {
+      for (let q = from; q < jobs.length; q++) S.magicPending.delete(jobs[q].key);
+    };
     const one = async (w) => {
       if (stale()) { S.magicPending.delete(w.key); return; }
       const qs = `sessionId=${encodeURIComponent(S.sessionId)}&year=${encodeURIComponent(String(year))}`
@@ -906,7 +911,10 @@
         S.magicPending.delete(w.key);
       }
     };
-    for (let p = 0; p < jobs.length; p += 3) await Promise.all(jobs.slice(p, p + 3).map(one));
+    for (let p = 0; p < jobs.length; p += 3) {
+      if (stale()) { dropRest(p); return; } // 换档途中不再排新请求,免得把服务端塞满旧档
+      await Promise.all(jobs.slice(p, p + 3).map(one));
+    }
   }
 
   /* ------------------------------------------------------------------ *
@@ -1374,11 +1382,12 @@
     if (magic) {
       const gx = Math.min(magic.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * magic.gridW)));
       const gy = Math.min(magic.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * magic.gridH)));
-      const region = magic.grid[gy * magic.gridW + gx];
-      if (typeof region === 'number' && region >= 0 && region < magic.values.length) {
+      const idx = magic.grid[gy * magic.gridW + gx];
+      if (typeof idx === 'number' && idx >= 0 && idx < magic.values.length) {
         if (lines.length) lines.push('<span class="muted">——</span>');
-        lines.push(`<b>魔力浓度</b> <span class="field-tip-value">${magic.values[region].toFixed(4)}</span>`);
-        lines.push(`<span class="muted">第 ${fmtInt(magic.frameYear)} 年图层(取不晚于本回合的帧)· 州 #${region} · ${lon}°E, ${lat}°N</span>`);
+        const where = magic.unit === 'tile' ? `地块 #${idx}` : `州 #${idx}`;
+        lines.push(`<b>魔力浓度</b> <span class="field-tip-value">${magic.values[idx].toFixed(4)}</span>`);
+        lines.push(`<span class="muted">第 ${fmtInt(magic.frameYear)} 年图层(取不晚于本回合的帧)· ${where} · ${lon}°E, ${lat}°N</span>`);
       } else if (!lines.length) {
         return setFieldTipVisible(false);
       }
@@ -1530,7 +1539,7 @@
     }
     el.magicStatusLine.textContent =
       `魔力强度 ${meta && meta.strength !== null && meta.strength !== undefined ? meta.strength : '?'} · 图层第 ${fmtInt(year)} 年(帧 ${fmtInt(d.frameYear)}) · ` +
-      `${fmtInt(d.regions)} 州 · min ${d.stats.min.toFixed(2)} / mean ${d.stats.mean.toFixed(2)} / max ${d.stats.max.toFixed(2)}`;
+      `${fmtInt(d.count)} ${d.unit === 'tile' ? '地块' : '州'} · min ${d.stats.min.toFixed(2)} / mean ${d.stats.mean.toFixed(2)} / max ${d.stats.max.toFixed(2)}`;
   }
 
   function resetMagic(quiet) {

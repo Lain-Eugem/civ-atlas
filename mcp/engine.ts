@@ -457,7 +457,7 @@ function eventView(e: ChronicleEntry): EventView {
 export interface MagicLayerView {
   id: string;
   title: string;
-  unit: 'region';
+  unit: 'region' | 'tile';
   keep: number;
   legend: string;
   years: number[];
@@ -479,12 +479,17 @@ export function magicView(s: Session): MagicView | null {
     if (L.by !== 'magic') continue;
     const n = L.years.length ? Math.floor(L.values.length / L.years.length) : 0;
     const last = n ? L.values.subarray(L.values.length - n) : undefined;
+    const unit: 'region' | 'tile' = L.unit === 'tile' ? 'tile' : 'region';
+    const of = s.civ.regions.of;
     let min = Infinity;
     let max = -Infinity;
     let sum = 0;
     let k = 0;
     if (last) {
-      for (const v of last) {
+      for (let i = 0; i < last.length; i++) {
+        // 按地块的层只统计陆地地块(海水那部分不算魔力)
+        if (unit === 'tile' && of[i]! < 0) continue;
+        const v = last[i]!;
         if (!Number.isFinite(v)) continue;
         min = Math.min(min, v);
         max = Math.max(max, v);
@@ -495,7 +500,7 @@ export function magicView(s: Session): MagicView | null {
     layers.push({
       id: L.id,
       title: L.title,
-      unit: 'region',
+      unit,
       keep: MAGIC_LAYER.keep,
       legend: MAGIC_LAYER.legend,
       years: [...L.years],

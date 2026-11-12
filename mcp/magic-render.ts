@@ -17,8 +17,9 @@ export const MAGIC_OUT_W = 2048;
 
 export interface MagicLayerFrame {
   years: number[];
-  /** 每帧州数 */
-  regions: number;
+  /** 每帧的格数(按州 = 州数;按地块 = 地块数) */
+  count: number;
+  unit: 'region' | 'tile';
   values: Float32Array;
 }
 
@@ -46,6 +47,15 @@ export interface MagicRender {
   frameYear: number | null;
 }
 
+/** 一局魔力层的元数据:按州(旧)或按地块(现在内置魔力场) */
+export interface MagicLayer extends MagicLayerFrame {
+  title: string;
+  colors: string[];
+  min: number;
+  max: number;
+  legend: string;
+}
+
 const rasterCache = new WeakMap<World, Raster>();
 
 export function magicRaster(world: World): Raster {
@@ -56,16 +66,18 @@ export function magicRaster(world: World): Raster {
   return r;
 }
 
-/** 取本局魔力层(没有 = null) */
-export function magicLayerOf(civ: Civ): { years: number[]; values: Float32Array; regions: number; title: string; colors: string[]; min: number; max: number; legend: string } | null {
+/** 取本局魔力层(没有 = null);unit 决定是「一州一值」还是「一地块一值」 */
+export function magicLayerOf(civ: Civ): MagicLayer | null {
   const L = (civ.simLayers ?? []).find((v) => v.by === 'magic' && v.id === 'magic');
   if (!L || !L.years.length) return null;
-  const regions = Math.floor(L.values.length / L.years.length);
-  if (regions <= 0) return null;
+  const unit: 'region' | 'tile' = L.unit === 'tile' ? 'tile' : 'region';
+  const count = Math.floor(L.values.length / L.years.length);
+  if (count <= 0) return null;
   return {
     years: [...L.years],
     values: L.values,
-    regions,
+    unit,
+    count,
     title: L.title,
     colors: [...(L.ramp?.colors ?? ['#1b1036', '#5b2a9e', '#a46cff', '#f2e6ff'])],
     min: L.ramp?.min ?? 0,
@@ -84,10 +96,10 @@ export function magicFrameIndex(years: readonly number[], year: number): number 
   return pick;
 }
 
-/** 帧里的州值按线性插值取(年落在两帧之间时),显示用;两端取端点 */
-export function magicValuesAt(layer: { years: number[]; values: Float32Array; regions: number }, year: number): { frame: number; values: Float32Array } {
+/** 帧里的值按线性插值取(年落在两帧之间时),显示用;两端取端点 */
+export function magicValuesAt(layer: { years: number[]; values: Float32Array; count: number }, year: number): { frame: number; values: Float32Array } {
   const i = magicFrameIndex(layer.years, year);
-  const n = layer.regions;
+  const n = layer.count;
   const cur = layer.values.subarray(i * n, (i + 1) * n);
   if (i + 1 >= layer.years.length) return { frame: layer.years[i], values: Float32Array.from(cur) };
   const y0 = layer.years[i];
@@ -96,7 +108,7 @@ export function magicValuesAt(layer: { years: number[]; values: Float32Array; re
   const t = Math.min(1, Math.max(0, (year - y0) / (y1 - y0)));
   const nxt = layer.values.subarray((i + 1) * n, (i + 2) * n);
   const out = new Float32Array(n);
-  for (let r = 0; r < n; r++) out[r] = cur[r] + (nxt[r] - cur[r]) * t;
+  for (let r = 0; r < n; r++) out[r] = cur[r]! + (nxt[r]! - cur[r]!) * t;
   return { frame: y0, values: out };
 }
 
@@ -163,19 +175,38 @@ function blurField(a: Float32Array, w: number, h: number, r: number): void {
 }
 
 /**
- * 每州的值 → 每地块 → 按球面三角形插值成 w×h 的连续场(t ∈ [0,1],显示用)。
- * 州内是常数,跨州界的一圈三角形里线性过渡,看起来就像连续扩散的魔力而不是色块。
+ * 一帧的值 → 每地块的显示强度 t ∈ [0,1]。
+ * - 按州记的旧层:州内常数,水地块 0;
+ * - 按地块记的新层:直接取每地块的值,水地块仍是 0(魔力只长在陆地上)。
+ * 数值本身不改;这里只做显示前的归一化。
  */
-export function magicFieldOf(world: World, civ: Civ, values: Float32Array, min: number, span: number, w: number, h: number): Float32Array {
+export function magicCellField(world: World, civ: Civ, layer: MagicLayer, values: Float32Array): Float32Array {
   const mesh = world.mesh;
   const cells = new Float32Array(mesh.n);
+  const span = Math.max(1e-6, layer.max - layer.min);
   const of = civ.regions.of;
+  if (layer.unit === 'tile') {
+    const n = Math.min(mesh.n, values.length);
+    for (let c = 0; c < n; c++) {
+      const v = of[c]! >= 0 ? values[c]! : NaN;
+      cells[c] = Number.isFinite(v) ? (v - layer.min) / span : 0;
+    }
+    return cells;
+  }
   for (let c = 0; c < mesh.n; c++) {
     const region = of[c]!;
     const v = region >= 0 && region < values.length ? values[region]! : NaN;
-    cells[c] = Number.isFinite(v) ? (v - min) / span : 0;
+    cells[c] = Number.isFinite(v) ? (v - layer.min) / span : 0;
   }
-  return sphereField(mesh, cells, w, h);
+  return cells;
+}
+
+/**
+ * 每地块的显示强度 → 按球面三角形插值成 w×h 的连续场(显示用)。
+ * 州内是常数时,跨州界的一圈三角形里线性过渡;按地块的层本身就是连续的。
+ */
+export function magicFieldOf(world: World, civ: Civ, layer: MagicLayer, values: Float32Array, w: number, h: number): Float32Array {
+  return sphereField(world.mesh, magicCellField(world, civ, layer, values), w, h);
 }
 
 export interface MagicPixels {
@@ -244,9 +275,8 @@ export function renderMagicPixels(world: World, civ: Civ, year: number, style: M
   const w = Math.max(512, Math.round(world.width));
   const h = Math.max(256, Math.round(world.height));
   const { values, frame } = magicValuesAt(layer, year);
-  const span = Math.max(1e-6, layer.max - layer.min);
-  const t = magicFieldOf(world, civ, values, layer.min, span, w, h);
-  // 三角形插值在州界上的折线再用约 2px 的柔化抹一下;州内是常数,不会被抹淡
+  const t = magicFieldOf(world, civ, layer, values, w, h);
+  // 三角形插值在格与格之间的折线再用约 2px 的柔化抹一下
   blurField(t, w, h, Math.max(1, Math.round(w / 1024)));
   const glow = glowOf(t, w, h, Math.max(2, Math.round(w / 190)));
   return { width: w, height: h, rgba: paintMagic(t, glow, w, h, layer, style.opacity), frameYear: frame };
@@ -263,14 +293,7 @@ export function renderMagicTilePixels(world: World, civ: Civ, year: number, S: n
   if (!layer) return null;
   const mesh = world.mesh;
   const { values, frame } = magicValuesAt(layer, year);
-  const span = Math.max(1e-6, layer.max - layer.min);
-  const of = civ.regions.of;
-  const cells = new Float32Array(mesh.n);
-  for (let c = 0; c < mesh.n; c++) {
-    const region = of[c]!;
-    const v = region >= 0 && region < values.length ? values[region]! : NaN;
-    cells[c] = Number.isFinite(v) ? (v - layer.min) / span : 0;
-  }
+  const cells = magicCellField(world, civ, layer, values);
   const cov = sphereCoverWindow(world, S, x0, y0, size, size);
   const tris = mesh.triangles;
   const t = new Float32Array(size * size);
@@ -315,7 +338,9 @@ export interface MagicDataJson {
   year: number;
   frameYear: number | null;
   years: number[];
-  regions: number;
+  /** region = 值按州、grid 存州编号;tile = 值按地块、grid 存地块编号(水 = -1) */
+  unit: 'region' | 'tile';
+  count: number;
   values: string;
   grid: string;
   gridW: number;
@@ -327,17 +352,22 @@ export interface MagicDataJson {
   legend: string;
 }
 
-/** 给 hover / 导出用的精确州值(不经过颜色反推) */
+/** 给 hover / 导出用的精确值:按州或按地块,按 unit 判读(不经过颜色反推) */
 export function magicDataJson(world: World, civ: Civ, sessionId: string, year: number, gridW = 256): MagicDataJson | null {
   const layer = magicLayerOf(civ);
   if (!layer) return null;
   const r = magicRaster(world);
   const { values, frame } = magicValuesAt(layer, year);
+  const of = civ.regions.of;
   let min = Infinity;
   let max = -Infinity;
   let sum = 0;
   let k = 0;
-  for (const v of values) {
+  // 水地块不算进统计(魔力只长在陆地上,按地块层里海水那部分显示为 0)
+  const counted = (i: number): boolean => (layer.unit === 'tile' ? of[i]! >= 0 : true);
+  for (let i = 0; i < values.length; i++) {
+    if (!counted(i)) continue;
+    const v = values[i]!;
     if (!Number.isFinite(v)) continue;
     min = Math.min(min, v);
     max = Math.max(max, v);
@@ -351,7 +381,13 @@ export function magicDataJson(world: World, civ: Civ, sessionId: string, year: n
     for (let gx = 0; gx < gridW; gx++) {
       const x = Math.min(r.w - 1, Math.floor((gx + 0.5) * (r.w / gridW)));
       const cell = r.cell[y * r.w + x];
-      grid[gy * gridW + gx] = cell >= 0 ? civ.regions.of[cell] : -1;
+      if (cell < 0) {
+        grid[gy * gridW + gx] = -1;
+      } else if (layer.unit === 'tile') {
+        grid[gy * gridW + gx] = of[cell]! >= 0 ? cell : -1;
+      } else {
+        grid[gy * gridW + gx] = of[cell]!;
+      }
     }
   }
   return {
@@ -359,7 +395,8 @@ export function magicDataJson(world: World, civ: Civ, sessionId: string, year: n
     year,
     frameYear: frame,
     years: layer.years,
-    regions: layer.regions,
+    unit: layer.unit,
+    count: layer.count,
     values: Buffer.from(values.buffer, values.byteOffset, values.byteLength).toString('base64'),
     grid: Buffer.from(grid.buffer, grid.byteOffset, grid.byteLength).toString('base64'),
     gridW,
