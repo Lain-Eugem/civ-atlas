@@ -467,7 +467,13 @@
   }
 
   let idleTimer = 0;
+  /** 最近一次输入(拖动/滚轮/缩放)的时间:矢量层在交互中不画,停手 260ms 后再补 */
+  let lastInputAt = 0;
+  let vecIdleTimer = 0;
   function beginInteractive() {
+    lastInputAt = performance.now();
+    clearTimeout(vecIdleTimer);
+    vecIdleTimer = setTimeout(() => requestDraw(), 260);
     if (S.rs !== 1) {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(endInteractive, 220);
@@ -576,7 +582,9 @@
     // 每层先铺底图,再把现算的高清瓦片盖在底图上,最后才叠场 / 魔力 / 疆域,
     // 这样国家颜色不会被地形盖掉。瓦片已经铺满视口时整张底图都不用画:
     // 高倍率下把 2048 宽的图放大到几万像素再被瓦片完全盖住,纯粹是白fill。
-    const baseCovered = tilesCoverView();
+    // 拖动 / 缩放中:跳过高清瓦片,只铺底图(2048 整图比十几块瓦片便宜得多),停手再补
+    const interacting = performance.now() - lastInputAt < 200;
+    const baseCovered = !interacting && tilesCoverView();
     if (!baseCovered) {
       for (const r of rects) {
         ctx.save();
@@ -588,9 +596,9 @@
     const nextLod = currentLod();
     if (nextLod !== S.lod) S.tileSeq++;  // 换档时让上一档还没发完的请求作废(缓存留着,来回缩放还能用)
     S.lod = nextLod;
-    drawHiTiles();
+    if (!interacting) drawHiTiles();
     drawMagicHiTiles();
-    const magicSharp = S.magic.on && magicTilesCoverView();
+    const magicSharp = !interacting && S.magic.on && magicTilesCoverView();
     for (const r of rects) {
       ctx.save();
       if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
@@ -788,7 +796,6 @@
       }
     }
     if (!want.length) return;
-    // 屏幕中间的先算,观感上先清楚起来;最多一批 3 块并发
     const cx = (g.i0 + g.i1) / 2;
     const cy = (g.j0 + g.j1) / 2;
     want.sort((a, b) => (Math.abs(a.i - cx) + Math.abs(a.j - cy)) - (Math.abs(b.i - cx) + Math.abs(b.j - cy)));
@@ -831,7 +838,8 @@
         S.tilePending.delete(w.key);
       }
     };
-    for (let p = 0; p < jobs.length; p += 3) await Promise.all(jobs.slice(p, p + 3).map(one));
+    // 一批 6 块并发:浏览器的 HTTP/1.1 单域并发上限是 6,再多也要排队
+    for (let p = 0; p < jobs.length; p += 6) await Promise.all(jobs.slice(p, p + 6).map(one));
   }
 
   /* ------------------------------------------------------------------ *
@@ -935,9 +943,9 @@
         S.magicPending.delete(w.key);
       }
     };
-    for (let p = 0; p < jobs.length; p += 3) {
+    for (let p = 0; p < jobs.length; p += 6) {
       if (stale()) { dropRest(p); return; } // 换档途中不再排新请求,免得把服务端塞满旧档
-      await Promise.all(jobs.slice(p, p + 3).map(one));
+      await Promise.all(jobs.slice(p, p + 6).map(one));
     }
   }
 
@@ -946,18 +954,11 @@
    *
    * 底图与高清瓦片里的墨线 / 波纹已经在服务端去掉,这里按固定屏幕线宽画。
    * 所以放大到 1200% 墨线仍是 1.15px、符号按倍数分级变多,而不是把位图拉糊。
+   *
+   * 绘制本体在 vec-draw.js(主线程和 vec-worker.js 共用同一份):主线程只做
+   * 兜底,正常情况下重烘交给 Worker 的 OffscreenCanvas,不阻塞拖动 / 缩放。
    * ------------------------------------------------------------------ */
-  function withBox(line) {
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (let i = 0; i < line.length; i += 2) {
-      const x = line[i], y = line[i + 1];
-      if (x < x0) x0 = x;
-      if (x > x1) x1 = x;
-      if (y < y0) y0 = y;
-      if (y > y1) y1 = y;
-    }
-    return { p: line, x0, y0, x1, y1 };
-  }
+  const { withBox, drawVectorsInto: drawVectorsIntoShared, visibleRectsFor } = window.CivVecDraw;
 
   function loadVectors() {
     // 矢量和画法无关:默认 fantasy 要用,white 也要用;提前拿好,切过去时不用等
@@ -988,185 +989,124 @@
   }
 
   /**
-   * 一个地形符号的几何,塞进两条 Path2D:fill(山的实心三角)和 stroke(其余线条)。
-   * 以前这里直接 ctx.fill()/stroke(),每个符号 2~4 次调用;三千多个符号时一帧要
-   * 上万次 canvas 调用,光驱动开销就够呛。现在整帧只调两次。
+   * 矢量层重烘优先交给 Worker(OffscreenCanvas):主线程不再被上万段线阻塞。
+   * 拿不到 Worker / OffscreenCanvas / 出错时回退到主线程同步绘制。
    */
-  function glyphInto(g, x, y, unit, fillPath, linePath) {
-    const kind = g[2];
-    // 后几级(放大后才出现)的符号画小一点:像主站那样一级一级补细节,而不是一起撑成大三角
-    const tier = 1 / (1 + Math.log2(Math.max(1, g[7])) * 0.55);
-    const s = clamp(g[3] * unit * tier, 2.5, 24);
-    const w = s * (0.75 + g[6] * 0.12);
-    if (kind === 0 || kind === 7) {          // 山 / 火山
-      fillPath.moveTo(x - w, y);
-      fillPath.lineTo(x - w * 0.12, y - s * 0.9);
-      fillPath.lineTo(x + w, y);
-      fillPath.closePath();
-      linePath.moveTo(x - w * 0.12, y - s * 0.9);
-      linePath.lineTo(x + w * 0.16, y - s * 0.45);
-      linePath.lineTo(x + w * 0.38, y);
-      if (kind === 7) {
-        linePath.moveTo(x - w * 0.12, y - s * 0.9);
-        linePath.quadraticCurveTo(x + w * 0.1, y - s * 1.3, x, y - s * 1.55);
-      }
-    } else if (kind === 1) {                 // 丘陵
-      linePath.moveTo(x - s * 0.7, y);
-      linePath.quadraticCurveTo(x, y - s * 0.85, x + s * 0.7, y);
-    } else if (kind === 5) {                 // 沙丘
-      linePath.moveTo(x - s * 0.6, y);
-      linePath.quadraticCurveTo(x - s * 0.1, y - s * 0.45, x + s * 0.6, y);
-    } else if (kind === 6) {                 // 草丛
-      for (let i = -1; i <= 1; i++) {
-        linePath.moveTo(x + i * s * 0.18, y);
-        linePath.lineTo(x + i * s * 0.18 + s * 0.12, y - s * 0.5);
-      }
-    } else {                                 // 沼泽
-      linePath.moveTo(x - s * 0.5, y);
-      linePath.lineTo(x + s * 0.5, y);
-      linePath.moveTo(x - s * 0.35, y - s * 0.22);
-      linePath.lineTo(x + s * 0.2, y - s * 0.22);
-    }
+  let vecWorker = null;
+  let vecWorkerSeq = 0;
+  let vecWorkerBusy = false;
+  let vecWorkerBroken = false;
+  let vecWorkerWorldId = null;
+  let vecWorkerPending = null;
+
+  function vecWorkerAvailable() {
+    return typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined';
   }
 
-  /**
-   * 把矢量层画进指定 ctx。cw / ch 是这个 ctx 的"虚拟视口"尺寸,rects 也相对它。
-   * 抽出来才能把整层预先画到离屏 canvas 上:拖动时只贴一张图,不必每帧重新描上万段线。
-   */
-  function drawVectorsInto(g, rects, k, P, H, cw, ch, tileFull, tileCover) {
-    const v = S.vec;
-    if (!v || (S.style !== 'fantasy' && S.style !== 'white') || !rects.length) return;
-    const white = S.style === 'white';
-    const ink = white ? 'rgba(70,72,76,0.82)' : 'rgba(58,45,34,0.86)';
-    const inkSoft = white ? 'rgba(70,72,76,0.20)' : 'rgba(58,45,34,0.17)';
-    const W = S.mapW;
-    const sx = P / S.mapW;              // 屏幕像素 / 整图像素
-    const sy = H / S.mapH;
-    const relK = S.view.k;              // 1 = 默认视图;符号的分级 / 收缩按相对倍数算
-    const gs = relK <= 1.35 ? 1 : Math.pow(relK / 1.35, -0.22);
-    const unit = gs * sx;               // 符号大小:比地图放大得慢,不会撑满屏幕
-    const fine = relK >= 2.5;           // 放大后换成没怎么抽稀的线,曲线才不会被放大成折线
-    const coast = fine ? v.coastFine : v.coast;
-    const lake = fine ? v.lakeFine : v.lake;
-    const ripples = fine ? v.rippleFine : v.ripple.slice(0, 2);
-
-    for (const r of rects) {
-      const fx = (px) => r.x + px * sx;
-      const fy = (py) => (r.odd ? r.yTop + H - py * sy : r.yTop + py * sy);
-      // 逐线段裁剪,而不是整条折线的包围盒:长海岸线可能横跨整幅地图,用整条线的
-      // bbox 判断会漏画局部;一次塞进超长路径描边也可能丢后半段。每 3000 段 flush 一次。
-      //
-      // 关键:连续可见的线段要连着画(一个 moveTo + 一串 lineTo),不能每段都 moveTo。
-      // 每段单独成一条子路径、再配上圆头线帽,等于给一万多段各画两个圆 —— dpr2 的
-      // 1920×1000 画布上光是这一项就要 400ms,拖动直接卡死。改成折线 + 平头线帽后
-      // 子路径从一万多降到几百条,渲染时间掉一个数量级(观感不变:转折处仍是圆角连接)。
-      const strokeLines = (lists, color, lw) => {
-        g.strokeStyle = color;
-        g.lineWidth = lw;
-        g.beginPath();
-        let seg = 0;
-        for (const list of lists) {
-          for (const b of list) {
-            const p = b.p;
-            // 东西相连:跨 180° 经线的海岸线会伸出左右边界,要在另一侧再补一份,
-            // 否则那段海岸只在"某一份平铺副本"里出现,拖到屏幕边缘就没了(主站 chunkPath / wrapShifts 同款)。
-            const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
-            for (const sh of shifts) {
-              let pen = false;    // 上一段还连着,可以省掉 moveTo
-              for (let i = 0; i + 3 < p.length; i += 2) {
-                const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
-                const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
-                if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
-                if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
-                  || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
-                if (!pen) { g.moveTo(x0, y0); pen = true; }
-                g.lineTo(x1, y1);
-                if (++seg >= 3000) { g.stroke(); g.beginPath(); pen = false; seg = 0; }
-              }
+  function ensureVecWorker() {
+    if (vecWorker || vecWorkerBroken) return vecWorker;
+    try {
+      vecWorker = new Worker('./vec-worker.js');
+      vecWorker.onmessage = (ev) => {
+        const m = ev.data || {};
+        vecWorkerBusy = false;
+        if (m.ok) {
+          if (m.seq === vecWorkerSeq) {
+            if (S.vecCache && S.vecCache.canvas && S.vecCache.canvas !== m.bitmap && S.vecCache.canvas.close) {
+              S.vecCache.canvas.close();
             }
+            S.vecCache = {
+              canvas: m.bitmap, x0: m.x0, y0: m.y0, w: m.w, h: m.h, pad: m.pad, k: m.k,
+              ox: m.ox, oy: m.oy, cw: m.cw, ch: m.ch, rdpr: m.rdpr, style: m.style,
+              tileFull: m.tileFull, vecWorldId: m.vecWorldId
+            };
+            requestDraw();
+          } else if (m.bitmap && m.bitmap.close) {
+            m.bitmap.close();
           }
+        } else if (m.seq === vecWorkerSeq) {
+          // Worker 内部报错(比如极端参数):后续改回主线程,保证有图可看
+          vecWorkerBroken = true;
+          requestDraw();
         }
-        g.stroke();
+        const next = vecWorkerPending;
+        vecWorkerPending = null;
+        if (next && !vecWorkerBroken) sendVecBuild(next);
       };
-      g.save();
-      g.lineJoin = 'round';
-      g.lineCap = 'butt';
-      if (!white) strokeLines(ripples, inkSoft, 1);
-      // 有瓦片覆盖的地方用瓦片自带的那份线(它是按当前倍率追的,才和这块地形对齐);
-      // 全局这份是在 1 倍底图上追的,放大后会和海岸差一两个像素,只在没瓦片的空白处补。
-      if (!tileFull) {
-        if (tileCover.length) {
-          const cover = new Path2D();
-          cover.rect(-20, -20, cw + 40, ch + 40);
-          for (const t of tileCover) cover.rect(t.x, t.y, t.w, t.h);
-          g.clip(cover, 'evenodd');
-        }
-        strokeLines([lake, coast], ink, 1.15);
-      }
-      g.restore();
-      if (white) continue;
-      // 符号:整帧只合成两条路径(实心三角 + 线条),最后各调一次 fill / stroke
-      const gFill = new Path2D();
-      const gLine = new Path2D();
-      for (const g of v.glyphs) {
-        if (g[7] > relK + 0.01) continue;   // z:放大后逐级出现更多符号
-        const gy = r.odd ? r.yTop + H - g[1] * sy : r.yTop + g[1] * sy;
-        if (gy < -24 || gy > ch + 24) continue;
-        // 贴着 ±180° 经线的符号也在另一侧补一份,免得拖到边缘时缺一截
-        const shifts = g[0] < 24 ? [0, W] : g[0] > W - 24 ? [0, -W] : [0];
-        for (const sh of shifts) {
-          const gx = r.x + (g[0] + sh) * sx;   // 位置跟着地图,不跟着符号缩放
-          if (gx < -24 || gx > cw + 24) continue;
-          glyphInto(g, gx, gy, unit, gFill, gLine);
-        }
-      }
-      g.fillStyle = 'rgba(238,228,201,0.82)';
-      g.fill(gFill);
-      g.lineWidth = 0.85;
-      g.lineJoin = 'round';
-      g.lineCap = 'round';
-      g.strokeStyle = 'rgba(58,45,34,0.78)';
-      g.stroke(gLine);
+      vecWorker.onerror = () => {
+        vecWorkerBroken = true;
+        vecWorkerBusy = false;
+        vecWorkerPending = null;
+        requestDraw();
+      };
+    } catch (e) {
+      vecWorkerBroken = true;
+      vecWorker = null;
     }
+    return vecWorker;
   }
 
-  /** 一个"虚拟视口"里可见的平铺 / 跨极副本,和 draw() 里的循环同一套公式 */
-  function visibleRectsFor(k, P, H, oxAbs, oyAbs, vw, vh) {
-    const ox = ((oxAbs % P) + P) % P - P;
-    const n0 = Math.floor((0 - oyAbs) / H);
-    const n1 = Math.floor((vh - oyAbs) / H);
-    const mCount = Math.max(1, Math.ceil(vw / P) + 1);
-    const rects = [];
-    for (let n = n0; n <= n1; n++) {
-      const yTop = oyAbs + n * H;
-      if (yTop > vh || yTop + H < 0) continue;
-      const odd = ((n % 2) + 2) % 2 === 1;
-      for (let m = 0; m <= mCount; m++) {
-        const x = ox + m * P - (odd ? P / 2 : 0);
-        if (x > vw || x + P < 0) continue;
-        rects.push({ x, yTop, odd });
-      }
+  function sendVecBuild(p) {
+    if (vecWorkerBusy) { vecWorkerPending = p; return; }
+    const w = ensureVecWorker();
+    if (!w) return;
+    vecWorkerBusy = true;
+    vecWorkerSeq = p.seq;
+    const msg = {
+      seq: p.seq, worldId: p.worldId, style: p.style, k: p.k, P: p.P, H: p.H,
+      oxAbs: p.oxAbs, oyAbs: p.oyAbs, cw: p.cw, ch: p.ch, rdpr: p.rdpr,
+      tileFull: p.tileFull, tileCover: p.tileCover, x0: p.x0, y0: p.y0, w: p.w, h: p.h,
+      mapW: p.mapW, mapH: p.mapH, relK: p.relK, pad: p.pad
+    };
+    // 1.3MB 的矢量 JSON 每个世界只传一次,之后 worker 自己缓存
+    if (vecWorkerWorldId !== p.worldId) {
+      msg.vec = S.vec;
+      vecWorkerWorldId = p.worldId;
     }
-    return rects;
+    w.postMessage(msg);
   }
+
+  function requestVecBuildWorker(p) {
+    p.seq = ++vecWorkerSeq;
+    if (vecWorkerBusy) { vecWorkerPending = p; return true; }
+    sendVecBuild(p);
+    return true;
+  }
+
 
   function clearVecCache() {
+    if (S.vecCache && S.vecCache.canvas && S.vecCache.canvas.close) S.vecCache.canvas.close();
     S.vecCache = null;
   }
 
   const VEC_PAD_MIN = 180;
   const VEC_PAD_MAX = 340;
 
-  /** 重建矢量层缓存:视口四周多画一圈边距,拖动时先贴图,快拖出边距再重画 */
+  /**
+   * 重建矢量层缓存:视口四周多画一圈边距,拖动时先贴图,快拖出边距再重画。
+   * 正常走 Worker 异步重烘(不阻塞主线程);Worker 不可用才退回主线程同步画。
+   */
   function buildVecCache() {
-    if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white')) { S.vecCache = null; return null; }
-    const { k, oxAbs, oyAbs, P, H } = S.draw;
+    if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white')) { clearVecCache(); return null; }
+    const { k, oxAbs, P, H } = S.draw;
+    const oyAbs = S.draw.oy;
     const rdpr = S.rdpr || S.dpr;
     const pad = Math.round(clamp(Math.min(S.cw, S.ch) * 0.3, VEC_PAD_MIN, VEC_PAD_MAX));
     const w = S.cw + pad * 2;
     const h = S.ch + pad * 2;
     const x0 = oxAbs - pad;
     const y0 = oyAbs - pad;
+    const cover = S.tileCover.map((t) => ({ x: t.x - x0, y: t.y - y0, w: t.w, h: t.h }));
+    if (!vecWorkerBroken && vecWorkerAvailable()) {
+      requestVecBuildWorker({
+        worldId: S.vecWorldId, style: S.style, k, P, H, oxAbs, oyAbs,
+        cw: S.cw, ch: S.ch, rdpr, tileFull: S.tileFull, tileCover: cover,
+        x0, y0, w, h, mapW: S.mapW, mapH: S.mapH, relK: S.view.k, pad
+      });
+      // Worker 正在算:先把上一张缓存继续贴着(可能位置略旧,但不会闪空)
+      return S.vecCache;
+    }
+    // 兜底:主线程同步画
     const cv = document.createElement('canvas');
     cv.width = Math.max(1, Math.round(w * rdpr));
     cv.height = Math.max(1, Math.round(h * rdpr));
@@ -1174,19 +1114,31 @@
     if (!g) return null;
     g.setTransform(rdpr, 0, 0, rdpr, 0, 0);
     const rects = visibleRectsFor(k, P, H, oxAbs - x0, oyAbs - y0, w, h);
-    const cover = S.tileCover.map((t) => ({ x: t.x - x0, y: t.y - y0, w: t.w, h: t.h }));
-    drawVectorsInto(g, rects, k, P, H, w, h, S.tileFull, cover);
+    drawVectorsIntoShared(g, {
+      vec: S.vec, rects, k, P, H, mapW: S.mapW, mapH: S.mapH, cw: w, ch: h,
+      style: S.style, relK: S.view.k, tileFull: S.tileFull, tileCover: cover
+    });
     S.vecCache = { canvas: cv, x0, y0, w, h, pad, k, ox: oxAbs, oy: oyAbs, cw: S.cw, ch: S.ch, rdpr, style: S.style, tileFull: S.tileFull, vecWorldId: S.vecWorldId };
     return S.vecCache;
   }
-
   /**
    * 矢量层:平稳时不重描,每帧只把离屏缓存贴到画布。
    * 缩放明显变化、拖动快把边距拖光、换画法 / 换世界 / 瓦片覆盖状态变化时才重画。
    */
   function drawVectorsCached() {
     if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white') || !S.baseImg) { S.vecCache = null; return; }
-    const { k, oxAbs, oyAbs } = S.draw;
+    const { k, oxAbs } = S.draw;
+    const oyAbs = S.draw.oy;
+    // 拖动 / 缩放进行中不画矢量层:软件画布贴 6MP 位图比直接描线还慢,等停手再贴
+    if (performance.now() - lastInputAt < 200) return;
+    if (vecWorkerBroken) {
+      // Worker 起不来:主线程直接描线(比每帧贴 6MP 位图便宜),不建缓存
+      const { P, H } = S.draw;
+      const rects = visibleRectsFor(k, P, H, oxAbs, oyAbs, S.cw, S.ch);
+      drawVectorsIntoShared(ctx, { vec: S.vec, rects, k, P, H, mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, style: S.style, relK: S.view.k, tileFull: S.tileFull, tileCover: S.tileCover });
+      S.vecCache = null;
+      return;
+    }
     const rdpr = S.rdpr || S.dpr;
     let c = S.vecCache;
     let reuse = false;
@@ -1422,7 +1374,8 @@
       if (!(await waitIdle(i))) return;
       const st = pending[i];
       try {
-        const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(wid)}&style=${encodeURIComponent(st)}&v=${MAP_VER}`);
+        // 后台预取让路给正在拖动的请求:低优先级,浏览器支持时会把它排后面
+        const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(wid)}&style=${encodeURIComponent(st)}&v=${MAP_VER}`, { priority: 'low' });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const blob = await r.blob();
         const img = await createImageBitmap(blob);

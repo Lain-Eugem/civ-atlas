@@ -21,6 +21,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync, existsSync } from 'node:fs';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { deflateSync } from 'node:zlib';
+import { constants as osConstants, setPriority } from 'node:os';
 
 import {
   createWorld,
@@ -56,6 +57,7 @@ import {
 } from './field-render';
 import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf, parseMagicColors } from './magic-render';
 import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
+import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
 
@@ -725,13 +727,17 @@ function parseTileQuery(q: URLSearchParams): TileQuery {
   return { worldId, style, S, x, y, size, key: `${worldId}|${style}|${S}|${x}|${y}|${size}` };
 }
 
-function getBasePng(worldId: string, style: TerrainStyle): Buffer {
+async function getBasePng(worldId: string, style: TerrainStyle): Promise<Buffer> {
   const key = `${worldId}|${style}`;
   const hit = baseCache.get(key);
   if (hit) return hit;
   const rec = getWorldRecord(worldId);
-  // classic = 改造前沙盒自己的三角栅格底图,留作对照 / 兜底;其余三种直接跑主站的渲染管线
-  const map = style === 'classic' ? renderWorldMap(rec.world) : renderWhole(rec.world, style);
+  // classic = 改造前沙盒自己的三角栅格底图,留作对照 / 兜底;其余画法直接跑主站的渲染管线。
+  // 首次渲染在 worker 池里跑(不阻塞其它请求),池不可用就原地渲染。
+  const map =
+    style === 'classic'
+      ? renderWorldMap(rec.world)
+      : ((await renderViaPool(worldId, rec.world, { kind: 'whole', style })) ?? renderWhole(rec.world, style));
   const png = encodePng(map.width, map.height, map.rgba);
   baseCache.set(key, png);
   return png;
@@ -854,7 +860,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
   if (method === 'GET' && pathname === '/api/map/base') {
     const worldId = url.searchParams.get('worldId') ?? '';
     if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
-    sendImmutablePng(res, getBasePng(worldId, styleOf(url.searchParams)));
+    sendImmutablePng(res, await getBasePng(worldId, styleOf(url.searchParams)));
     return true;
   }
 
@@ -882,15 +888,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       fail(res, 400, e instanceof Error ? e.message : '瓦片参数不合法');
       return true;
     }
-    const render = (): { png: Buffer; sea: number[][]; lake: number[][] } => {
+    const render = async (): Promise<{ png: Buffer; sea: number[][]; lake: number[][] }> => {
       const rec = getWorldRecord(t.worldId);
-      const map = renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
-      return { png: encodePng(map.width, map.height, map.rgba), sea: map.sea, lake: map.lake };
+      // 池里渲染后再送回主线程编码;池不可用/超时就回退单进程。
+      const map =
+        (await renderViaPool(t.worldId, rec.world, { kind: 'tile', style: t.style, S: t.S, x: t.x, y: t.y, size: t.size })) ??
+        renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
+      return { png: encodePng(map.width, map.height, map.rgba), sea: map.sea ?? [], lake: map.lake ?? [] };
     };
     if (pathname === '/api/map/tile') {
       let png = tileCache.get(t.key);
       if (!png) {
-        const r = render();
+        const r = await render();
         cacheTile(t.key, r.png, { sea: r.sea, lake: r.lake });
         png = r.png;
       }
@@ -900,7 +909,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     // 海岸线:按这块瓦片自己的倍率追的,和这块的地形严丝合缝(1 倍底图追的那份放大后会对不上)
     let lines = tileLines.get(t.key);
     if (!lines) {
-      const r = render();
+      const r = await render();
       lines = { sea: r.sea, lake: r.lake };
       cacheTile(t.key, r.png, lines);
     }
@@ -1383,8 +1392,23 @@ function parseArgs(argv: string[]): { port: number } {
   return { port };
 }
 
+/**
+ * 后台渲染给前台让路:把 viewer 进程优先级降到「低于正常」。
+ * 用户在别的窗口打字/聊天时,调度器会优先照顾前台应用;本进程只在有空闲 CPU 时干活。
+ * 浏览器侧还有「空闲 6 秒才预取」与「拖动中不画细节层」两道闸,这里再压一层。
+ */
+function softenPriority(): void {
+  try {
+    setPriority(process.pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
+  } catch {
+    // 权限不够(或平台不支持)就算了,不影响功能
+  }
+}
+
 function main(): void {
   const { port } = parseArgs(process.argv.slice(2));
+  softenPriority();
+  process.on('exit', () => disposeMapPools());
   const server = createServer((req, res) => {
     void handle(req, res);
   });
