@@ -704,10 +704,18 @@ function WorldCard({
                   void copyResults(w.id, id);
                   void import('./worldStore')
                     .then((m) => m.copyWorldPlugins(w.id, id))
-                    .catch(() => 'failed' as const)
+                    .catch(() => ({ status: 'failed' } as const))
                     .then((r) => {
-                      if (r === 'failed') more.push('用到的插件没能一起存下，打开可能和原来不一样（浏览器存储已满）');
-                      notify({ kind: more.length > 1 ? 'warn' : 'ok', text: `已复制一份「${name}」`, more });
+                      const pluginTrouble: Partial<Record<typeof r.status, string>> = {
+                        conflict: '用到的插件没能一起存下：副本已经被后台转存抢先写下了第一份内容。删掉这一份、重新复制一次通常就好（不是存储满了）',
+                        unreadable: '用到的插件没能一起存下：源世界的插件内容读不出来（可能已经损坏），这一份副本打开后可能和原来不一样',
+                        full: '用到的插件没能一起存下（浏览器存储已满）',
+                        unavailable: '用到的插件没能一起存下（浏览器不让用本地存储）',
+                        failed: '用到的插件没能一起存下（原因不明，可以再试一次）',
+                      };
+                      const trouble = pluginTrouble[r.status];
+                      if (trouble) more.push(trouble);
+                      notify({ kind: trouble || more.length > 1 ? 'warn' : 'ok', text: `已复制一份「${name}」`, more });
                     });
                 })}
               >
