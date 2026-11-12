@@ -20,6 +20,11 @@
     state: null,
     baseImg: null,
     ownersImg: null,
+    // 后台预加载的其它画法底图:style -> { img, w, h };换世界时清空
+    baseCache: new Map(),
+    baseCacheWorldId: null,
+    // 矢量层(fantasy / white)的离屏缓存:一帧只画一次,拖动时贴图
+    vecCache: null,
     mapW: 1024,
     mapH: 512,
     cw: 800,
@@ -443,6 +448,8 @@
     // 高 DPI 大窗口一帧要铺 700 万像素,降一半就是少 4 倍工作量。
     // 手一停就恢复满分辨率重画一次(见 endInteractive)。
     S.rdpr = S.dpr * S.rs;
+    // 视口尺寸 / 分辨率变了,矢量层缓存按旧尺寸画的,直接作废
+    S.vecCache = null;
     el.map.width = Math.round(S.cw * S.rdpr);
     el.map.height = Math.round(S.ch * S.rdpr);
     normalizeView();
@@ -594,7 +601,7 @@
       ctx.restore();
     }
     // 墨线 / 波纹 / 符号是矢量,按固定屏幕线宽画在最上层,放大多少倍都不变粗
-    drawVectors(rects, k, P, H);
+    drawVectorsCached();
     for (const r of rects) {
       // 文字不能跟着翻转,单独按镜像后的位置画
       if (S.state) drawLabels(ctx, r.x, r.yTop, k, r.odd, H);
@@ -619,6 +626,8 @@
    */
   // 改地形 / 上色算法时 +1:瓦片和底图都是 immutable 缓存,不换 URL 老浏览器会一直用旧图
   const MAP_VER = 3;
+  /** 与 mcp/terrain.ts 的 TERRAIN_STYLES 一致 */
+  const STYLES = ['fantasy', 'satellite', 'geo', 'white', 'classic'];
 
   function currentLod() {
     const kd = fitScale() * S.view.k * S.dpr;
@@ -951,7 +960,7 @@
   }
 
   function loadVectors() {
-    if (S.style !== 'fantasy' && S.style !== 'white') return;
+    // 矢量和画法无关:默认 fantasy 要用,white 也要用;提前拿好,切过去时不用等
     if (S.vec && S.vecWorldId === S.worldId) return;
     const wid = S.worldId;
     fetch(`/api/map/vectors?worldId=${encodeURIComponent(wid)}`)
@@ -966,12 +975,14 @@
         v.rippleFine = v.rippleFine.map((group) => group.map(withBox));
         S.vec = v;
         S.vecWorldId = wid;
+        clearVecCache();
         draw();
       })
       .catch(() => {
         // 拿不到矢量层多半是监视台进程还是旧代码(没重启),此时位图墨线已被服务端抹掉,
         // 画面会缺描边。明确提示,别让用户以为是地图坏了。
         S.vec = null;
+        clearVecCache();
         toast('矢量地图数据加载失败:请关掉旧窗口、重新双击 启动.bat', true);
       });
   }
@@ -1018,13 +1029,16 @@
     }
   }
 
-  function drawVectors(rects, k, P, H) {
+  /**
+   * 把矢量层画进指定 ctx。cw / ch 是这个 ctx 的"虚拟视口"尺寸,rects 也相对它。
+   * 抽出来才能把整层预先画到离屏 canvas 上:拖动时只贴一张图,不必每帧重新描上万段线。
+   */
+  function drawVectorsInto(g, rects, k, P, H, cw, ch, tileFull, tileCover) {
     const v = S.vec;
     if (!v || (S.style !== 'fantasy' && S.style !== 'white') || !rects.length) return;
     const white = S.style === 'white';
     const ink = white ? 'rgba(70,72,76,0.82)' : 'rgba(58,45,34,0.86)';
     const inkSoft = white ? 'rgba(70,72,76,0.20)' : 'rgba(58,45,34,0.17)';
-    const { cw, ch } = S;
     const W = S.mapW;
     const sx = P / S.mapW;              // 屏幕像素 / 整图像素
     const sy = H / S.mapH;
@@ -1047,9 +1061,9 @@
       // 1920×1000 画布上光是这一项就要 400ms,拖动直接卡死。改成折线 + 平头线帽后
       // 子路径从一万多降到几百条,渲染时间掉一个数量级(观感不变:转折处仍是圆角连接)。
       const strokeLines = (lists, color, lw) => {
-        ctx.strokeStyle = color;
-        ctx.lineWidth = lw;
-        ctx.beginPath();
+        g.strokeStyle = color;
+        g.lineWidth = lw;
+        g.beginPath();
         let seg = 0;
         for (const list of lists) {
           for (const b of list) {
@@ -1065,31 +1079,31 @@
                 if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
                 if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
                   || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
-                if (!pen) { ctx.moveTo(x0, y0); pen = true; }
-                ctx.lineTo(x1, y1);
-                if (++seg >= 3000) { ctx.stroke(); ctx.beginPath(); pen = false; seg = 0; }
+                if (!pen) { g.moveTo(x0, y0); pen = true; }
+                g.lineTo(x1, y1);
+                if (++seg >= 3000) { g.stroke(); g.beginPath(); pen = false; seg = 0; }
               }
             }
           }
         }
-        ctx.stroke();
+        g.stroke();
       };
-      ctx.save();
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'butt';
+      g.save();
+      g.lineJoin = 'round';
+      g.lineCap = 'butt';
       if (!white) strokeLines(ripples, inkSoft, 1);
       // 有瓦片覆盖的地方用瓦片自带的那份线(它是按当前倍率追的,才和这块地形对齐);
       // 全局这份是在 1 倍底图上追的,放大后会和海岸差一两个像素,只在没瓦片的空白处补。
-      if (!S.tileFull) {
-        if (S.tileCover.length) {
+      if (!tileFull) {
+        if (tileCover.length) {
           const cover = new Path2D();
           cover.rect(-20, -20, cw + 40, ch + 40);
-          for (const t of S.tileCover) cover.rect(t.x, t.y, t.w, t.h);
-          ctx.clip(cover, 'evenodd');
+          for (const t of tileCover) cover.rect(t.x, t.y, t.w, t.h);
+          g.clip(cover, 'evenodd');
         }
         strokeLines([lake, coast], ink, 1.15);
       }
-      ctx.restore();
+      g.restore();
       if (white) continue;
       // 符号:整帧只合成两条路径(实心三角 + 线条),最后各调一次 fill / stroke
       const gFill = new Path2D();
@@ -1106,15 +1120,97 @@
           glyphInto(g, gx, gy, unit, gFill, gLine);
         }
       }
-      ctx.fillStyle = 'rgba(238,228,201,0.82)';
-      ctx.fill(gFill);
-      ctx.lineWidth = 0.85;
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.strokeStyle = 'rgba(58,45,34,0.78)';
-      ctx.stroke(gLine);
+      g.fillStyle = 'rgba(238,228,201,0.82)';
+      g.fill(gFill);
+      g.lineWidth = 0.85;
+      g.lineJoin = 'round';
+      g.lineCap = 'round';
+      g.strokeStyle = 'rgba(58,45,34,0.78)';
+      g.stroke(gLine);
     }
   }
+
+  /** 一个"虚拟视口"里可见的平铺 / 跨极副本,和 draw() 里的循环同一套公式 */
+  function visibleRectsFor(k, P, H, oxAbs, oyAbs, vw, vh) {
+    const ox = ((oxAbs % P) + P) % P - P;
+    const n0 = Math.floor((0 - oyAbs) / H);
+    const n1 = Math.floor((vh - oyAbs) / H);
+    const mCount = Math.max(1, Math.ceil(vw / P) + 1);
+    const rects = [];
+    for (let n = n0; n <= n1; n++) {
+      const yTop = oyAbs + n * H;
+      if (yTop > vh || yTop + H < 0) continue;
+      const odd = ((n % 2) + 2) % 2 === 1;
+      for (let m = 0; m <= mCount; m++) {
+        const x = ox + m * P - (odd ? P / 2 : 0);
+        if (x > vw || x + P < 0) continue;
+        rects.push({ x, yTop, odd });
+      }
+    }
+    return rects;
+  }
+
+  function clearVecCache() {
+    S.vecCache = null;
+  }
+
+  const VEC_PAD_MIN = 180;
+  const VEC_PAD_MAX = 340;
+
+  /** 重建矢量层缓存:视口四周多画一圈边距,拖动时先贴图,快拖出边距再重画 */
+  function buildVecCache() {
+    if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white')) { S.vecCache = null; return null; }
+    const { k, oxAbs, oyAbs, P, H } = S.draw;
+    const rdpr = S.rdpr || S.dpr;
+    const pad = Math.round(clamp(Math.min(S.cw, S.ch) * 0.3, VEC_PAD_MIN, VEC_PAD_MAX));
+    const w = S.cw + pad * 2;
+    const h = S.ch + pad * 2;
+    const x0 = oxAbs - pad;
+    const y0 = oyAbs - pad;
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(w * rdpr));
+    cv.height = Math.max(1, Math.round(h * rdpr));
+    const g = cv.getContext('2d');
+    if (!g) return null;
+    g.setTransform(rdpr, 0, 0, rdpr, 0, 0);
+    const rects = visibleRectsFor(k, P, H, oxAbs - x0, oyAbs - y0, w, h);
+    const cover = S.tileCover.map((t) => ({ x: t.x - x0, y: t.y - y0, w: t.w, h: t.h }));
+    drawVectorsInto(g, rects, k, P, H, w, h, S.tileFull, cover);
+    S.vecCache = { canvas: cv, x0, y0, w, h, pad, k, ox: oxAbs, oy: oyAbs, cw: S.cw, ch: S.ch, rdpr, style: S.style, tileFull: S.tileFull, vecWorldId: S.vecWorldId };
+    return S.vecCache;
+  }
+
+  /**
+   * 矢量层:平稳时不重描,每帧只把离屏缓存贴到画布。
+   * 缩放明显变化、拖动快把边距拖光、换画法 / 换世界 / 瓦片覆盖状态变化时才重画。
+   */
+  function drawVectorsCached() {
+    if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white') || !S.baseImg) { S.vecCache = null; return; }
+    const { k, oxAbs, oyAbs } = S.draw;
+    const rdpr = S.rdpr || S.dpr;
+    let c = S.vecCache;
+    let reuse = false;
+    if (c) {
+      const s = k / c.k;
+      const dx = oxAbs + s * (c.x0 - c.ox);
+      const dy = oyAbs + s * (c.y0 - c.oy);
+      const right = dx + c.w * s;
+      const bottom = dy + c.h * s;
+      const mx = c.pad * 0.45;
+      const my = c.pad * 0.45;
+      reuse = c.style === S.style && c.cw === S.cw && c.ch === S.ch && c.rdpr === rdpr
+        && c.tileFull === S.tileFull && c.vecWorldId === S.vecWorldId
+        && s >= 0.82 && s <= 1.22
+        && dx <= mx && dy <= my && right >= S.cw - mx && bottom >= S.ch - my;
+    }
+    if (!reuse) c = buildVecCache();
+    if (!c) return;
+    const s = k / c.k;
+    const dx = oxAbs + s * (c.x0 - c.ox);
+    const dy = oyAbs + s * (c.y0 - c.oy);
+    ctx.drawImage(c.canvas, dx, dy, c.w * s, c.h * s);
+  }
+
 
   function updateZoomLabel() {
     if (el.zoomVal) el.zoomVal.textContent = `${Math.round(S.view.k * 100)}%`;
@@ -1285,8 +1381,79 @@
     }, { passive: false });
   }
 
+  /* 换世界时底图缓存必须丢;同一个世界的其它画法由 schedulePreloadMaps 在后台慢慢补 */
+  function baseCacheFor() {
+    if (S.baseCacheWorldId !== S.worldId) {
+      S.baseCache.clear();
+      S.baseCacheWorldId = S.worldId;
+    }
+    return S.baseCache;
+  }
+
+  /**
+   * 其它画法在后台排队预取:用户切到卫星 / 地理 / 白模时直接命中缓存,
+   * 不用再等服务端 2–3 秒现算还要盯着「地图绘制中…」。
+   * 每次只取一张,取完歇 80ms,避免和当前地图的瓦片 / 矢量请求抢带宽与主线程。
+   */
+  let preloadSeq = 0;
+  /** 最近一次用户操作的时间:预取底图会占住服务端线程 2–3 秒,只在用户停下来之后再排队 */
+  let lastActive = 0;
+  const PRELOAD_IDLE_MS = 6000;
+  function schedulePreloadMaps() {
+    if (!S.worldId) return;
+    const token = ++preloadSeq;
+    const wid = S.worldId;
+    const pending = STYLES.filter((st) => st !== S.style && !baseCacheFor().has(st));
+    if (!pending.length) return;
+    const waitIdle = async (i) => {
+      for (let n = 0; n < 300; n++) {
+        if (token !== preloadSeq || wid !== S.worldId) return false;
+        // 服务端渲染是同步的(一张 2048 底图 2–3 秒):用户正在拖 / 正在等瓦片时不排预取,
+        // 否则会把 tile 请求也堵在服务器后面,反而更卡。
+        if (!S.busy && !document.hidden
+          && !S.tilePending.size && !S.magicPending.size
+          && performance.now() - lastActive > PRELOAD_IDLE_MS) return true;
+        await new Promise((res) => setTimeout(res, 400));
+      }
+      return false;
+    };
+    const one = async (i) => {
+      if (i >= pending.length || token !== preloadSeq || wid !== S.worldId) return;
+      if (!(await waitIdle(i))) return;
+      const st = pending[i];
+      try {
+        const r = await fetch(`/api/map/base?worldId=${encodeURIComponent(wid)}&style=${encodeURIComponent(st)}&v=${MAP_VER}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        const img = await createImageBitmap(blob);
+        if (token !== preloadSeq || wid !== S.worldId) { if (img.close) img.close(); return; }
+        baseCacheFor().set(st, { img, w: img.width, h: img.height });
+      } catch (_) {
+        // 预取失败不打扰用户;真切过去时还会再试一次并给出明确报错
+      }
+      await new Promise((res) => setTimeout(res, 120));
+      void one(i + 1);
+    };
+    setTimeout(() => { void one(0); }, 600);
+  }
+
   async function loadBaseMap(keepView = false) {
     if (!S.worldId) return;
+    const cached = baseCacheFor().get(S.style);
+    if (cached) {
+      el.mapLoading.classList.add('hidden');
+      el.mapEmpty.classList.add('hidden');
+      S.baseImg = cached.img;
+      S.mapW = cached.w;
+      S.mapH = cached.h;
+      if (!keepView) S.view = { k: 1, x: 0, y: 0 };
+      clearTiles();
+      clearVecCache();
+      resizeCanvas();
+      void loadVectors();
+      schedulePreloadMaps();
+      return;
+    }
     el.mapLoading.classList.remove('hidden');
     el.mapLoadingText.textContent = '地图绘制中…';
     el.mapEmpty.classList.add('hidden');
@@ -1301,10 +1468,13 @@
       S.baseImg = await createImageBitmap(blob);
       S.mapW = S.baseImg.width;
       S.mapH = S.baseImg.height;
+      baseCacheFor().set(S.style, { img: S.baseImg, w: S.mapW, h: S.mapH });
       if (!keepView) S.view = { k: 1, x: 0, y: 0 };
       clearTiles();
+      clearVecCache();
       resizeCanvas();
       void loadVectors();
+      schedulePreloadMaps();
     } catch (e) {
       toast(`地图生成失败:${e instanceof Error ? e.message : String(e)}`, true);
     } finally {
@@ -2095,6 +2265,12 @@
       S.grid = null;
       S.sel = null;
       S.baseImg = null;
+      // 换世界:上一张图的底图缓存、矢量层缓存全部作废
+      S.baseCache.clear();
+      S.baseCacheWorldId = d.worldId;
+      S.vecCache = null;
+      S.vec = null;
+      S.vecWorldId = null;
       S.autoOn = false;
       S.field = { on: false, img: null, data: null, legend: null, kind: 'magic' };
       if (el.fieldEnable) el.fieldEnable.checked = false;
@@ -2475,6 +2651,7 @@
         saveCfg(cfgFromForm());
         if (!S.worldId) return;
         clearTiles();
+        clearVecCache();
         void loadBaseMap(true);   // 换画法不重置缩放 / 拖动位置
       });
     }
@@ -2674,6 +2851,11 @@
     }
 
     window.addEventListener('resize', () => resizeCanvas());
+    // 底图后台预取只在用户停下来之后做:服务端渲染一张 2048 底图要 2–3 秒,会占住线程
+    const markActive = () => { lastActive = performance.now(); };
+    for (const ev of ['pointerdown', 'pointermove', 'wheel', 'keydown']) {
+      window.addEventListener(ev, markActive, { passive: true });
+    }
     if (window.ResizeObserver && el.mapWrap) {
       new ResizeObserver(() => resizeCanvas()).observe(el.mapWrap);
     }
