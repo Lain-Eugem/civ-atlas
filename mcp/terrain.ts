@@ -29,7 +29,7 @@ import { macroGrids, realisticPixels, realisticWindowPixels, type MacroGrids } f
 import type { SurfaceLook } from '../src/render/surface';
 
 /** 沙盒里可选的地形画法。classic = 改造前的三角栅格底图,由 viewer.ts 自己画,这里不处理。 */
-export const TERRAIN_STYLES = ['fantasy', 'satellite', 'geo', 'classic'] as const;
+export const TERRAIN_STYLES = ['fantasy', 'satellite', 'geo', 'white', 'classic'] as const;
 export type TerrainStyle = (typeof TERRAIN_STYLES)[number];
 
 export function isTerrainStyle(x: unknown): x is TerrainStyle {
@@ -91,6 +91,55 @@ function cleanInk(px: Uint8ClampedArray, patch: ReturnType<typeof fantasyFullPix
   patch.iceW.putInto(px);
 }
 
+/**
+ * 白模画法:灰白、无生物群系颜色,只留海拔晕渲 + 海陆/湖泊/海冰,方便和叠在上面的
+ * 「自定义场 / 魔力」颜色区分开 —— 看到的彩色就是图层本身的颜色。
+ * 输出与 rasterize 同尺寸的 RGBA,后续整图/瓦片共用同一份逻辑。
+ */
+function whitePixels(r: Raster): Uint8ClampedArray {
+  const { w, h, elev, water, ice } = r;
+  const out = new Uint8ClampedArray(w * h * 4);
+  const clamp255 = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : v | 0);
+  const mix = (a: readonly number[], b: readonly number[], t: number): [number, number, number] => {
+    const k = t < 0 ? 0 : t > 1 ? 1 : t;
+    return [a[0]! + (b[0]! - a[0]!) * k, a[1]! + (b[1]! - a[1]!) * k, a[2]! + (b[2]! - a[2]!) * k];
+  };
+  const LAND = [233, 231, 226] as const;
+  const PEAK = [250, 249, 246] as const;
+  const SEA = [196, 206, 212] as const;
+  const DEEP = [170, 184, 191] as const;
+  const LAKE = [214, 223, 227] as const;
+  const ICE = [244, 247, 248] as const;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const p = row + x;
+      const o = p * 4;
+      const sea = water[p]!;
+      let c: readonly [number, number, number] = LAND;
+      if (sea !== 0) {
+        c = sea === 2 ? LAKE : mix(SEA, DEEP, Math.min(1, Math.max(0, -elev[p]!) / 4200));
+        const ic = ice[p]!;
+        if (ic >= 0.5) c = mix(c, ICE, Math.min(1, (ic - 0.5) * 2));
+      } else {
+        // 越高越接近白,再叠西北向山体晕渲;海冰/湖泊不参与晕渲
+        c = mix(LAND, PEAK, Math.min(1, Math.max(0, (elev[p]! - 1200) / 2600)));
+        const xl = x > 0 ? elev[p - 1]! : elev[p]!;
+        const xr = x < w - 1 ? elev[p + 1]! : elev[p]!;
+        const yu = y > 0 ? elev[p - w]! : elev[p]!;
+        const yd = y < h - 1 ? elev[p + w]! : elev[p]!;
+        const shade = Math.min(1.16, Math.max(0.74, 1 + ((xr - xl) * 0.55 + (yd - yu) * 0.85) / 1400));
+        c = [c[0]! * shade, c[1]! * shade, c[2]! * shade];
+      }
+      out[o] = clamp255(c[0]!);
+      out[o + 1] = clamp255(c[1]!);
+      out[o + 2] = clamp255(c[2]!);
+      out[o + 3] = 255;
+    }
+  }
+  return out;
+}
+
 /** 整张像素层(每种画法算一次):既是底图,也是高清块的颜色基准 */
 function wholePixels(world: World, ctx: TerrainCtx, style: TerrainStyle): Uint8ClampedArray {
   let px = ctx.px.get(style);
@@ -100,6 +149,8 @@ function wholePixels(world: World, ctx: TerrainCtx, style: TerrainStyle): Uint8C
       ctx.fantasy = fp;
       cleanInk(fp.px, fp.patch);
       px = fp.px;
+    } else if (style === 'white') {
+      px = whitePixels(ctx.whole);
     } else {
       px = realisticPixels(ctx.whole, LOOK[style as 'satellite' | 'geo'] ?? 'detail').px;
     }
@@ -285,6 +336,8 @@ export function renderTile(
       const fp = fantasyFullPixels(world, r);
       cleanInk(fp.px, fp.patch);   // 墨线 / 波纹交给前端矢量层,位图只留地形
       px = fp.px;
+    } else if (style === 'white') {
+      px = whitePixels(r);
     } else {
       px = realisticWindowPixels(r, grids, LOOK[style as 'satellite' | 'geo'] ?? 'detail');
     }

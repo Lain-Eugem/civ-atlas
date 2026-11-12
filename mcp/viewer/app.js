@@ -58,7 +58,7 @@
     toastTimer: 0,
     field: { on: false, img: null, data: null, legend: null, kind: 'magic' },
     // 魔力层:整张 2048 图用于缩小时;放大后按地形同款瓦片贴,柔边/光晕按瓦片像素算
-    magic: { on: false, img: null, data: null, legend: null, meta: null, year: null },
+    magic: { on: false, img: null, data: null, legend: null, meta: null, year: null, colors: null },
     magicTiles: new Map(),
     magicPending: new Set(),
     magicSeq: 0,
@@ -125,6 +125,11 @@
     magicEnable: $('#magicEnable'),
     magicYearPick: $('#magicYearPick'),
     btnMagicNow: $('#btnMagicNow'),
+    magicPalette: $('#magicPalette'),
+    magicColor0: $('#magicColor0'),
+    magicColor1: $('#magicColor1'),
+    magicColor2: $('#magicColor2'),
+    btnMagicColorsReset: $('#btnMagicColorsReset'),
     magicStatusLine: $('#magicStatusLine'),
     magicLegendWrap: $('#magicLegendWrap'),
     magicLegendName: $('#magicLegendName'),
@@ -237,6 +242,14 @@
     }
     if (el.reviewMode && cfg.review !== undefined) el.reviewMode.checked = !!cfg.review;
     if (el.mock && cfg.mock !== undefined) el.mock.checked = !!cfg.mock;
+    if (cfg.style === 'fantasy' || cfg.style === 'satellite' || cfg.style === 'geo' || cfg.style === 'white' || cfg.style === 'classic') {
+      S.style = cfg.style;
+      if (el.mapStyle) el.mapStyle.value = cfg.style;
+    }
+    if (Array.isArray(cfg.magicColors) && cfg.magicColors.length >= 2 && cfg.magicColors.every((c) => typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c))) {
+      S.magic.colors = [...cfg.magicColors];
+    }
+    syncMagicColorInputs();
   }
 
   /** 当前参数栏里的配置(保存用) */
@@ -259,6 +272,8 @@
       },
       review: el.reviewMode ? el.reviewMode.checked : false,
       mock: el.mock ? el.mock.checked : false,
+      style: S.style,
+      magicColors: S.magic.colors ? [...S.magic.colors] : null,
       onboarded: true,
     };
   }
@@ -743,7 +758,7 @@
     ctx.clip();
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
-    ctx.strokeStyle = 'rgba(58,45,34,0.86)';
+    ctx.strokeStyle = S.style === 'white' ? 'rgba(70,72,76,0.82)' : 'rgba(58,45,34,0.86)';
     ctx.lineWidth = 1.15 / m;
     ctx.stroke(lines.coast);
     if (lines.lake) ctx.stroke(lines.lake);
@@ -819,7 +834,7 @@
    * 块的坐标锚在世界展开平面上,和地形瓦片同一套 tileGridAt,所以叠得严丝合缝。
    * ------------------------------------------------------------------ */
   function magicTileKey(lod, i, j) {
-    return `${lod}|${i}|${j}|${S.magic.year}`;
+    return `${lod}|${i}|${j}|${S.magic.year}|${magicColorsKey()}`;
   }
 
   function clearMagicTiles() {
@@ -890,7 +905,7 @@
     const one = async (w) => {
       if (stale()) { S.magicPending.delete(w.key); return; }
       const qs = `sessionId=${encodeURIComponent(S.sessionId)}&year=${encodeURIComponent(String(year))}`
-        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}`;
+        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}${magicColorsParam()}`;
       try {
         const r = await fetch(`/api/magic/tile?${qs}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -936,7 +951,7 @@
   }
 
   function loadVectors() {
-    if (S.style !== 'fantasy') return;
+    if (S.style !== 'fantasy' && S.style !== 'white') return;
     if (S.vec && S.vecWorldId === S.worldId) return;
     const wid = S.worldId;
     fetch(`/api/map/vectors?worldId=${encodeURIComponent(wid)}`)
@@ -1005,7 +1020,10 @@
 
   function drawVectors(rects, k, P, H) {
     const v = S.vec;
-    if (!v || S.style !== 'fantasy' || !rects.length) return;
+    if (!v || (S.style !== 'fantasy' && S.style !== 'white') || !rects.length) return;
+    const white = S.style === 'white';
+    const ink = white ? 'rgba(70,72,76,0.82)' : 'rgba(58,45,34,0.86)';
+    const inkSoft = white ? 'rgba(70,72,76,0.20)' : 'rgba(58,45,34,0.17)';
     const { cw, ch } = S;
     const W = S.mapW;
     const sx = P / S.mapW;              // 屏幕像素 / 整图像素
@@ -1059,7 +1077,7 @@
       ctx.save();
       ctx.lineJoin = 'round';
       ctx.lineCap = 'butt';
-      strokeLines(ripples, 'rgba(58,45,34,0.17)', 1);
+      if (!white) strokeLines(ripples, inkSoft, 1);
       // 有瓦片覆盖的地方用瓦片自带的那份线(它是按当前倍率追的,才和这块地形对齐);
       // 全局这份是在 1 倍底图上追的,放大后会和海岸差一两个像素,只在没瓦片的空白处补。
       if (!S.tileFull) {
@@ -1069,9 +1087,10 @@
           for (const t of S.tileCover) cover.rect(t.x, t.y, t.w, t.h);
           ctx.clip(cover, 'evenodd');
         }
-        strokeLines([lake, coast], 'rgba(58,45,34,0.86)', 1.15);
+        strokeLines([lake, coast], ink, 1.15);
       }
       ctx.restore();
+      if (white) continue;
       // 符号:整帧只合成两条路径(实心三角 + 线条),最后各调一次 fill / stroke
       const gFill = new Path2D();
       const gLine = new Path2D();
@@ -1508,6 +1527,62 @@
    * 本局动态层:魔力(引擎逐年演化、真影响城上限)
    * ------------------------------------------------------------------ */
 
+  /** 内置色带(给玩家一键切换;custom 用下面三个取色器现拼) */
+  const MAGIC_PALETTES = {
+    default: ['#1b1036', '#5b2a9e', '#a46cff', '#f2e6ff'],
+    ember: ['#1b0f08', '#7a2d0e', '#e8862a', '#ffe6a8'],
+    verdant: ['#06180f', '#14532d', '#22c55e', '#dcfce7'],
+    frost: ['#071722', '#0e4f6e', '#38bdf8', '#e0f2fe'],
+    mono: ['#101010', '#4a4a4a', '#9a9a9a', '#f5f5f5'],
+  };
+  /** 自定义取色器只给三档(低 / 中 / 高),渲染层会在相邻两档之间插值 */
+  const MAGIC_PALETTE_ANCHORS = { default: [0, 2, 3], ember: [0, 2, 3], verdant: [0, 2, 3], frost: [0, 2, 3], mono: [0, 2, 3] };
+
+  /** 当前色带的 URL 片段(没有自定义就空串,让服务端用图层自带色带) */
+  function magicColorsParam() {
+    const c = S.magic.colors;
+    return c && c.length >= 2 ? `&colors=${encodeURIComponent(c.join(','))}` : '';
+  }
+
+  /** 色带签名字符串,参与瓦片缓存键 */
+  function magicColorsKey() {
+    const c = S.magic.colors;
+    return c && c.length >= 2 ? c.join(',') : '';
+  }
+
+  /** 把色带同步到三个取色器 + 下拉选项 */
+  function syncMagicColorInputs() {
+    const c = S.magic.colors;
+    const preset = c ? Object.keys(MAGIC_PALETTES).find((k) => MAGIC_PALETTES[k].join(',') === c.join(',')) ?? 'custom' : '';
+    if (el.magicPalette) el.magicPalette.value = preset;
+    let low = MAGIC_PALETTES.default[0];
+    let mid = MAGIC_PALETTES.default[2];
+    let high = MAGIC_PALETTES.default[3];
+    if (c && c.length >= 2) {
+      low = c[0];
+      mid = c[Math.floor(c.length / 2)];
+      high = c[c.length - 1];
+    }
+    if (el.magicColor0) el.magicColor0.value = low;
+    if (el.magicColor1) el.magicColor1.value = mid;
+    if (el.magicColor2) el.magicColor2.value = high;
+  }
+
+  /** 换色:立刻重渲染整图与瓦片(色带只影响显示,不动游戏数值) */
+  function setMagicColors(colors) {
+    S.magic.colors = colors && colors.length >= 2 ? [...colors] : null;
+    syncMagicColorInputs();
+    clearMagicTiles();
+    if (S.sessionId && el.magicEnable && el.magicEnable.checked) void refreshMagic(S.magic.year ?? undefined);
+    saveCfg(cfgFromForm());
+    draw();
+  }
+
+  function magicColorsFromInputs() {
+    const v = (e) => (e && /^#[0-9a-f]{6}$/i.test(e.value) ? e.value : '#000000');
+    return [v(el.magicColor0), v(el.magicColor1), v(el.magicColor2)];
+  }
+
   function decodeMagicData(d) {
     const vb = decodeB64(d.values);
     const gb = decodeB64(d.grid);
@@ -1564,7 +1639,7 @@
     if (!S.sessionId) { resetMagic(true); return; }
     try {
       const sid = encodeURIComponent(S.sessionId);
-      const meta = await api(`/api/magic/meta?sessionId=${sid}`);
+      const meta = await api(`/api/magic/meta?sessionId=${sid}${magicColorsParam()}`);
       S.magic.meta = meta;
       if (!meta || !meta.enabled || !meta.layers || !meta.layers.length) { resetMagic(true); return; }
       const layer = meta.layers[0];
@@ -1579,7 +1654,7 @@
           .map((y) => `<option value="${y}"${y === pick ? ' selected' : ''}>第 ${fmtInt(y)} 年</option>`)
           .join('');
       }
-      const q = `sessionId=${sid}&year=${encodeURIComponent(String(pick))}`;
+      const q = `sessionId=${sid}&year=${encodeURIComponent(String(pick))}${magicColorsParam()}`;
       const pngRes = await fetch(`/api/magic/base?${q}`);
       if (!pngRes.ok) {
         let msg = `HTTP ${pngRes.status}`;
@@ -2397,6 +2472,7 @@
       el.mapStyle.value = S.style;
       el.mapStyle.addEventListener('change', () => {
         S.style = el.mapStyle.value;
+        saveCfg(cfgFromForm());
         if (!S.worldId) return;
         clearTiles();
         void loadBaseMap(true);   // 换画法不重置缩放 / 拖动位置
@@ -2573,6 +2649,28 @@
     }
     if (el.btnMagicNow) {
       el.btnMagicNow.addEventListener('click', () => { void refreshMagic(); });
+    }
+    if (el.magicPalette) {
+      el.magicPalette.addEventListener('change', () => {
+        const key = el.magicPalette.value;
+        if (!key) { setMagicColors(null); return; }
+        if (key === 'custom') { setMagicColors(magicColorsFromInputs()); return; }
+        const preset = MAGIC_PALETTES[key];
+        setMagicColors(preset ? [...preset] : null);
+      });
+    }
+    for (const picker of [el.magicColor0, el.magicColor1, el.magicColor2]) {
+      if (!picker) continue;
+      picker.addEventListener('change', () => {
+        if (el.magicPalette) el.magicPalette.value = 'custom';
+        setMagicColors(magicColorsFromInputs());
+      });
+    }
+    if (el.btnMagicColorsReset) {
+      el.btnMagicColorsReset.addEventListener('click', () => {
+        setMagicColors(null);
+        if (el.magicPalette) el.magicPalette.value = '';
+      });
     }
 
     window.addEventListener('resize', () => resizeCanvas());

@@ -28,7 +28,7 @@
 | **小事件裁决层**（`mcp/petty*.ts`） | 接官方 Jev `POST /api/v1/decisions`；客户端控 token（≤4250）、严格串行优先队列（P0/P1/P2）、超时/背压/熔断/降级，概率交给引擎统一随机流抽样 |
 | **DM 小决策与故事** | 天灾/小贸易真写进引擎；`story` 干预让 DM 按剧情写事件，效果只落在城市折损、人口上限、发展、叙事四类 |
 | **地形渲染**（`mcp/terrain.ts`） | 直接复用主站的 `gen/raster.ts`、`gen/rasterWindow.ts`、`render/fantasy.ts|realistic.ts` 生成底图、放大块与矢量细节层；零新依赖，PNG 仍由 `mcp/png.ts` 手写编码 |
-| **浏览器查看器**（`mcp/viewer.ts`） | 和主站同一个开发服务器（`/sandbox/`）：主站同款地形画法与矢量墨线、放大现算高清块、跨极无限拖动；国家详情/AI 决策/编年史/回合日志/回放对账/导出，含 DM、小事件、场图层与 hover 精确值 |
+| **浏览器查看器**（`mcp/viewer.ts`） | 和主站同一个开发服务器（`/sandbox/`）：主站同款地形画法与矢量墨线、放大现算高清块、跨极无限拖动；还有**白模**画法（灰白地形，方便分辨魔力/疆域/场层的颜色）与魔力层自定义色带；国家详情/AI 决策/编年史/回合日志/回放对账/导出，含 DM、小事件、场图层与 hover 精确值 |
 | **可配置场**（`fieldPlugin.ts`） | 玩家给一份 spec 就能生成一组原生插件表：自己选密度、扩散、衰减、强度，以及影响哪些官方数值（`city.capacity`/`war.odds`/`unrest.add` 等 6 个口） |
 | **地块级场** | `unit: "tile"` 时场按世界全部地块逐年演化，出手前聚合成州值再影响引擎；图层内存按地块、存档按 `cell` 层 |
 | **官方 .civplugin 加载器**（`plugin-loader.ts`） | 在 MCP 的 CommonJS 产物里用 QuickJS 直装官方推演插件（文件或源码目录，最多 4 个），与内置场并列 |
@@ -156,6 +156,8 @@ node mcp/.build/mcp/selftest-coast.js
 | 魔力动态场 | 地块级场 |
 |---|---|
 | ![魔力场：魔脉扩散渗流，逐年变化](docs/screenshots/magic-field.png) | ![地块级场：每块地逐年演化，再聚合成州值影响容量](docs/screenshots/tile-field.png) |
+
+![白模画法 + 自定义魔力色带：地形只剩灰白浮雕，彩色都是叠加层](docs/screenshots/white-model.png)
 
 ![小事件裁决层：一次 petty 回合的决策与摘要](docs/screenshots/petty-panel.png)
 

@@ -50,6 +50,7 @@
           <option value="fantasy">手绘羊皮纸</option>
           <option value="satellite">卫星写实</option>
           <option value="geo">地理图</option>
+          <option value="white">白模(灰白)</option>
           <option value="classic">原沙盒地形</option>
         </select>
       </label>
@@ -225,18 +226,33 @@
           </details>
 
           <details class="llm-row" id="magicRow">
-            <summary>本局动态层 · 魔力 <span class="muted">(逐年演化:灵脉渗出 → 邻州扩散 → 人口耗散;每 50 年存一帧,真影响城上限)</span></summary>
+            <summary>本局动态层 · 魔力 <span class="muted">(每地块逐年演化:灵脉渗出 → 邻块扩散 → 自然消退;每 100 年存一帧,真影响城上限)</span></summary>
             <div class="control-row">
               <label class="field check"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
               <label class="field"><span>图层年份</span><select id="magicYearPick"></select></label>
               <button id="btnMagicNow" class="btn" type="button">回到本回合</button>
               <span class="hint grow" id="magicStatusLine">开一个带「魔力场」的会话后,这里会出现逐年图层。</span>
             </div>
+            <div class="control-row">
+              <label class="field"><span>色带</span><select id="magicPalette" aria-label="魔力色带">
+                <option value="">默认(紫)</option>
+                <option value="ember">余烬</option>
+                <option value="verdant">青翠</option>
+                <option value="frost">冰蓝</option>
+                <option value="mono">灰阶</option>
+                <option value="custom">自定义</option>
+              </select></label>
+              <label class="field color" title="低值颜色"><span>低</span><input id="magicColor0" type="color" value="#1b1036" aria-label="魔力低值颜色"></label>
+              <label class="field color" title="中间值颜色"><span>中</span><input id="magicColor1" type="color" value="#5b2a9e" aria-label="魔力中间值颜色"></label>
+              <label class="field color" title="高值颜色"><span>高</span><input id="magicColor2" type="color" value="#f2e6ff" aria-label="魔力高值颜色"></label>
+              <button id="btnMagicColorsReset" class="btn quiet" type="button">默认色</button>
+              <span class="hint grow">白模画法下看魔力颜色最清楚;色带只改显示,不改数值。</span>
+            </div>
             <div class="field-legend-wrap hidden" id="magicLegendWrap">
               <div class="field-legend-head"><span id="magicLegendName">魔力浓度</span><span class="field-legend-hash" id="magicLegendHash"></span></div>
               <div class="field-legend-bar" id="magicLegendBar"></div>
               <div class="field-legend-ticks" id="magicLegendTicks"></div>
-              <div class="field-legend-unit">按州记的浓度(0–100;图层色带 0–60)· 每像素取所属州的值 · hover 看精确值</div>
+              <div class="field-legend-unit">按地块记录的浓度(0–100)· 每像素取所在州的值 · hover 看精确值</div>
             </div>
           </details>
         </div>

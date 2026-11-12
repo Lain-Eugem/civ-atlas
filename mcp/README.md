@@ -325,8 +325,8 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 
 - **引擎侧**:两张按地块记的表——`vein`(灵脉,约 6% 的地块有,一次生成后不变)、`magic`(每 5 年按 `spread/seep/fade/drain` 在相邻地块间扩散、渗入、自然消退);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(先把地块值按州求均值,跳过水面;强度 1 时 0–100 浓度≈1–2 倍)。图层每 100 年存一帧(`keep=100`,地块图层的格数固定,字节上限 7.8 MB),跟着 `Civ.simLayers` 一起存档/回放。
 - **开关**:`civ_session_open` 加 `magicField: true`(默认强度 1)或 `magicField: number`(0–3,0.5 一档);`civ_state_get` 返回 `magic`(强度 + 图层元数据/统计)。**不给 `magicField` 时,引擎行为和官方规则逐字节一致**;`magicField: 0` 只记图层、不改数值,也拿来做确定性对账。
-- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;整张 PNG 与地形底图同为 2048×1024——先把每块地的值经 `sphereField` 按球面三角形重心插值铺成连续场(相邻地块之间线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,`grid` 存地块编号、水面为 −1,并带 `unit`/`count`)。放大超过约 2 倍后,查看器改用 `renderMagicTilePixels` 的窗口化瓦片(与地形瓦片同一网格 `x=i*512,y=j*512`,按瓦片自己的倍率做球面覆盖、模糊与辉光,所以放大不糊),路由 `GET /api/magic/tile?sessionId=&year=&S=&x=&y=&size=`;瓦片没铺满前用整张 2048 图兜底。
-- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与地块魔力浓度。
+- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;整张 PNG 与地形底图同为 2048×1024——先把每块地的值经 `sphereField` 按球面三角形重心插值铺成连续场(相邻地块之间线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,`grid` 存地块编号、水面为 −1,并带 `unit`/`count`)。放大超过约 2 倍后,查看器改用 `renderMagicTilePixels` 的窗口化瓦片(与地形瓦片同一网格 `x=i*512,y=j*512`,按瓦片自己的倍率做球面覆盖、模糊与辉光,所以放大不糊),路由 `GET /api/magic/tile?sessionId=&year=&S=&x=&y=&size=`;瓦片没铺满前用整张 2048 图兜底。所有 `/api/magic/*` 都接受可选 `colors=#rrggbb,#......`(2–8 个,只改显示、不改数值),并纳入 PNG/瓦片缓存键。
+- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,还能选色带(默认紫 / 余烬 / 青翠 / 冰蓝 / 灰阶 / 自定义三色取色器,写进 localStorage),图例与瓦片颜色跟着变;hover 同时显示地块静态场与地块魔力浓度。想分清「地图本来的颜色」和「魔力的颜色」时,把顶部「画法」切到**白模(灰白)**:地形只画灰白浮雕与海岸,所有彩色都来自叠加层(魔力/疆域/静态场)。
 - **自检**:`node mcp/.build/mcp/selftest-magic.js`(35 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
 
 ## 可配置场(阶段A:玩家自己造「铲子」)
@@ -426,12 +426,12 @@ node mcp/.build/mcp/viewer.js --port 5190
 查看器是**独立进程**(零新依赖,只监听 127.0.0.1),内置前端在 `mcp/viewer/`(浅色界面照主站的 `src/ui/theme.css`;系统跟随深浅色):
 
 - 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策、**魔力场与强度**;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。参数收在顶栏「参数」打开的浮窗里。
-- 地图:**铺满整个窗口**当背景。顶栏「画法」切换主站同款的四种地形(默认手绘羊皮纸);东西相连,越过南北极也会按球面接法(纬度镜像 + 经度挪半圈)接到另一侧,所以**上下左右都能无限拖**;放大超过 1 倍底图后按 √2 分档现算高清块,越放大越锐利;滚轮 / 双击 / 右下角按钮缩放,「复位」回到默认视图。点选国家、hover 数值、国都标注都按同一套跨极变换反算。
+- 地图:**铺满整个窗口**当背景。顶栏「画法」切换五种地形(手绘羊皮纸 / 卫星写实 / 地理图 / **白模(灰白)** / 旧沙盒底图),白模只画灰白浮雕与海岸、不画生物群系颜色,专门用来看叠加层(魔力/疆域/静态场)的颜色;东西相连,越过南北极也会按球面接法(纬度镜像 + 经度挪半圈)接到另一侧,所以**上下左右都能无限拖**;放大超过 1 倍底图后按 √2 分档现算高清块,越放大越锐利;滚轮 / 双击 / 右下角按钮缩放,「复位」回到默认视图。点选国家、hover 数值、国都标注都按同一套跨极变换反算。
 - 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争),可收起到只剩标题条。
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹),同样可收起。
 - 左侧行动栏:创建世界 → 开始会话 → 跑一回合 → 自动播放,以及回放对账、导出会话;这三块都是浮在地图上的玻璃卡片,地图始终露在中间。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data|tile`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data|tile`(都接受可选 `colors=#rrggbb,...`)、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG,style 含 white)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 ### 地形渲染:复用主站的管线
 
@@ -440,7 +440,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 | 环节 | 用的模块 |
 |---|---|
 | 1 倍整张主图 | `src/gen/raster.ts` 的 `rasterize(world, 1, false)`,2048 × 1024 |
-| 上色 | `src/render/fantasy.ts` 的 `fantasyFullPixels`;写实风用 `realistic.ts` 的 `realisticPixels` / `realisticWindowPixels` |
+| 上色 | `src/render/fantasy.ts` 的 `fantasyFullPixels`;写实风用 `realistic.ts` 的 `realisticPixels` / `realisticWindowPixels`;白模用本文件 `whitePixels()`(灰白浮雕 + 浅灰海,不画生物群系颜色) |
 | 放大现算一块 | `src/gen/rasterWindow.ts` 的 `zoomSource` + `rasterizeWindow` |
 | 矢量细节层 | `src/render/fantasy.ts` 的 `fantasyCoastLines` / `seaRippleLines` / `planGlyphs` / `simplifyLine` → 浏览器 Canvas 画 |
 | 编码 | 仍然是 `mcp/png.ts` 手写 zlib,不碰 canvas / sharp |
@@ -523,7 +523,7 @@ mcp/
   coast-trace.ts     按瓦片自己的倍率追水陆边界(marching squares,Douglas–Peucker 抽稀)
   png.ts             纯 Node PNG 编码(渲染层共用)
   field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
-  magic-render.ts    魔力图层渲染(逐地块值 2048 球面插值连续场 + 平滑/辉光;放大后按 LOD 现算窗口化瓦片)
+  magic-render.ts    魔力图层渲染(逐地块值 2048 球面插值连续场 + 平滑/辉光;放大后按 LOD 现算窗口化瓦片;支持 colors 覆盖色带)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图 + 场叠加)
   viewer/               index.html / style.css / app.js
   tsconfig.build.json / build.ps1

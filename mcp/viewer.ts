@@ -54,7 +54,7 @@ import {
   type FieldRamp,
   type FieldStyle,
 } from './field-render';
-import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf } from './magic-render';
+import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf, parseMagicColors } from './magic-render';
 import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
@@ -996,12 +996,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const sid = url.searchParams.get('sessionId') ?? '';
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
     const s = getSession(sid);
+    const colors = parseMagicColors(url.searchParams.get('colors'));
     const view = magicView(s);
     sendJson(res, 200, {
       enabled: !!view,
       strength: view?.strength ?? null,
       layers: view?.layers ?? [],
-      legend: magicLegendOf(s.civ, s.play.year),
+      legend: magicLegendOf(s.civ, s.play.year, colors ?? undefined),
       year: s.play.year,
       yearNow: gameYearOf(s.play.year),
     });
@@ -1014,13 +1015,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const s = getSession(sid);
     const layer = magicLayerOf(s.civ);
     if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const colors = parseMagicColors(url.searchParams.get('colors'));
+    const colorKey = colors ? colors.join(',') : '';
     const asked = optNum(url.searchParams.get('year'));
     const lo = layer.years[0];
     const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(lo, asked));
-    const key = `${s.id}|${year}`;
+    const key = `${s.id}|${year}|${colorKey}`;
     const hit = magicPngs.get(key);
     if (hit) { sendPng(res, hit.png); return true; }
-    const out = renderMagicMap(s.world, s.civ, year, DEFAULT_MAGIC_STYLE);
+    const style = colors ? { ...DEFAULT_MAGIC_STYLE, colors } : DEFAULT_MAGIC_STYLE;
+    const out = renderMagicMap(s.world, s.civ, year, style);
     if (!out) { fail(res, 404, '没有魔力图层'); return true; }
     if (magicPngs.size > 24) magicPngs.clear();
     magicPngs.set(key, { png: out.png, legend: out.legend, frameYear: out.frameYear });
@@ -1034,11 +1038,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const s = getSession(sid);
     const layer = magicLayerOf(s.civ);
     if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const colors = parseMagicColors(url.searchParams.get('colors'));
     const asked = optNum(url.searchParams.get('year'));
     const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
-    const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)));
+    const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)), colors ?? undefined);
     if (!data) { fail(res, 404, '没有魔力图层'); return true; }
-    sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year) });
+    sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year, colors ?? undefined) });
     return true;
   }
 
@@ -1058,10 +1063,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
     const asked = optNum(q.get('year'));
     const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
-    const key = `${s.id}|${year}|${S}|${x}|${y}|${size}`;
+    const colors = parseMagicColors(q.get('colors'));
+    const colorKey = colors ? colors.join(',') : '';
+    const key = `${s.id}|${year}|${S}|${x}|${y}|${size}|${colorKey}`;
     const hit = magicTilePngs.get(key);
     if (hit) { sendPng(res, hit); return true; }
-    const out = renderMagicTile(s.world, s.civ, year, S, x, y, size, DEFAULT_MAGIC_STYLE);
+    const style = colors ? { ...DEFAULT_MAGIC_STYLE, colors } : DEFAULT_MAGIC_STYLE;
+    const out = renderMagicTile(s.world, s.civ, year, S, x, y, size, style);
     if (!out) { fail(res, 404, '没有魔力图层'); return true; }
     if (magicTilePngs.size > 512) magicTilePngs.clear();
     magicTilePngs.set(key, out.png);

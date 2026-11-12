@@ -25,9 +25,29 @@ export interface MagicLayerFrame {
 
 export interface MagicRenderStyle {
   opacity: number;
+  /** 玩家自选的色带(2–8 个 #rrggbb);不给时用图层自带 ramp(默认紫色系) */
+  colors?: readonly string[];
 }
 
 export const DEFAULT_MAGIC_STYLE: MagicRenderStyle = { opacity: 0.85 };
+
+const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
+
+/** 解析查看器传进来的 colors=#aabbcc,#ddeeff;格式不合规返回 null(用默认色带) */
+export function parseMagicColors(raw: string | null | undefined): string[] | null {
+  if (!raw) return null;
+  const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (parts.length < 2 || parts.length > 8) return null;
+  if (!parts.every((p) => HEX_COLOR.test(p))) return null;
+  return parts;
+}
+
+/** 实际渲染用的色带:玩家选的优先,否则用图层自带 ramp */
+export function magicColorsOf(layer: { colors: string[] }, style?: MagicRenderStyle): string[] {
+  const pick = style?.colors;
+  if (pick && pick.length >= 2) return [...pick];
+  return [...layer.colors];
+}
 
 export interface MagicLegend {
   title: string;
@@ -133,7 +153,7 @@ export function rampColor(colors: readonly string[], t: number): [number, number
   ];
 }
 
-export function magicLegendOf(civ: Civ, year: number): MagicLegend {
+export function magicLegendOf(civ: Civ, year: number, colors?: readonly string[]): MagicLegend {
   const layer = magicLayerOf(civ);
   if (!layer) return { title: '魔力浓度', legend: '魔力（0–100）', colors: [], min: 0, max: 60, frameYear: null, ticks: [] };
   const { frame } = magicValuesAt(layer, year);
@@ -143,7 +163,8 @@ export function magicLegendOf(civ: Civ, year: number): MagicLegend {
     const value = layer.min + (layer.max - layer.min) * f;
     ticks.push({ value, label: value >= 100 ? value.toFixed(0) : value.toFixed(1) });
   }
-  return { title: layer.title, legend: layer.legend, colors: layer.colors, min: layer.min, max: layer.max, frameYear: frame, ticks };
+  const palette = colors && colors.length >= 2 ? [...colors] : layer.colors;
+  return { title: layer.title, legend: layer.legend, colors: palette, min: layer.min, max: layer.max, frameYear: frame, ticks };
 }
 
 /** 显示级盒式模糊:横向按经度取模;纵向按最近的边延伸。只改观感,不碰数值。 */
@@ -216,21 +237,15 @@ export interface MagicPixels {
   frameYear: number | null;
 }
 
-interface MagicLayerLike {
-  colors: string[];
-  min: number;
-  max: number;
-}
-
 /** 把连续场 t + 辉光场 glow 上色成 RGBA(低值近透明,高值实色 + 柔光) */
-function paintMagic(t: Float32Array, glow: Float32Array, w: number, h: number, layer: MagicLayerLike, opacityIn: number): Uint8Array {
+function paintMagic(t: Float32Array, glow: Float32Array, w: number, h: number, opacityIn: number, colors: readonly string[]): Uint8Array {
   const n = w * h;
   const rgba = new Uint8Array(n * 4);
   const opacity = Math.min(1, Math.max(0.05, opacityIn));
-  const hot = rampColor(layer.colors, 0.92);
+  const hot = rampColor(colors, 0.92);
   for (let p = 0; p < n; p++) {
     const tv = Math.min(1, Math.max(0, t[p]!));
-    const [R0, G0, B0] = rampColor(layer.colors, tv);
+    const [R0, G0, B0] = rampColor(colors, tv);
     let R = R0;
     let G = G0;
     let B = B0;
@@ -279,7 +294,7 @@ export function renderMagicPixels(world: World, civ: Civ, year: number, style: M
   // 三角形插值在格与格之间的折线再用约 2px 的柔化抹一下
   blurField(t, w, h, Math.max(1, Math.round(w / 1024)));
   const glow = glowOf(t, w, h, Math.max(2, Math.round(w / 190)));
-  return { width: w, height: h, rgba: paintMagic(t, glow, w, h, layer, style.opacity), frameYear: frame };
+  return { width: w, height: h, rgba: paintMagic(t, glow, w, h, style.opacity, magicColorsOf(layer, style)), frameYear: frame };
 }
 
 /**
@@ -310,7 +325,7 @@ export function renderMagicTilePixels(world: World, civ: Civ, year: number, S: n
   // 半径按瓦片像素(≈屏幕像素)给:512 块 → 2px 柔化、4px 辉光
   blurField(t, size, size, Math.max(1, Math.round(size / 256)));
   const glow = glowOf(t, size, size, Math.max(2, Math.round(size / 128)));
-  return { width: size, height: size, rgba: paintMagic(t, glow, size, size, layer, style.opacity), frameYear: frame };
+  return { width: size, height: size, rgba: paintMagic(t, glow, size, size, style.opacity, magicColorsOf(layer, style)), frameYear: frame };
 }
 
 /** 渲染一块魔力瓦片 PNG */
@@ -328,7 +343,7 @@ export function renderMagicMap(world: World, civ: Civ, year: number, style: Magi
     width: px.width,
     height: px.height,
     png: encodePng(px.width, px.height, px.rgba),
-    legend: magicLegendOf(civ, year),
+    legend: magicLegendOf(civ, year, style.colors),
     frameYear: px.frameYear,
   };
 }
@@ -353,7 +368,7 @@ export interface MagicDataJson {
 }
 
 /** 给 hover / 导出用的精确值:按州或按地块,按 unit 判读(不经过颜色反推) */
-export function magicDataJson(world: World, civ: Civ, sessionId: string, year: number, gridW = 256): MagicDataJson | null {
+export function magicDataJson(world: World, civ: Civ, sessionId: string, year: number, gridW = 256, colors?: readonly string[]): MagicDataJson | null {
   const layer = magicLayerOf(civ);
   if (!layer) return null;
   const r = magicRaster(world);
@@ -402,7 +417,7 @@ export function magicDataJson(world: World, civ: Civ, sessionId: string, year: n
     gridW,
     gridH,
     stats: k ? { min, max, mean: sum / k } : { min: 0, max: 0, mean: 0 },
-    colors: layer.colors,
+    colors: colors && colors.length >= 2 ? [...colors] : layer.colors,
     min: layer.min,
     max: layer.max,
     legend: layer.legend,

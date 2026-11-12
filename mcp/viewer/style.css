@@ -1255,3 +1255,7 @@ details.advanced > summary { font-weight: 500; }
 .audit-chip.allow { background: rgba(46, 154, 88, 0.14); color: var(--ok); }
 .audit-chip.soften { background: rgba(185, 124, 12, 0.14); color: var(--warn); }
 .audit-chip.reject { background: rgba(224, 68, 58, 0.14); color: var(--err); }
+
+/* 魔力色带的三个取色器:紧凑一点,别把参数栏撑高 */
+.field.color { min-width: 52px; }
+.field input[type='color'] { width: 46px; height: 30px; padding: 2px; cursor: pointer; }
