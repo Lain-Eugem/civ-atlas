@@ -183,7 +183,14 @@ export default defineConfig({
   // 显式绑 IPv4 回环:默认的 'localhost' 在 Windows 上会被解析成 ::1,只监听 IPv6,
   // 而浏览器访问 localhost 走的是 127.0.0.1,于是报「拒绝连接」。绑 127.0.0.1 两边都对得上,
   // 也仍然只对本机开放(不设 host: true,免得把带 Key 的沙盒接口暴露到局域网)。
-  server: { host: '127.0.0.1', port: 5188, strictPort: true },
+  server: {
+    host: '127.0.0.1',
+    port: 5188,
+    strictPort: true,
+    // 开发时别监视缓存/临时目录:预渲染瓦片(.runs)和验证截图(snaps)动辄几百 MB,
+    // 而且脚本写临时文件时会被 Windows 锁住,watcher 抛 EBUSY 会把 dev server 弄崩
+    watch: { ignored: ['**/.runs/**', '**/snaps/**'] },
+  },
   // 只跑 tests/ 下的单测;本地工具目录(.claude/)里的不算。
   // 先后和分份(PR 检查上分几台机器跑)按各文件大概多久排,见 tests/lib/shardSequencer.ts
   test: {

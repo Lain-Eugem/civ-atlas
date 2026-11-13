@@ -1005,7 +1005,8 @@
   const { withBox, drawVectorsInto: drawVectorsIntoShared, visibleRectsFor } = window.CivVecDraw;
 
   function loadVectors() {
-    // 矢量和画法无关:默认 fantasy 要用,white 也要用;提前拿好,切过去时不用等
+    // 矢量数据所有画法共用:fantasy 用全套墨线 / 林块 / 符号 / 河网,
+    // geo / satellite / white 只用河网(河网几何与画法无关,每个世界只算一次);提前拿好,切过去时不用等
     if (S.vec && S.vecWorldId === S.worldId) return;
     const wid = S.worldId;
     fetch(`/api/map/vectors?worldId=${encodeURIComponent(wid)}`)
@@ -1132,8 +1133,13 @@
    * 重建矢量层缓存:视口四周多画一圈边距,拖动时先贴图,快拖出边距再重画。
    * 正常走 Worker 异步重烘(不阻塞主线程);Worker 不可用才退回主线程同步画。
    */
+  /** 哪些画法要用矢量层:fantasy 用全套墨线 / 林块 / 符号,geo / satellite / white 只用共用的河网;classic 仍是纯栅格底图 */
+  function vecStyleOn() {
+    return S.style === 'fantasy' || S.style === 'geo' || S.style === 'satellite' || S.style === 'white';
+  }
+
   function buildVecCache() {
-    if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white')) { clearVecCache(); return null; }
+    if (!S.vec || !vecStyleOn()) { clearVecCache(); return null; }
     const { k, oxAbs, P, H } = S.draw;
     const oyAbs = S.draw.oy;
     const rdpr = S.rdpr || S.dpr;
@@ -1172,7 +1178,7 @@
    * 缩放明显变化、拖动快把边距拖光、换画法 / 换世界 / 瓦片覆盖状态变化时才重画。
    */
   function drawVectorsCached() {
-    if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white') || !S.baseImg) { S.vecCache = null; return; }
+    if (!S.vec || !vecStyleOn() || !S.baseImg) { S.vecCache = null; return; }
     const { k, oxAbs, P, H } = S.draw;
     const oyAbs = S.draw.oy;
     // 拖动 / 缩放进行中也要有墨线:主线程直接描线只要几毫秒,

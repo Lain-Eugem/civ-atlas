@@ -241,11 +241,32 @@
     g.restore();
   }
 
-  /* ---------- 河流矢量层 ----------
-   * 照搬主站 render/common.ts 的 drawRivers(普通、非投影路径)与 fantasy.ts 的 fantasyRiverStyle:
-   * 河流是 [x,y,flux,…] 的三元组折线,屏幕上每段单独 stroke,线宽由该段 flux 和当前缩放现算,
-   * 所以放大时线宽会变、走线不变 —— 这正是"河流不能烘进位图、必须浏览器端矢量重绘"的原因。
+  /* ---------- 河网矢量层 ----------
+   * 几何来自服务端 mcp/terrain.ts 的 riverNet:主站 gen/riverGeometry.ts 那一套
+   * (并干流 → 统一平滑 → Catmull-Rom 加密 → 河口喇叭口),已按水陆图裁掉水面并 RDP 抽稀到
+   * 0.02 世界单位。走向 / f / m 与画风无关,所以每个世界只算一次、所有画风与所有缩放共用;
+   * 客户端只按画风与当前缩放重算线宽(和主站 render/common.ts strokeRivers 同一个公式):
+   *   w = (widthOf(f) * 0.5 * (m[i]+m[i+1]) * lodTaper(style,f) + extra) * s
    */
+
+  /** 各画风的河网外观:照主站 render/realistic.ts 的 MATERIALS.river / riverFlux */
+  const RIVER_LOOKS = {
+    // 地理图
+    geo: { color: 'rgb(48,118,190)', minW: 0.55, growW: 1.9, bank: null, fluxRef: 1400, riverFlux: [0.7, 0.9] },
+    // 卫星(细节)
+    satellite: {
+      color: 'rgb(28,64,92)',
+      minW: 0.45,
+      growW: 1.6,
+      bank: { color: 'rgba(22,40,30,0.2)', thinW: 0.45 },
+      fluxRef: 1400,
+      riverFlux: [2.4, 1.4],
+    },
+    // 白模
+    white: { color: 'rgb(150,186,214)', minW: 0.55, growW: 1.9, bank: null, fluxRef: 1400, riverFlux: [2.5, 1.5] },
+    // 手绘羊皮纸:和主站 fantasyRiverStyle 同一套颜色 / 宽度,保留手绘的细线感
+    fantasy: { color: 'rgba(48,82,110,0.9)', minW: 0.5, growW: 1.5, bank: null, fluxRef: 900, riverFlux: [1, 1] },
+  };
 
   /** 把 x 折回离 ref 最近的一圈(主站 gen/util.ts 的 nearX) */
   function nearX(x, ref, W) { return W ? x - W * Math.round((x - ref) / W) : x; }
@@ -253,25 +274,52 @@
   /** 河流分级:缩放越大画出来的河越多(主站 common.ts riverLod) */
   function riverLod(k) { return Math.max(1, 4.5 * Math.pow(Math.max(1, k), -1.3)); }
 
-  /** 主站 fantasy.ts 的 fantasyRiverStyle(那边没 export,这里原样复制 6 行) */
-  function fantasyRiverStyle(k, threshold) {
+  /**
+   * 当前画风 + 缩放下的河宽参数,两套公式都照主站:
+   * - 手绘(fantasy):fantasyRiverStyle(kk, threshold) —— maxW = 0.5 + 1.5×kk^-0.2、minFlux = threshold×riverLod(kk)、
+   *   宽度指数 0.5、无河岸;
+   * - 写实系(geo / satellite / white):realisticRiverStyle —— maxW = minW + growW×kk^-0.12、thin = kk^-0.6、
+   *   minFlux = threshold×(kk>1 ? max(0.2, 4.5×kk^-2.2) : riverLod(kk))×riverFlux[kk>1 ? 1 : 0]、宽度指数 0.65。
+   * 四画风共用的是河网几何;线宽公式各按主站那一套来(主站本来就不一样)。
+   */
+  function riverStyleOf(style, k, threshold) {
+    const look = RIVER_LOOKS[style] || RIVER_LOOKS.fantasy;
     const kk = Math.max(1, k);
+    const thin = Math.pow(kk, -0.6);
+    if (style === 'fantasy') {
+      return {
+        color: look.color,
+        minW: look.minW,
+        maxW: 0.5 + 1.5 * Math.pow(kk, -0.2),
+        fluxRef: look.fluxRef,
+        thin: thin,
+        minFlux: threshold * riverLod(kk),
+        power: 0.5,
+        bank: null,
+      };
+    }
     return {
-      color: 'rgba(48,82,110,0.9)',
-      minW: 0.5,
-      maxW: 0.5 + 1.5 * Math.pow(kk, -0.2),
-      fluxRef: 900,
-      thin: Math.pow(kk, -0.6),
-      minFlux: threshold * riverLod(kk),
+      color: look.color,
+      minW: look.minW,
+      maxW: look.minW + look.growW * Math.pow(kk, -0.12),
+      fluxRef: look.fluxRef,
+      thin: thin,
+      minFlux:
+        threshold *
+        (kk > 1 ? Math.max(0.2, 4.5 * Math.pow(kk, -2.2)) : riverLod(kk)) *
+        look.riverFlux[kk > 1 ? 1 : 0],
+      power: 0.65,
+      bank: look.bank ? { color: look.bank.color, width: look.bank.thinW * thin } : null,
     };
   }
 
-  /** 线宽(世界单位):flux 只在一段范围内起作用(主站 common.ts riverWidth,power = 0.5) */
+  /** 线宽(世界单位):flux 只在一段范围内起作用(主站 common.ts riverWidth;手绘 power 0.5、写实系 0.65) */
   function riverWidthOf(style, threshold) {
     const base = style.minW * (style.thin || 1);
     const span = style.maxW - style.minW;
+    const power = style.power || 0.65;
     return function (f) {
-      return base + span * Math.min(1, Math.pow(Math.max(0, f - threshold) / style.fluxRef, 0.5));
+      return base + span * Math.min(1, Math.pow(Math.max(0, f - threshold) / style.fluxRef, power));
     };
   }
 
@@ -284,69 +332,121 @@
   }
 
   /**
-   * 河流几何:把每条河的 x 展开(跨 180 度处接着上一顶点延出去,折线才不会横穿整张图),
-   * 顺便算 bbox —— 和 strokeLines 一样用 bbox 判断要不要再画一份平移副本。
-   * 兼容两种结构:vec 原样的 {pts,cells},或 app.js 已套过 withBox 的 {p,…}。
+   * 河网几何:把每条河的 x 展开(跨 180° 处接着上一点延出去,折线才不会横穿整张图),顺便算 bbox,
+   * 跨 180° 时在另一边再画一份平移副本用。每份矢量数据(vec)只算一次,各视口 / 各画风复用。
    */
-  function riverGeometry(rivers, W) {
+  const riverNetCache = new WeakMap();
+  function riverNetGeometry(net, W) {
     const out = [];
-    for (const river of rivers || []) {
-      const raw = river && (river.pts || river.p);
-      if (!raw || raw.length < 6) continue;
-      const p = new Float64Array(raw.length);
-      for (let i = 0; i < raw.length; i++) p[i] = raw[i];
-      for (let i = 3; i < p.length; i += 3) p[i] = nearX(p[i], p[i - 3], W);
-      let x0 = Infinity, x1 = -Infinity;
-      for (let i = 0; i < p.length; i += 3) {
-        const x = p[i];
-        if (x < x0) x0 = x;
-        if (x > x1) x1 = x;
+    for (const line of net || []) {
+      const xs = line.x;
+      const ys = line.y;
+      const fs = line.f;
+      const ms = line.m;
+      const n = xs ? xs.length : 0;
+      if (n < 2) continue;
+      const x = new Float64Array(n);
+      const y = new Float64Array(n);
+      const f = new Float64Array(n);
+      const m = new Float64Array(n);
+      let x0 = Infinity;
+      let x1 = -Infinity;
+      for (let i = 0; i < n; i++) {
+        x[i] = i ? nearX(xs[i], x[i - 1], W) : xs[i];
+        y[i] = ys[i];
+        f[i] = fs[i];
+        m[i] = ms[i];
+        if (x[i] < x0) x0 = x[i];
+        if (x[i] > x1) x1 = x[i];
       }
-      out.push({ p: p, x0: x0, x1: x1 });
+      out.push({ x: x, y: y, f: f, m: m, x0: x0, x1: x1 });
     }
     return out;
   }
 
+  /** 河网几何只算一次:几何与画风 / 缩放无关 */
+  function riverNetOf(v, W) {
+    const net = v.riverNet;
+    if (!net || !net.length) return null;
+    const hit = riverNetCache.get(v);
+    if (hit) return hit;
+    const geo = riverNetGeometry(net, W);
+    riverNetCache.set(v, geo);
+    return geo;
+  }
+
+  const RIVER_W_STEP = 0.25;
+
   /**
-   * 在某个虚拟视口里画河流:每段一条独立路径(线宽逐段不同),moveTo / quadraticCurveTo / stroke
-   * 的顺序和主站 drawRivers 完全一致,只是把 (s, ox, oy) 换成本视口的 fx / fy。
-   * sx = 屏幕像素 / 整图像素(P / mapW),线宽最终 = 世界线宽 × sx。
+   * 画一层河网(河岸层 / 河层):分段画法同主站 drawRivers 的普通路径 —— 从上一段中点起笔、
+   * 以当前顶点为控制点 quadraticCurveTo 到本段中点(最后一段直接到顶点),round cap / join,
+   * 跨 180° 在另一边画平移副本,画布外按"线宽 + 两轴跨度"放宽后裁掉。
+   * 线宽逐段不同,按 0.25 屏幕像素分桶后用 Path2D 一次描一桶(主站 strokeRivers 同一手:
+   * 否则上万段每段一次 stroke 太慢;线宽误差 < 0.125px,看不出来)。
    */
-  function drawRiversInRect(g, geo, threshold, style, sx, fx, fy, cw, ch, W) {
+  function drawRiverNetPass(g, net, threshold, style, color, extra, sx, fx, fy, cw, ch, W) {
     const widthOf = riverWidthOf(style, threshold);
     const minFlux = style.minFlux;
-    g.strokeStyle = style.color;
-    g.lineCap = 'round';
-    g.lineJoin = 'round';
-    for (const river of geo) {
-      const p = river.p;
-      const m = p.length / 3;
-      if (m < 2) continue;
+    const buckets = new Map();
+    for (const river of net) {
+      const x = river.x;
+      const y = river.y;
+      const f = river.f;
+      const m = river.m;
+      const n = x.length;
       const shifts = river.x1 > W ? [0, -W] : river.x0 < 0 ? [0, W] : [0];
       for (const sh of shifts) {
-        for (let i = 0; i < m - 1; i++) {
-          const f = p[i * 3 + 2];
-          if (f < minFlux) continue;
-          const x0 = fx(p[i * 3] + sh), y0 = fy(p[i * 3 + 1]);
-          const x1 = fx(p[(i + 1) * 3] + sh), y1 = fy(p[(i + 1) * 3 + 1]);
-          if (!Number.isFinite(x0 + y0 + x1 + y1)) continue;
-          const lw = widthOf(f) * riverTaper(style, f) * sx;
+        let prevDrawn = false;
+        let prevKey = -1;
+        for (let i = 0; i < n - 1; i++) {
+          // 一段河画不画 / 多宽,按两端平均流量算(和主站 strokeRivers 一样)
+          const ff = 0.5 * (f[i] + f[i + 1]);
+          if (ff < minFlux) { prevDrawn = false; continue; }
+          const x0 = fx(x[i] + sh);
+          const y0 = fy(y[i]);
+          const x1 = fx(x[i + 1] + sh);
+          const y1 = fy(y[i + 1]);
+          if (!Number.isFinite(x0 + y0 + x1 + y1)) { prevDrawn = false; continue; }
+          const wv = (widthOf(ff) * 0.5 * (m[i] + m[i + 1]) * riverTaper(style, ff) + extra) * sx;
+          const lw = wv > 0.05 ? wv : 0.05;
           // pad 和主站一样按"线宽 + 两轴跨度"放宽,斜穿画布外的段不会被误裁
           const pad = lw + Math.abs(x1 - x0) + Math.abs(y1 - y0);
-          if (x0 < -pad || y0 < -pad || x0 > cw + pad || y0 > ch + pad) continue;
-          g.lineWidth = lw;
-          g.beginPath();
-          if (i === 0 || p[(i - 1) * 3 + 2] < minFlux) {
-            g.moveTo(x0, y0);
+          if (x0 < -pad || y0 < -pad || x0 > cw + pad || y0 > ch + pad) { prevDrawn = false; continue; }
+          const key = Math.max(1, Math.round(lw / RIVER_W_STEP));
+          let path = buckets.get(key);
+          if (!path) buckets.set(key, (path = new Path2D()));
+          const endX = i === n - 2 ? x1 : (x0 + x1) / 2;
+          const endY = i === n - 2 ? y1 : (y0 + y1) / 2;
+          if (prevDrawn && prevKey === key) {
+            path.quadraticCurveTo(x0, y0, endX, endY);
           } else {
-            g.moveTo((fx(p[(i - 1) * 3] + sh) + x0) / 2, (fy(p[(i - 1) * 3 + 1]) + y0) / 2);
+            // 段被滤掉 / 换了桶:从上一段中点(或本段起点)重新起笔
+            const startX = i === 0 || !prevDrawn ? x0 : (fx(x[i - 1] + sh) + x0) / 2;
+            const startY = i === 0 || !prevDrawn ? y0 : (fy(y[i - 1]) + y0) / 2;
+            path.moveTo(startX, startY);
+            path.quadraticCurveTo(x0, y0, endX, endY);
           }
-          if (i === m - 2) g.quadraticCurveTo(x0, y0, x1, y1);
-          else g.quadraticCurveTo(x0, y0, (x0 + x1) / 2, (y0 + y1) / 2);
-          g.stroke();
+          prevDrawn = true;
+          prevKey = key;
         }
       }
     }
+    if (!buckets.size) return;
+    g.strokeStyle = color;
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    for (const [key, path] of buckets) {
+      g.lineWidth = key * RIVER_W_STEP;
+      g.stroke(path);
+    }
+  }
+
+  /** 画河网:主站顺序是河岸层在前、河层在后(netLayers);四套画法里只有卫星(细节)有可见河岸 */
+  function drawRiverNetInRect(g, net, threshold, style, sx, fx, fy, cw, ch, W) {
+    if (style.bank && style.bank.width > 0) {
+      drawRiverNetPass(g, net, threshold, style, style.bank.color, style.bank.width * 2, sx, fx, fy, cw, ch, W);
+    }
+    drawRiverNetPass(g, net, threshold, style, style.color, 0, sx, fx, fy, cw, ch, W);
   }
 
   /**
@@ -356,10 +456,13 @@
    */
   function drawVectorsInto(g, opts) {
     const v = opts.vec;
-    if (!v || (opts.style !== 'fantasy' && opts.style !== 'white') || !opts.rects.length) return;
-    const white = opts.style === 'white';
-    const ink = white ? 'rgba(70,72,76,0.82)' : 'rgba(58,45,34,0.86)';
-    const inkSoft = white ? 'rgba(70,72,76,0.20)' : 'rgba(58,45,34,0.17)';
+    const style = opts.style;
+    const fantasy = style === 'fantasy';
+    // 河网是所有画法共用的;纸感墨线 / 波纹 / 冰缘 / 林块 / 山符号只有手绘风有
+    const onlyRivers = style === 'geo' || style === 'satellite' || style === 'white';
+    if (!v || (!fantasy && !onlyRivers) || !opts.rects.length) return;
+    const ink = 'rgba(58,45,34,0.86)';
+    const inkSoft = 'rgba(58,45,34,0.17)';
     const W = opts.mapW, H = opts.H;
     const sx = opts.P / opts.mapW;              // 屏幕像素 / 整图像素
     const sy = opts.H / opts.mapH;
@@ -374,71 +477,74 @@
     const cw = opts.cw, ch = opts.ch;
     const tileFull = opts.tileFull;
     const tileCover = opts.tileCover || [];
-    // 河流:只算一次几何(展开 + bbox),各视口复用;白模不画。风格 k 用 relK(= S.view.k 缩放倍数),
-    // 和主站 fantasyRiverStyle(v.k, …) 同一个量(v.k 是缩放倍数,不是 P/mapW):放大 → 分级放宽、世界线宽变细、屏幕线宽再按 sx 放大。
+    // 河网:几何每世界只算一次(服务端缓存的 riverNet),所有画法 / 所有视口复用。
+    // 风格 k 用 relK(= S.view.k 缩放倍数,和主站 v.k 同一个量,不是 P/mapW):
+    // 放大 → 分级放宽、世界线宽变细,屏幕线宽再按 sx 放大。
     const riverThreshold = v.riverThreshold || 0;
-    const riverStyle = white ? null : fantasyRiverStyle(relK, riverThreshold);
-    const riverGeo = white || !v.rivers || !v.rivers.length ? null : riverGeometry(v.rivers, W);
+    const riverNet = riverNetOf(v, W);
+    const riverStyle = riverNet ? riverStyleOf(style, relK, riverThreshold) : null;
 
     for (const r of opts.rects) {
       const fx = (px) => r.x + px * sx;
       const fy = (py) => (r.odd ? r.yTop + H - py * sy : r.yTop + py * sy);
-      const strokeLines = (lists, color, lw) => {
-        g.strokeStyle = color;
-        g.lineWidth = lw;
-        g.beginPath();
-        let seg = 0;
-        for (const list of lists) {
-          for (const b of list) {
-            const p = b.p;
-            const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
-            for (const sh of shifts) {
-              let pen = false;    // 上一段还连着,可以省掉 moveTo
-              for (let i = 0; i + 3 < p.length; i += 2) {
-                const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
-                const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
-                if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
-                if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
-                  || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
-                if (!pen) { g.moveTo(x0, y0); pen = true; }
-                g.lineTo(x1, y1);
-                if (++seg >= 3000) { g.stroke(); g.beginPath(); pen = false; seg = 0; }
+      if (fantasy) {
+        const strokeLines = (lists, color, lw) => {
+          g.strokeStyle = color;
+          g.lineWidth = lw;
+          g.beginPath();
+          let seg = 0;
+          for (const list of lists) {
+            for (const b of list) {
+              const p = b.p;
+              const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
+              for (const sh of shifts) {
+                let pen = false;    // 上一段还连着,可以省掉 moveTo
+                for (let i = 0; i + 3 < p.length; i += 2) {
+                  const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
+                  const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
+                  if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
+                  if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
+                    || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
+                  if (!pen) { g.moveTo(x0, y0); pen = true; }
+                  g.lineTo(x1, y1);
+                  if (++seg >= 3000) { g.stroke(); g.beginPath(); pen = false; seg = 0; }
+                }
               }
             }
           }
-        }
-        g.stroke();
-      };
-      g.save();
-      g.lineJoin = 'round';
-      g.lineCap = 'butt';
-      if (!white) strokeLines(ripples, inkSoft, 1);
-      // 冰缘:底图里的冰 / 海交界只有一条硬填色边,这里按主站 fantasyIceParts 的墨线补
-      // (主站 ICE_LW=1.5 / ICE_INK_A=0.62,屏幕上统一 1.15px 线宽、0.62 透明度)
-      if (ice && ice.length) strokeLines([ice], white ? 'rgba(70,72,76,0.62)' : 'rgba(58,45,34,0.62)', 1.15);
-
-      if (!tileFull) {
-        if (tileCover.length) {
-          const cover = new Path2D();
-          cover.rect(-20, -20, cw + 40, ch + 40);
-          for (const t of tileCover) cover.rect(t.x, t.y, t.w, t.h);
-          g.clip(cover, 'evenodd');
-        }
-        strokeLines([lake, coast], ink, 1.15);
-      }
-      g.restore();
-      // 林块:主站 detail.ts 的层级顺序是 海岸墨线 → 林块 → 河流 → 山符号,所以插在这里(河流之前)。
-      // 主站的林块从来不烘进底图,所以高清块(tileFull)里也照画;白模不画(和符号 / 河流一致)。
-      if (!white) drawForestInRect(g, v, r, sx, sy, H, relK, cw, ch, W);
-      // 河流画在湖 / 海岸墨线之后(与主站 detail.ts 的层级顺序一致:墨线 → 林块 → 河 → 山符号),
-      // 这样河口压在岸线墨线上而不是被墨线切断;tileCover 的裁剪已经结束,高清块里没烘河所以照画。
-      // 单独 save / restore:河流用 round cap,不能污染后面符号的笔状态。
-      if (riverGeo) {
+          g.stroke();
+        };
         g.save();
-        drawRiversInRect(g, riverGeo, riverThreshold, riverStyle, sx, fx, fy, cw, ch, W);
+        g.lineJoin = 'round';
+        g.lineCap = 'butt';
+        strokeLines(ripples, inkSoft, 1);
+        // 冰缘:底图里的冰 / 海交界只有一条硬填色边,这里按主站 fantasyIceParts 的墨线补
+        // (主站 ICE_LW=1.5 / ICE_INK_A=0.62,屏幕上统一 1.15px 线宽、0.62 透明度)
+        if (ice && ice.length) strokeLines([ice], 'rgba(58,45,34,0.62)', 1.15);
+
+        if (!tileFull) {
+          if (tileCover.length) {
+            const cover = new Path2D();
+            cover.rect(-20, -20, cw + 40, ch + 40);
+            for (const t of tileCover) cover.rect(t.x, t.y, t.w, t.h);
+            g.clip(cover, 'evenodd');
+          }
+          strokeLines([lake, coast], ink, 1.15);
+        }
+        g.restore();
+        // 林块:主站 detail.ts 的层级顺序是 海岸墨线 → 林块 → 河流 → 山符号,所以插在这里(河流之前)。
+        // 主站的林块从来不烘进底图,所以高清块(tileFull)里也照画。
+        drawForestInRect(g, v, r, sx, sy, H, relK, cw, ch, W);
+      }
+      // 河网画在墨线 / 林块之后(与主站 detail.ts 的层级顺序一致:墨线 → 林块 → 河 → 山符号),
+      // 这样河口压在岸线墨线上而不是被墨线切断;tileCover 的裁剪已经结束,高清块里没烘河所以照画。
+      // 单独 save / restore:河用 round cap,不能污染后面符号的笔状态。
+      if (riverNet && riverStyle) {
+        g.save();
+        drawRiverNetInRect(g, riverNet, riverThreshold, riverStyle, sx, fx, fy, cw, ch, W);
         g.restore();
       }
-      if (white) continue;
+      if (onlyRivers) continue;
       const gFill = new Path2D();
       const gLine = new Path2D();
       for (const glyph of v.glyphs) {
