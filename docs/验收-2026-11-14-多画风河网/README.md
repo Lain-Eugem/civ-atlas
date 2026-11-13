@@ -39,7 +39,7 @@
 
 ## 已知差距（都不在本次范围）
 
-1. 不做 creeks 小溪：主站在 k>1 会多画一层小溪（`src/gen/creeks.ts`），查看器没有，659% 像素差主要来自这里。
+1. ~~不做 creeks 小溪~~ 已在 2026-11-14 补上（见下节）；主站 k>1 时的这层小溪现在查看器也有。
 2. `classic` 画风仍是旧三角形栅格，没有高清瓦片 / 矢量层。
 3. geo / satellite 目前只画河网，没有海岸 / 湖岸墨线（主站写实画风的墨线在别的层）。
 4. 查看器没有地名 / 河名标签。
@@ -51,3 +51,36 @@
 - `vite.config.ts` 的 dev server 加了 `server.watch.ignored: ['**/.runs/**', '**/snaps/**']`：
   预渲染瓦片 / 截图目录动辄几百 MB，而且脚本写临时文件时被 Windows 锁住会让 watcher 抛 EBUSY 把 dev server 弄崩
   （本任务中真的崩过一次）。
+
+## 2026-11-14 补丁：小溪（creeks）
+
+- 上游对照：主站写实系（geo / satellite / white）在 `k > 1` 时用 `render/realistic.ts` 的 `riversOf(world, k)`
+  把 `src/gen/creeks.ts` 的小溪并进河网**一起**跑 `riverGeometry`（所以溪流汇入干流处不会断口）；
+  手绘风主站不画小溪，所以查看器也只在非手绘、`relK > 1.2`（主站 `DETAIL_K`）时画。
+- 服务端 `mcp/terrain.ts`：把 `riverNetOf` 拆成 `riverNetOf` / `riverNetCreekOf` / `buildRiverNet(world, ctx, rivers, tol)`；
+  `TerrainCtx` 缓存第二份 `riverNetCreek`，用 `[...world.rivers, ...creeksOf(world)]` 走同一个 `riverGeometry`，
+  裁陆后 RDP 容差放宽到 **0.03** 世界像素（1200% 时约 0.4 屏幕像素），`VectorData.riverNetCreek` 随 `/api/map/vectors` 下发。
+- 前端 `mcp/viewer/vec-draw.js`：`riverNetCache` 改成每个 `vec` 缓存 `{ base, creek }` 两份几何（`riverNetGeoOf(v, W, which)`）；
+  `drawVectorsInto` 里 `const useCreek = !fantasy && relK > 1.2;`，取不到小溪那份时回退到 `base`。
+
+### 数字（同一世界 seed=7 / cells=34043）
+
+| 项 | 值 |
+| --- | --- |
+| 小溪条数 / 原始点 | 1,381 条 / 5,982 点（`creeksOf`） |
+| 河道+小溪 合并几何 | 1,403 段 / 115,940 加密点 / 45 ms |
+| 裁陆 + RDP(0.03) 后 | 1,415 段 / 37,026 点 |
+| `/api/map/vectors` | 1,835,598 B → **2,676,008 B**（+840,410 B，+45.8%） |
+| renderVectors 首算 | 3.32 s → 4.50 s（进程内二次 0 ms） |
+| 河网段落 | `riverNet` 279 段 / 11,425 点保持不变（手绘与低倍仍用它） |
+
+### 验收
+
+- 659% 下查看器地理图 / 白模都能看到细小溪网络；与主站地理图同视角做 50% 叠色，海岸线与溪流走向重合（无重影）。
+- 证据图：`05` 查看器地理图 659%、`06` 主站地理图 659%、`07` 两者 50% 叠色放大、`08` 查看器白模 659%。
+- 回归：根 `tsc --noEmit` exit 0；`selftest` 31/31；`selftest-coast` 18/18；`selftest-tile-field` 30/30。
+
+### 已知限制
+
+- 小溪只在放大后显示（`relK > 1.2`），fit 下与主站一致只显示大河。
+- 下发体积 +0.84 MB、首算 +1.2 s；后续要压可以再调 RDP 容差或按缩放分档下发。

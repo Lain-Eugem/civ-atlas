@@ -12,10 +12,11 @@
  * render/labels/fonts.ts 里的 import.meta.env(Vite 专属),由构建产物的兼容补丁处理,见 mcp/build.ps1
  * 与 scripts/lib/sandboxViewer.ts。
  */
-import type { World } from '../src/gen/world';
+import type { River, World } from '../src/gen/world';
 import { rasterize, type Raster } from '../src/gen/raster';
 import { rasterizeWindow, zoomSource, WINDOW_PAD, type ZoomSource } from '../src/gen/rasterWindow';
 import { riverGeometry } from '../src/gen/riverGeometry';
+import { creeksOf } from '../src/gen/creeks';
 import { traceMaskValue } from './coast-trace';
 import {
   fantasyCoastLines,
@@ -54,6 +55,8 @@ const RIVER_MOUTH_FLARE = 1.5;
 const RIVER_WIDTH_POWER = 0.65;
 /** 折线抽稀容差(世界单位):1200% 时约 0.2 屏幕像素,肉眼看不出来 */
 const RIVER_NET_TOL = 0.02;
+/** 带小溪那份河网的容差:溪多(约 4.7 万点),放到 0.03(1200% 时约 0.4 屏幕像素)压一压体积 */
+const RIVER_NET_TOL_CREEK = 0.03;
 
 interface TerrainCtx {
   /** 1 倍整张主图:放大现算要用的海冰 / 细沟 / 大尺度晕渲都从它取 */
@@ -68,6 +71,8 @@ interface TerrainCtx {
   vectors: VectorData | null;
   /** 河网几何缓存(与画风无关,只算一次) */
   riverNet: RiverNetLine[] | null;
+  /** 带小溪的河网几何缓存(放大后 geo/satellite/white 用,和主站 realistic 的 riversOf 同一套) */
+  riverNetCreek: RiverNetLine[] | null;
 }
 
 /**
@@ -108,6 +113,11 @@ export interface VectorData {
    */
   riverNet?: RiverNetLine[];
   /**
+   * 放大后用的河网 = 河道 + 小溪(主站 realistic 在 k>1 时用 riversOf 把小溪 creeks.ts 并进河网,
+   * 汇合处一起平滑,所以小溪终点正好落在干流折线上)。手绘风不用这份(主站手绘只画 world.rivers)。
+   */
+  riverNetCreek?: RiverNetLine[];
+  /**
    * 林块:扁平存 [x, y, kind, flags, i, …] 每个有林的地块一项。
    * kind: 1 阔叶 / 2 针叶 / 3 雨林(和主站 fantasy.ts 的 F_BROAD / F_PINE / F_JUNGLE 同值);
    * flags: 1 = 林块边界(有邻格不是同种林,画成扇贝边的小圆)、2 = 临水(圆会缩小);
@@ -137,6 +147,7 @@ function ctxOf(world: World): TerrainCtx {
     fantasy: null,
     vectors: null,
     riverNet: null,
+    riverNetCreek: null,
   };
   contexts.set(world, ctx);
   return ctx;
@@ -290,10 +301,25 @@ function rdpKeep(x: number[], y: number[], tol: number): number[] {
 function riverNetOf(world: World, ctx: TerrainCtx): RiverNetLine[] {
   const hit = ctx.riverNet;
   if (hit) return hit;
+  const out = buildRiverNet(world, ctx, world.rivers, RIVER_NET_TOL);
+  ctx.riverNet = out;
+  return out;
+}
+
+/** 放大后的河网:河道 + 小溪,只给 geo / satellite / white 用(主站 realistic 的 riversOf(k>1)) */
+function riverNetCreekOf(world: World, ctx: TerrainCtx): RiverNetLine[] {
+  const hit = ctx.riverNetCreek;
+  if (hit) return hit;
+  const out = buildRiverNet(world, ctx, [...world.rivers, ...creeksOf(world)], RIVER_NET_TOL_CREEK);
+  ctx.riverNetCreek = out;
+  return out;
+}
+
+function buildRiverNet(world: World, ctx: TerrainCtx, rivers: River[], tol: number): RiverNetLine[] {
   const raster = ctx.whole;
   const W = world.width; // 世界坐标 = 1 倍整图像素坐标(scale = 1),wrap 也用同一个宽度
   const dense = riverGeometry(
-    world.rivers,
+    rivers,
     world.riverThreshold,
     RIVER_GEOM_WIDTH,
     RIVER_MOUTH_FLARE,
@@ -363,7 +389,7 @@ function riverNetOf(world: World, ctx: TerrainCtx): RiverNetLine[] {
           cur.y.push(ay);
           cur.f.push(af);
           cur.m.push(am);
-          pushRiverNet(out, cur);
+          pushRiverNet(out, cur, tol);
         }
         cur = null;
       } else {
@@ -376,16 +402,15 @@ function riverNetOf(world: World, ctx: TerrainCtx): RiverNetLine[] {
       lm = qm;
       wasLand = land;
     }
-    if (cur) pushRiverNet(out, cur);
+    if (cur) pushRiverNet(out, cur, tol);
   }
-  ctx.riverNet = out;
   return out;
 }
 
 /** 抽稀并压成下发格式(坐标 / 流量 / 宽度系数都取到 0.01) */
-function pushRiverNet(out: RiverNetLine[], run: RiverNetLine): void {
+function pushRiverNet(out: RiverNetLine[], run: RiverNetLine, tol: number): void {
   if (run.x.length < 2) return;
-  const keep = rdpKeep(run.x, run.y, RIVER_NET_TOL);
+  const keep = rdpKeep(run.x, run.y, tol);
   if (keep.length < 2) return;
   const x: number[] = [];
   const y: number[] = [];
@@ -450,6 +475,7 @@ export function renderVectors(world: World): VectorData {
     riverThreshold: world.riverThreshold,
     // 河网几何:所有画风共用这一份,前端按 f/m 现算线宽(裁陆 + RDP 抽稀在这一步做)
     riverNet: riverNetOf(world, ctx),
+    riverNetCreek: riverNetCreekOf(world, ctx),
     forest,
     forestSpacing: mesh.spacing,
     forestSeed: subSeed(world.params.seed, 'glyphs'),

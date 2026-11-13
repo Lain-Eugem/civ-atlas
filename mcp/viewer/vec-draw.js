@@ -364,14 +364,18 @@
     return out;
   }
 
-  /** 河网几何只算一次:几何与画风 / 缩放无关 */
-  function riverNetOf(v, W) {
-    const net = v.riverNet;
-    if (!net || !net.length) return null;
-    const hit = riverNetCache.get(v);
-    if (hit) return hit;
-    const geo = riverNetGeometry(net, W);
-    riverNetCache.set(v, geo);
+  /**
+   * 河网几何只算一次:几何与画风 / 缩放无关。
+   * which = 'base' 只有河道(手绘 / 低倍);'creek' = 河道 + 小溪(主站 realistic 在 k>1 时用 riversOf 并进小溪)。
+   */
+  function riverNetGeoOf(v, W, which) {
+    let hit = riverNetCache.get(v);
+    if (hit && hit[which] !== undefined) return hit[which];
+    const net = which === 'creek' ? v.riverNetCreek : v.riverNet;
+    let geo = null;
+    if (net && net.length) geo = riverNetGeometry(net, W);
+    if (!hit) riverNetCache.set(v, (hit = {}));
+    hit[which] = geo;
     return geo;
   }
 
@@ -481,7 +485,10 @@
     // 风格 k 用 relK(= S.view.k 缩放倍数,和主站 v.k 同一个量,不是 P/mapW):
     // 放大 → 分级放宽、世界线宽变细,屏幕线宽再按 sx 放大。
     const riverThreshold = v.riverThreshold || 0;
-    const riverNet = riverNetOf(v, W);
+    // 放大后(主站 DETAIL_K = 1.2)非手绘画风换成"河道 + 小溪"那份几何:主站 realistic 的
+    // riversOf(world, k>1) 就是把这个世界的 creeks.ts 并进河网一起平滑;手绘风主站不画小溪,保持只有河道。
+    const useCreek = !fantasy && relK > 1.2;
+    const riverNet = riverNetGeoOf(v, W, useCreek ? 'creek' : 'base') || riverNetGeoOf(v, W, 'base');
     const riverStyle = riverNet ? riverStyleOf(style, relK, riverThreshold) : null;
 
     for (const r of opts.rects) {
