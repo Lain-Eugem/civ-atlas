@@ -15,3 +15,7 @@ ai-ruler/out/
 .pnpm-store/
 .pnpm-home/
 .npm-cache/
+
+# 预渲染的瓦片缓存(可随时重算)
+.runs/
+

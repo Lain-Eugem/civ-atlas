@@ -18,8 +18,8 @@
  *   - 世界生成和推演都是纯计算,接口本身不改变确定性。
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFileSync, existsSync } from 'node:fs';
-import { extname, join, normalize, resolve, sep } from 'node:path';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { constants as osConstants, setPriority } from 'node:os';
 
@@ -57,6 +57,7 @@ import {
 } from './field-render';
 import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf, parseMagicColors } from './magic-render';
 import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
+import { renderOwnerPixels } from './owner-map';
 import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
@@ -395,76 +396,34 @@ function renderWorldMap(world: World): MapImage {
 interface OwnerMap extends MapImage {
   grid: { w: number; h: number; owner: number[] };
   colors: Record<string, string>;
+  /** 国界线:扁平 [x0,y0,x1,y1,…],主图像素坐标(跨 180° 的线会超出 [0,W],前端按 shift 再画一份) */
+  borders: number[][];
   fingerprint: string;
 }
 
-/** 疆域图:只画三个顶点同属一国的三角形,边界自然留缝露出地形;水/无主透明 */
+/** 疆域图:逐像素归属 + 水彩罩染 + 平滑国界,和主站同一套画法(见 mcp/owner-map.ts);水/无主透明 */
 function renderOwnerMap(s: Session): OwnerMap {
   const world = s.world;
   const civ: Civ = s.civ;
-  const W = MAP_OUT_W;
-  const H = Math.max(64, Math.round((MAP_OUT_W * world.height) / world.width));
-  const sx = W / world.width;
-  const sy = H / world.height;
-  const px = new Uint8Array(W * H * 4); // 全透明
-  const n = world.mesh.n;
-  const ownerOf = new Int16Array(n);
-  const colorOfPolity = (id: number): RGB => {
-    const p = civ.polities[id];
-    return p ? (p.color as unknown as RGB) : [128, 128, 128];
-  };
-  for (let i = 0; i < n; i++) {
-    const region = civ.regions.of[i] ?? -1;
-    const owner = region >= 0 ? (civ.polity[region] ?? -1) : -1;
-    ownerOf[i] = owner;
-  }
+  const pixels = renderOwnerPixels(world, civ);
+  const W = pixels.width;
+  const H = pixels.height;
+  // Uint8ClampedArray → Uint8Array 零拷贝视图(encodePng 收 Uint8Array)
+  const px = new Uint8Array(pixels.rgba.buffer, pixels.rgba.byteOffset, pixels.rgba.byteLength);
+
   const colors: Record<string, string> = {};
   for (const p of civ.polities) {
-    if (p.ended === undefined) colors[String(p.id)] = hexOf(colorOfPolity(p.id));
+    if (p.ended === undefined) colors[String(p.id)] = hexOf(p.color);
   }
 
-  const stampRadius = Math.max(1, Math.round(world.mesh.spacing * sx * 0.55));
-  const stampColor = (i: number): RGB | null => {
-    const id = ownerOf[i]!;
-    return id >= 0 ? colorOfPolity(id) : null;
-  };
-  stampCells(px, W, H, sx, sy, n, world.mesh.x, world.mesh.y, stampColor, stampRadius);
-
-  const tri = world.mesh.triangles;
-  for (let t = 0; t + 2 < tri.length; t += 3) {
-    const ia = tri[t]!;
-    const ib = tri[t + 1]!;
-    const ic = tri[t + 2]!;
-    const oa = ownerOf[ia]!;
-    if (oa < 0 || ownerOf[ib] !== oa || ownerOf[ic] !== oa) continue;
-    const c = colorOfPolity(oa);
-    const ax = (world.mesh.x[ia] ?? 0) * sx;
-    const bx = (world.mesh.x[ib] ?? 0) * sx;
-    const cx = (world.mesh.x[ic] ?? 0) * sx;
-    const ay = (world.mesh.y[ia] ?? 0) * sy;
-    const by = (world.mesh.y[ib] ?? 0) * sy;
-    const cy = (world.mesh.y[ic] ?? 0) * sy;
-    const span = Math.max(ax, bx, cx) - Math.min(ax, bx, cx);
-    if (span > W / 2) {
-      const wxs = [ax, bx, cx].map((v) => (v > W / 2 ? v - W : v));
-      triangleFill(px, W, H, wxs[0]!, ay, wxs[1]!, by, wxs[2]!, cy, c, c, c);
-      triangleFill(px, W, H, wxs[0]! + W, ay, wxs[1]! + W, by, wxs[2]! + W, cy, c, c, c);
-    } else {
-      triangleFill(px, W, H, ax, ay, bx, by, cx, cy, c, c, c);
-    }
-  }
-
-  // 半透明,让底下的地形/雪线透出来;国界处本来就没画,会留一道细缝
-  for (let o = 3; o < px.length; o += 4) {
-    if (px[o] === 255) px[o] = 172;
-  }
-
-  // 点击选国用的低分辨率网格:每格取落进去的最后一个有主地块
+  // 点击/悬停选国用的低分辨率网格:每格取落进去的最后一个有主地块
+  const n = world.mesh.n;
   const gw = 240;
   const gh = Math.max(32, Math.round((gw * H) / W));
   const ownerGrid = new Int16Array(gw * gh).fill(-1);
   for (let i = 0; i < n; i++) {
-    const id = ownerOf[i]!;
+    const region = civ.regions.of[i] ?? -1;
+    const id = region >= 0 ? (civ.polity[region] ?? -1) : -1;
     if (id < 0) continue;
     const gx = Math.min(gw - 1, Math.max(0, Math.floor(((world.mesh.x[i] ?? 0) / world.width) * gw)));
     const gy = Math.min(gh - 1, Math.max(0, Math.floor(((world.mesh.y[i] ?? 0) / world.height) * gh)));
@@ -476,6 +435,7 @@ function renderOwnerMap(s: Session): OwnerMap {
     rgba: px,
     grid: { w: gw, h: gh, owner: Array.from(ownerGrid) },
     colors,
+    borders: pixels.borders,
     fingerprint: '',
   };
 }
@@ -607,7 +567,9 @@ function stateView(s: Session): Record<string, unknown> {
  * ------------------------------------------------------------------ */
 
 const baseCache = new Map<string, Buffer>();
-/** 高清瓦片:key = worldId | 画法 | LOD | 球面展开坐标上的块号 */
+/** 瓦片像素的渲染版本:terrain.ts 改了底图 / 瓦片的上色、河网等算法时 +1 */
+const TILE_RENDER_VER = 11;
+/** 高清瓦片:key = worldId | 画法 | 渲染版本 | LOD | 球面展开坐标上的块号 */
 const tileCache = new Map<string, Buffer>();
 /** 每块瓦片自己的海岸 / 湖岸线(按该块的倍率追的,和这块地形严丝合缝) */
 const tileLines = new Map<string, { sea: number[][]; lake: number[][] }>();
@@ -724,7 +686,7 @@ function parseTileQuery(q: URLSearchParams): TileQuery {
   if (!Number.isInteger(size) || size < 16 || size > 1024) throw new Error('size 超出范围');
   const style = styleOf(q);
   if (style === 'classic') throw new Error('classic 画法没有高清瓦片');
-  return { worldId, style, S, x, y, size, key: `${worldId}|${style}|${S}|${x}|${y}|${size}` };
+  return { worldId, style, S, x, y, size, key: `${worldId}|${style}|r${TILE_RENDER_VER}|${S}|${x}|${y}|${size}` };
 }
 
 async function getBasePng(worldId: string, style: TerrainStyle): Promise<Buffer> {
@@ -756,18 +718,132 @@ function cacheTile(key: string, png: Buffer, lines?: { sea: number[][]; lake: nu
   }
 }
 
-function getOwnerMap(s: Session): { png: Buffer; grid: { w: number; h: number; owner: number[] }; colors: Record<string, string>; fingerprint: string; width: number; height: number } {
+// ---- 预渲染:启动时把 S=2/4/8 的瓦片算好落盘,前端按进度条等到全部就绪 ----
+const PREWARM_LEVELS = [2, 4, 8] as const;
+const PREWARM_SIZE = 512;
+const TILE_DISK_ROOT = resolve('.runs', 'tiles');
+
+interface PrewarmState { state: 'running' | 'done' | 'failed'; done: number; total: number; startedAt: number; style: TerrainStyle }
+const prewarmState = new Map<string, PrewarmState>();
+
+function tileDiskPath(t: TileQuery, ext = 'png'): string {
+  return join(TILE_DISK_ROOT, t.worldId, t.style, `v${TILE_RENDER_VER}`, String(t.S), `${t.x}_${t.y}_${t.size}.${ext}`);
+}
+
+function readTileDisk(t: TileQuery, ext = 'png'): Buffer | undefined {
+  try {
+    const p = tileDiskPath(t, ext);
+    return existsSync(p) ? readFileSync(p) : undefined;
+  } catch { return undefined; }
+}
+
+function writeTileDisk(t: TileQuery, png: Buffer, lines?: { sea: number[][]; lake: number[][] }): void {
+  try {
+    const p = tileDiskPath(t);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, png);
+    if (lines) writeFileSync(tileDiskPath(t, 'json'), JSON.stringify(lines));
+  } catch { /* 磁盘缓存失败不影响出图 */ }
+}
+
+/** 只保留最近 keep 个世界的瓦片目录,避免 .runs 无限膨胀 */
+function pruneTileDisk(keep = 1): void {
+  try {
+    if (!existsSync(TILE_DISK_ROOT)) return;
+    const dirs = readdirSync(TILE_DISK_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory())
+      .map((d) => ({ name: d.name, m: statSync(join(TILE_DISK_ROOT, d.name)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    for (const d of dirs.slice(keep)) rmSync(join(TILE_DISK_ROOT, d.name), { recursive: true, force: true });
+  } catch { /* 清理失败不影响启动 */ }
+}
+
+function startPrewarm(worldId: string, style: TerrainStyle): PrewarmState {
+  const key = `${worldId}|${style}`;
+  const cur = prewarmState.get(key);
+  if (cur && cur.state === 'running') return cur;
+  const jobs: TileQuery[] = [];
+  for (const S of PREWARM_LEVELS) {
+    const cols = 4 * S;
+    const rows = 2 * S;
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const x = col * PREWARM_SIZE;
+        const y = row * PREWARM_SIZE;
+        jobs.push({ worldId, style, S, x, y, size: PREWARM_SIZE, key: `${worldId}|${style}|r${TILE_RENDER_VER}|${S}|${x}|${y}|${PREWARM_SIZE}` });
+      }
+    }
+  }
+  const st: PrewarmState = { state: 'running', done: 0, total: jobs.length, startedAt: Date.now(), style };
+  prewarmState.set(key, st);
+  void (async () => {
+    const rec = getWorldRecord(worldId);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < jobs.length) {
+        const t = jobs[next++]!;
+        if (!existsSync(tileDiskPath(t))) {
+          const map = (await renderViaPool(worldId, rec.world, { kind: 'tile', style: t.style, S: t.S, x: t.x, y: t.y, size: t.size })) ??
+            renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
+          const png = encodePng(map.width, map.height, map.rgba);
+          const lines = { sea: map.sea ?? [], lake: map.lake ?? [] };
+          cacheTile(t.key, png, lines);
+          writeTileDisk(t, png, lines);
+        }
+        st.done++;
+      }
+    };
+    try {
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      st.state = 'done';
+    } catch {
+      st.state = 'failed';
+    }
+  })();
+  return st;
+}
+
+function getOwnerMap(s: Session): {
+  png: Buffer;
+  grid: { w: number; h: number; owner: number[] };
+  colors: Record<string, string>;
+  borders: number[][];
+  fingerprint: string;
+  width: number;
+  height: number;
+} {
   const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
   const hit = ownerCache.get(s.id);
   if (hit && hit.fingerprint === fingerprint) {
-    const j = hit.json as { png: string; grid: { w: number; h: number; owner: number[] }; colors: Record<string, string>; width: number; height: number };
+    const j = hit.json as {
+      png: string;
+      grid: { w: number; h: number; owner: number[] };
+      colors: Record<string, string>;
+      borders: number[][];
+      width: number;
+      height: number;
+    };
     return { ...j, png: Buffer.from(j.png, 'base64'), fingerprint };
   }
   const map = renderOwnerMap(s);
   const png = encodePng(map.width, map.height, map.rgba);
-  const json = { png: png.toString('base64'), grid: map.grid, colors: map.colors, width: map.width, height: map.height };
+  const json = {
+    png: png.toString('base64'),
+    grid: map.grid,
+    colors: map.colors,
+    borders: map.borders,
+    width: map.width,
+    height: map.height,
+  };
   ownerCache.set(s.id, { fingerprint, json });
-  return { png, grid: map.grid, colors: map.colors, width: map.width, height: map.height, fingerprint };
+  return {
+    png,
+    grid: map.grid,
+    colors: map.colors,
+    borders: map.borders,
+    width: map.width,
+    height: map.height,
+    fingerprint,
+  };
 }
 
 function eventsOf(s: Session): { entries: EventView[]; total: number } {
@@ -879,6 +955,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     return true;
   }
 
+  // 预渲染:POST 启动,GET 查进度。前端建完世界先等它把 S=2/4/8 的瓦片算完再进地图。
+  if (pathname === '/api/map/prewarm') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    const style = styleOf(url.searchParams);
+    if (style === 'classic') { sendJson(res, 200, { state: 'done', done: 0, total: 0, style }); return true; }
+    const st = method === 'POST'
+      ? startPrewarm(worldId, style)
+      : prewarmState.get(`${worldId}|${style}`) ?? { state: 'idle', done: 0, total: 0, startedAt: 0, style };
+    sendJson(res, 200, { state: st.state, done: st.done, total: st.total, style });
+    return true;
+  }
+
   // 放大后按屏幕现算的一块(同主站 tileWorker):(x, y) 是球面展开平面上的坐标,可以越过南北极
   if (method === 'GET' && (pathname === '/api/map/tile' || pathname === '/api/map/coast')) {
     let t: TileQuery;
@@ -897,10 +986,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       return { png: encodePng(map.width, map.height, map.rgba), sea: map.sea ?? [], lake: map.lake ?? [] };
     };
     if (pathname === '/api/map/tile') {
-      let png = tileCache.get(t.key);
+      let png = tileCache.get(t.key) ?? readTileDisk(t);
       if (!png) {
         const r = await render();
         cacheTile(t.key, r.png, { sea: r.sea, lake: r.lake });
+        writeTileDisk(t, r.png, { sea: r.sea, lake: r.lake });
         png = r.png;
       }
       sendImmutablePng(res, png);
@@ -909,9 +999,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     // 海岸线:按这块瓦片自己的倍率追的,和这块的地形严丝合缝(1 倍底图追的那份放大后会对不上)
     let lines = tileLines.get(t.key);
     if (!lines) {
+      const disk = readTileDisk(t, 'json');
+      if (disk) {
+        try { lines = JSON.parse(disk.toString('utf8')) as { sea: number[][]; lake: number[][] }; } catch { lines = undefined; }
+      }
+    }
+    if (!lines) {
       const r = await render();
       lines = { sea: r.sea, lake: r.lake };
       cacheTile(t.key, r.png, lines);
+      writeTileDisk(t, r.png, lines);
     }
     sendImmutableJson(res, lines);
     return true;
@@ -928,6 +1025,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       colors: m.colors,
       width: m.width,
       height: m.height,
+      borders: m.borders,
       fingerprint: m.fingerprint,
     });
     return true;
@@ -1408,6 +1506,7 @@ function softenPriority(): void {
 function main(): void {
   const { port } = parseArgs(process.argv.slice(2));
   softenPriority();
+  pruneTileDisk(1);
   process.on('exit', () => disposeMapPools());
   const server = createServer((req, res) => {
     void handle(req, res);

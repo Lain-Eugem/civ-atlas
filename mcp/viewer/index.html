@@ -364,6 +364,14 @@
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="prewarm" id="prewarm" hidden>
+  <div class="prewarm-card">
+    <div class="prewarm-title">正在预渲染地图</div>
+    <div class="prewarm-sub">把每个放大倍率的地形先算好，之后拖动、放大都是现成的</div>
+    <div class="prewarm-bar"><div class="prewarm-fill" id="prewarmFill"></div></div>
+    <div class="prewarm-text" id="prewarmText">准备中…</div>
+  </div>
+</div>
 <div class="busy" id="busy"><div class="busy-card"><span class="spinner big"></span><div><div class="busy-title" id="busyTitle">AI 君主思考中…</div><div class="busy-sub" id="busySub"></div></div></div></div>
 
 <script src="./vec-draw.js"></script>

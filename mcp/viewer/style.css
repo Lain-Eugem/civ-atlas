@@ -1259,3 +1259,13 @@ details.advanced > summary { font-weight: 500; }
 /* 魔力色带的三个取色器:紧凑一点,别把参数栏撑高 */
 .field.color { min-width: 52px; }
 .field input[type='color'] { width: 46px; height: 30px; padding: 2px; cursor: pointer; }
+
+/* 预渲染进度:建完世界先等 S=2/4/8 的瓦片全部落盘 */
+.prewarm { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; background: rgba(24, 26, 24, 0.42); }
+.prewarm[hidden] { display: none; }
+.prewarm-card { width: min(430px, 82vw); padding: 22px 24px 20px; border-radius: 14px; background: #f7f3e8; box-shadow: 0 18px 60px rgba(0, 0, 0, 0.32); }
+.prewarm-title { font-size: 15px; font-weight: 600; letter-spacing: 0.04em; color: #3a3226; }
+.prewarm-sub { margin-top: 6px; font-size: 12px; line-height: 1.5; color: #7a6f5c; }
+.prewarm-bar { margin-top: 16px; height: 6px; border-radius: 3px; background: #e4dccb; overflow: hidden; }
+.prewarm-fill { height: 100%; width: 0%; border-radius: 3px; background: #8a7350; transition: width 0.25s ease; }
+.prewarm-text { margin-top: 9px; font-size: 12px; color: #6b6252; font-variant-numeric: tabular-nums; }

@@ -27,7 +27,7 @@ type PoolJob = {
   seq: number;
 };
 
-const POOL_SIZE = 2;
+const POOL_SIZE = 4;
 const JOB_TIMEOUT_MS = 10_000;
 const MAX_POOLS = 2;
 

@@ -20,6 +20,7 @@
     state: null,
     baseImg: null,
     ownersImg: null,
+    ownerBorders: null,
     // 后台预加载的其它画法底图:style -> { img, w, h };换世界时清空
     baseCache: new Map(),
     baseCacheWorldId: null,
@@ -30,9 +31,7 @@
     cw: 800,
     ch: 480,
     dpr: 1,
-    /** 交互时的分辨率系数(1 = 满分辨率);见 interactiveScale */
-    rs: 1,
-    /** 画布实际的设备像素比 = dpr × rs */
+    /** 画布实际的设备像素比(交互中也不降,见 resizeCanvas) */
     rdpr: 1,
     view: { k: 1, x: 0, y: 0 },
     draw: { k: 1, ox: 0, oy: 0, P: 1, H: 1 },
@@ -444,10 +443,9 @@
     S.cw = Math.max(240, Math.round(rect.width));
     S.ch = Math.max(180, Math.round(rect.height));
     S.dpr = Math.min(2, window.devicePixelRatio || 1);
-    // 交互(拖动 / 滚轮)时把画布分辨率降下来:Canvas2D 的瓶颈是填充率,
-    // 高 DPI 大窗口一帧要铺 700 万像素,降一半就是少 4 倍工作量。
-    // 手一停就恢复满分辨率重画一次(见 endInteractive)。
-    S.rdpr = S.dpr * S.rs;
+    // 画布分辨率只跟设备像素比走:拖动 / 缩放不再临时降分辨率,免得松手时
+    // 画面突然从糊变清晰。高倍率下的清晰度由瓦片负责(拖动中也照贴)。
+    S.rdpr = S.dpr;
     // 视口尺寸 / 分辨率变了,矢量层缓存按旧尺寸画的,直接作废
     S.vecCache = null;
     el.map.width = Math.round(S.cw * S.rdpr);
@@ -456,42 +454,13 @@
     draw();
   }
 
-  /**
-   * 拖 / 缩放时降到多少分辨率:按"交互时最多铺 320 万像素"反推。
-   * dpr1 的小窗口本来就不超,不降;dpr2 的 1920 宽大概降到 0.65。
-   */
-  function interactiveScale() {
-    const px = S.cw * S.ch * S.dpr * S.dpr;
-    if (px <= 3.2e6) return 1;
-    return Math.max(0.5, Math.round(Math.sqrt(3.2e6 / px) * 100) / 100);
-  }
-
-  let idleTimer = 0;
-  /** 最近一次输入(拖动/滚轮/缩放)的时间:矢量层在交互中不画,停手 260ms 后再补 */
+  /** 最近一次输入(拖动/滚轮/缩放)的时间:交互中矢量层同步描线,停手 260ms 后换上缓存 */
   let lastInputAt = 0;
   let vecIdleTimer = 0;
   function beginInteractive() {
     lastInputAt = performance.now();
     clearTimeout(vecIdleTimer);
     vecIdleTimer = setTimeout(() => requestDraw(), 260);
-    if (S.rs !== 1) {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(endInteractive, 220);
-      return;
-    }
-    const rs = interactiveScale();
-    if (rs === 1) return;
-    S.rs = rs;
-    resizeCanvas();
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(endInteractive, 220);
-  }
-
-  function endInteractive() {
-    clearTimeout(idleTimer);
-    if (S.rs === 1) return;
-    S.rs = 1;
-    resizeCanvas();
   }
 
   // 纵向不再夹住:世界是球面,越过极点会接到另一侧。只把累积的位移折回偶数层
@@ -596,7 +565,9 @@
     const nextLod = currentLod();
     if (nextLod !== S.lod) S.tileSeq++;  // 换档时让上一档还没发完的请求作废(缓存留着,来回缩放还能用)
     S.lod = nextLod;
-    if (!interacting) drawHiTiles();
+    // 拖动 / 缩放中也照样贴已经缓存的高清瓦片(连每块自己的海岸墨线一起)。
+    // 以前这里整段跳过,放大后一拖就退回 1 倍底图,看起来像"一动就变糊、松手才清晰"。
+    drawHiTiles();
     drawMagicHiTiles();
     const magicSharp = !interacting && S.magic.on && magicTilesCoverView();
     for (const r of rects) {
@@ -610,6 +581,7 @@
     }
     // 墨线 / 波纹 / 符号是矢量,按固定屏幕线宽画在最上层,放大多少倍都不变粗
     drawVectorsCached();
+    drawOwnerBorders(rects);
     for (const r of rects) {
       // 文字不能跟着翻转,单独按镜像后的位置画
       if (S.state) drawLabels(ctx, r.x, r.yTop, k, r.odd, H);
@@ -627,13 +599,15 @@
    * 平面上(不是屏幕上),所以拖动时已经算过的块还能接着用。
    * ------------------------------------------------------------------ */
   const TILE = 512;
-  const LOD_MAX = 16;
+  // 预渲染只做 2/4/8 三档;把最高档也钉在 8,这样任何放大倍率都落在已渲染的瓦片上,
+  // 不会在 1200% 才现算 S=16 的 4096 块。代价是超过 800% 时瓦片最多放大到 1.5 倍。
+  const LOD_MAX = 8;
   /**
    * 底图 / 瓦片 URL 的版本号。服务端把它们标成 immutable 让浏览器长期缓存,
    * 所以只要改了地形或上色的算法,这里就要 +1,否则老浏览器会一直用旧图。
    */
   // 改地形 / 上色算法时 +1:瓦片和底图都是 immutable 缓存,不换 URL 老浏览器会一直用旧图
-  const MAP_VER = 3;
+  const MAP_VER = 5;
   /** 与 mcp/terrain.ts 的 TERRAIN_STYLES 一致 */
   const STYLES = ['fantasy', 'satellite', 'geo', 'white', 'classic'];
 
@@ -643,8 +617,10 @@
     // 只会生成 1.4 倍的低档瓦片,和整图拼起来反而出现细线 / 色块(见"缩小错乱"),
     // 所以只有真正放大到 2 倍档才现算,最小档也从 2 倍起。
     if (kd <= 1.8 || S.style === 'classic') return 0;
-    // √2 一档:倍数小幅变化时不必重算,又能在 2 / 4 / 8 倍明显提分辨率
-    return clamp(2 ** (Math.round(Math.log2(kd) * 2) / 2), 2, LOD_MAX);
+    // 只取 2 的整数次幂:这样一圈地图正好 tileCols(lod)=4*lod 列、一层 tileRows(lod)=2*lod 行,
+    // 都是整数 —— 同一块世界区域不管落在哪个重复单元,列号取模后都是同一个键、同一张图,
+    // 拖到第几个"世界"都不用重渲,也不会出现越拖越大的坐标。档数还比 √2 少一半。
+    return clamp(2 ** Math.round(Math.log2(kd)), 2, LOD_MAX);
   }
 
   function clearTiles() {
@@ -683,6 +659,34 @@
     return tileGridAt(S.lod);
   }
 
+  /** 这一档一圈地图有多少列、一层有多少行(2 的幂档下都是整数) */
+  function tileCols(lod) { return Math.round(4 * lod); }
+  function tileRows(lod) { return Math.round(2 * lod); }
+
+  /**
+   * 世界坐标 (i,j) → 规范块。
+   *
+   * 球面在 x 方向每 tileCols 列、y 方向每两层完全重复(过极点镜像一次),
+   * 所以一块的内容只由 列号 / 层内的行 / 层的奇偶 决定。取模之后:
+   *   - 拖到任意一个重复单元,键都一样,命中的是同一张图;
+   *   - 发给服务端的 x / y 永远落在 [0, 一圈) 内,不会越拖越大。
+   */
+  function tileAt(lod, i, j) {
+    const cols = tileCols(lod);
+    const rows = tileRows(lod);
+    const col = ((i % cols) + cols) % cols;
+    const layer = Math.floor(j / rows);
+    const row = ((j % rows) + rows) % rows;
+    const par = ((layer % 2) + 2) % 2;
+    return {
+      key: `${lod}|${col}|${row}|${par}`,
+      col, row, par, cols, rows,
+      x: col * TILE,
+      // 偶数层直接落在第 0 / 1 层上;奇数层用第 1 层(服务端会自己按奇数层镜像)
+      y: (par * rows + row) * TILE,
+    };
+  }
+
   /** 缓存里已经有哪几层(升序)。每帧扫一遍键,一百来个,可以忽略不计 */
   function cachedLods() {
     const set = new Set();
@@ -696,52 +700,81 @@
   /** 这一层的可见块是不是齐了 */
   function levelComplete(g) {
     for (let j = g.j0; j <= g.j1; j++) {
-      for (let i = g.i0; i <= g.i1; i++) if (!S.tiles.has(`${g.lod}|${i}|${j}`)) return false;
+      for (let i = g.i0; i <= g.i1; i++) if (!S.tiles.has(tileAt(g.lod, i, j).key)) return false;
     }
     return true;
+  }
+
+  /** 这一块在 2 倍档上的四块子瓦片是不是都已经在缓存里(在的话就不必再按低档渲一遍) */
+  function childrenCover(lod, i, j) {
+    const l2 = lod * 2;
+    if (!l2 || l2 > LOD_MAX) return false;
+    const t = tileAt(lod, i, j);
+    const cols2 = t.cols * 2;
+    const rows2 = t.rows * 2;
+    const has = (dc, dr) => S.tiles.has(
+      `${l2}|${(t.col * 2 + dc) % cols2}|${(t.row * 2 + dr) % rows2}|${t.par}`,
+    );
+    return has(0, 0) && has(1, 0) && has(0, 1) && has(1, 1);
   }
 
   /**
    * 从低倍率往高倍率叠画,当前层最后画。
    *
-   * 换档(√2 一档)时新层一块都没有,以前只能露 1 倍底图被放大 3~5 倍、整片发糊;
-   * 现在缺块的地方由上一层(只差 √2 倍)顶着,补上再替换,观感上不会"先糊一下"。
-   * 倍率不同的块在世界平面上是对齐的,所以贴图位置按 k / lod 换算即可,
-   * 源图会被 drawImage 按目标尺寸重采样,不需要额外裁切。
+   * 换档时新层一块都没有,缺块的地方由已缓存的档顶着(低一档或高一档),补上再替换,
+   * 观感上不会"先糊一下"。倍率不同的块在世界平面上是对齐的,贴图位置按 k / lod
+   * 换算即可,源图会被 drawImage 按目标尺寸重采样,不需要额外裁切。
    *
-   * 能盖满视口的最低一层以下的层全被挡住,直接跳过,避免每帧多画几十张。
+   * 块的键是规范化的(见 tileAt):列取模、层内行 + 层奇偶 —— 拖动到第几个重复单元
+   * 都一样,所以同一块世界区域只渲染一次,其它单元直接命中同一张图。
    *
-   * 海岸 / 湖岸线跟着各自的瓦片一起画(见 drawTileCoast):全局那份是在 1 倍底图上
-   * 追的,放大后会和瓦片的水陆边界差一两个屏幕像素,所以有瓦片覆盖的地方不用它。
+   * 海岸 / 湖岸线只由"当前档里真正露在最上面的块"画:低档块会被高档块整块盖住,
+   * 再描一遍就是两条线叠着;被 2× 子块拼满的那块也不描,留给子块描。
    */
   function drawHiTiles() {
     S.tileCover.length = 0;
     S.tileFull = false;
     if (!S.lod || !S.tiles.size) return;
-    const lods = cachedLods().filter((lod) => lod <= S.lod);
-    if (!lods.length) return;
+    const lods = cachedLods();
+    const below = lods.filter((lod) => lod <= S.lod);
+    if (!below.length) return;
     let from = 0;
-    for (let n = 0; n < lods.length; n++) {
-      const g = tileGridAt(lods[n]);
+    for (let n = 0; n < below.length; n++) {
+      const g = tileGridAt(below[n]);
       if (!g || g.step < 4) continue;
       if (levelComplete(g)) {
         from = n;
-        if (lods[n] === S.lod) S.tileFull = true;   // 当前层齐了,全局那份海岸线整份都不用画
+        if (below[n] === S.lod) S.tileFull = true;   // 当前层齐了,全局那份海岸线整份都不用画
       }
     }
-    for (let n = from; n < lods.length; n++) {
-      const g = tileGridAt(lods[n]);
+    const paint = (g, i, j, withCoast) => {
+      const t = tileAt(g.lod, i, j);
+      const img = S.tiles.get(t.key);
+      if (!img) return;
+      const x = g.oxAbs + i * g.step;
+      const y = g.oyAbs + j * g.step;
+      ctx.drawImage(img, x, y, g.step + 0.6, g.step + 0.6);
+      if (withCoast && drawTileCoast(t.key, x, y, g.step + 0.6)) S.tileCover.push({ x, y, w: g.step + 0.6, h: g.step + 0.6 });
+    };
+    for (let n = from; n < below.length; n++) {
+      const g = tileGridAt(below[n]);
       if (!g || g.step < 4) continue;
       for (let j = g.j0; j <= g.j1; j++) {
         for (let i = g.i0; i <= g.i1; i++) {
-          const key = `${g.lod}|${i}|${j}`;
-          const img = S.tiles.get(key);
-          if (!img) continue;
-          const x = g.oxAbs + i * g.step;
-          const y = g.oyAbs + j * g.step;
-          ctx.drawImage(img, x, y, g.step + 0.6, g.step + 0.6);
-          if (drawTileCoast(key, x, y, g.step + 0.6)) S.tileCover.push({ x, y, w: g.step + 0.6, h: g.step + 0.6 });
+          // 海岸线只画一层:低档块会被高档块整块盖住,再描一遍就是两条线叠着;
+          // 被 2× 子块拼满的那块也不描,留给子块自己描。
+          paint(g, i, j, g.lod === S.lod && !childrenCover(g.lod, i, j));
         }
+      }
+    }
+    // 缩小时直接复用放大时已经渲染过的高清块:同一块世界区域只渲染一次,
+    // 缩小时把它降采样贴回去,而不是再按低一档重新渲一遍。只叠最近两档 ——
+    // 再高的档在屏幕上更小,已经被这两档完全盖住,画了也看不见。
+    for (const lod of lods.filter((l) => l > S.lod).slice(0, 2)) {
+      const g = tileGridAt(lod);
+      if (!g || g.step < 4) continue;
+      for (let j = g.j0; j <= g.j1; j++) {
+        for (let i = g.i0; i <= g.i1; i++) paint(g, i, j, true);
       }
     }
   }
@@ -788,24 +821,29 @@
     if (!g) return;
     const seq = S.tileSeq;
     const style = S.style;   // 换画法时旧任务必须整批作废,否则会用新画法 + 旧倍数发请求
+    // 视口外再预取一圈:平移时新露出来的那块往往已经有图,不用先糊一片底图再等。
+    // 排序按"离视口中心近的优先",所以这一圈永远排在可见块后面,不会抢它们的带宽。
+    const PAD = 1;
     const want = [];
-    for (let j = g.j0; j <= g.j1; j++) {
-      for (let i = g.i0; i <= g.i1; i++) {
-        const key = `${g.lod}|${i}|${j}`;
-        if (!S.tiles.has(key) && !S.tilePending.has(key)) want.push({ i, j, key });
+    for (let j = g.j0 - PAD; j <= g.j1 + PAD; j++) {
+      for (let i = g.i0 - PAD; i <= g.i1 + PAD; i++) {
+        const t = tileAt(g.lod, i, j);
+        if (!S.tiles.has(t.key) && !S.tilePending.has(t.key) && !childrenCover(g.lod, i, j)) {
+          want.push({ i, j, key: t.key, x: t.x, y: t.y });
+        }
       }
     }
     if (!want.length) return;
     const cx = (g.i0 + g.i1) / 2;
     const cy = (g.j0 + g.j1) / 2;
     want.sort((a, b) => (Math.abs(a.i - cx) + Math.abs(a.j - cy)) - (Math.abs(b.i - cx) + Math.abs(b.j - cy)));
-    const jobs = want.slice(0, 16);
+    const jobs = want.slice(0, 24);
     for (const w of jobs) S.tilePending.add(w.key);
     const stale = () => seq !== S.tileSeq || S.style !== style || S.lod !== g.lod;
     const one = async (w) => {
       if (stale()) { S.tilePending.delete(w.key); return; }
       const qs = `worldId=${encodeURIComponent(S.worldId)}&style=${encodeURIComponent(style)}`
-        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}&v=${MAP_VER}`;
+        + `&S=${g.lod}&x=${w.x}&y=${w.y}&size=${TILE}&v=${MAP_VER}`;
       try {
         // 图和这一块自己的海岸线一起要:线是按这块的倍率追的,和这块的地形严丝合缝
         const [r, rc] = await Promise.all([
@@ -851,7 +889,13 @@
    * 块的坐标锚在世界展开平面上,和地形瓦片同一套 tileGridAt,所以叠得严丝合缝。
    * ------------------------------------------------------------------ */
   function magicTileKey(lod, i, j) {
-    return `${lod}|${i}|${j}|${S.magic.year}|${magicColorsKey()}`;
+    const t = tileAt(lod, i, j);
+    return `${t.key}|${S.magic.year}|${magicColorsKey()}`;
+  }
+
+  function magicTileAt(lod, i, j) {
+    const t = tileAt(lod, i, j);
+    return { key: `${t.key}|${S.magic.year}|${magicColorsKey()}`, x: t.x, y: t.y };
   }
 
   function clearMagicTiles() {
@@ -904,8 +948,8 @@
     const want = [];
     for (let j = g.j0; j <= g.j1; j++) {
       for (let i = g.i0; i <= g.i1; i++) {
-        const key = magicTileKey(g.lod, i, j);
-        if (!S.magicTiles.has(key) && !S.magicPending.has(key)) want.push({ i, j, key });
+        const t = magicTileAt(g.lod, i, j);
+        if (!S.magicTiles.has(t.key) && !S.magicPending.has(t.key)) want.push({ i, j, key: t.key, x: t.x, y: t.y });
       }
     }
     if (!want.length) return;
@@ -922,7 +966,7 @@
     const one = async (w) => {
       if (stale()) { S.magicPending.delete(w.key); return; }
       const qs = `sessionId=${encodeURIComponent(S.sessionId)}&year=${encodeURIComponent(String(year))}`
-        + `&S=${g.lod}&x=${w.i * TILE}&y=${w.j * TILE}&size=${TILE}${magicColorsParam()}`;
+        + `&S=${g.lod}&x=${w.x}&y=${w.y}&size=${TILE}${magicColorsParam()}`;
       try {
         const r = await fetch(`/api/magic/tile?${qs}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -970,9 +1014,11 @@
         if (wid !== S.worldId) return;
         v.coast = v.coast.map(withBox);
         v.lake = v.lake.map(withBox);
+        v.ice = (v.ice || []).map(withBox);
         v.ripple = v.ripple.map((group) => group.map(withBox));
         v.coastFine = v.coastFine.map(withBox);
         v.lakeFine = v.lakeFine.map(withBox);
+        v.iceFine = (v.iceFine || []).map(withBox);
         v.rippleFine = v.rippleFine.map((group) => group.map(withBox));
         S.vec = v;
         S.vecWorldId = wid;
@@ -1127,13 +1173,12 @@
    */
   function drawVectorsCached() {
     if (!S.vec || (S.style !== 'fantasy' && S.style !== 'white') || !S.baseImg) { S.vecCache = null; return; }
-    const { k, oxAbs } = S.draw;
+    const { k, oxAbs, P, H } = S.draw;
     const oyAbs = S.draw.oy;
-    // 拖动 / 缩放进行中不画矢量层:软件画布贴 6MP 位图比直接描线还慢,等停手再贴
-    if (performance.now() - lastInputAt < 200) return;
+    // 拖动 / 缩放进行中也要有墨线:主线程直接描线只要几毫秒,
+    // 比"贴一张没盖住新视口的旧缓存"更稳(否则新露出的区域会整块没有海岸线)。
     if (vecWorkerBroken) {
       // Worker 起不来:主线程直接描线(比每帧贴 6MP 位图便宜),不建缓存
-      const { P, H } = S.draw;
       const rects = visibleRectsFor(k, P, H, oxAbs, oyAbs, S.cw, S.ch);
       drawVectorsIntoShared(ctx, { vec: S.vec, rects, k, P, H, mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, style: S.style, relK: S.view.k, tileFull: S.tileFull, tileCover: S.tileCover });
       S.vecCache = null;
@@ -1155,17 +1200,62 @@
         && s >= 0.82 && s <= 1.22
         && dx <= mx && dy <= my && right >= S.cw - mx && bottom >= S.ch - my;
     }
-    if (!reuse) c = buildVecCache();
-    if (!c) return;
+    if (!reuse) {
+      // 缓存没盖住当前视口(或根本没有):先同步补这一帧,再在后台重烘下一张。
+      const rects = visibleRectsFor(k, P, H, oxAbs, oyAbs, S.cw, S.ch);
+      drawVectorsIntoShared(ctx, { vec: S.vec, rects, k, P, H, mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, style: S.style, relK: S.view.k, tileFull: S.tileFull, tileCover: S.tileCover });
+      if (performance.now() - lastInputAt >= 200) buildVecCache();
+      return;
+    }
     const s = k / c.k;
     const dx = oxAbs + s * (c.x0 - c.ox);
     const dy = oyAbs + s * (c.y0 - c.oy);
     ctx.drawImage(c.canvas, dx, dy, c.w * s, c.h * s);
   }
 
-
   function updateZoomLabel() {
     if (el.zoomVal) el.zoomVal.textContent = `${Math.round(S.view.k * 100)}%`;
+  }
+
+  /**
+   * 国界:主站 borderLines 已经平滑好的折线(坐标 = 主图像素),按屏幕固定线宽画。
+   * 只叠在手绘风上(white / classic 等不画,和主站 civ 层一致);跨 180° 的线在另一侧再画一份。
+   */
+  function drawOwnerBorders(rects) {
+    const lines = S.ownerBorders;
+    if (!lines || !lines.length || S.style !== 'fantasy') return;
+    if (!S.draw || !S.mapW || !S.mapH) return;
+    const sx = S.draw.P / S.mapW;
+    const sy = S.draw.H / S.mapH;
+    const drawPass = (strokeStyle, lineWidth, dash) => {
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = lineWidth;
+      ctx.setLineDash(dash);
+      for (const r of rects) {
+        ctx.save();
+        if (r.odd) {
+          ctx.translate(0, 2 * r.yTop + S.draw.H);
+          ctx.scale(1, -1);
+        }
+        for (const b of lines) {
+          const p = b.p;
+          const shifts = b.x1 > S.mapW ? [0, -S.mapW] : b.x0 < 0 ? [0, S.mapW] : [0];
+          for (const sh of shifts) {
+            ctx.beginPath();
+            ctx.moveTo(r.x + (p[0] + sh) * sx, r.yTop + p[1] * sy);
+            for (let i = 2; i + 1 < p.length; i += 2) ctx.lineTo(r.x + (p[i] + sh) * sx, r.yTop + p[i + 1] * sy);
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+      }
+    };
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    // 第一遍奶白底线压住底图纹理,第二遍墨色虚线(屏幕像素,放大多少倍都不变粗)
+    drawPass('rgba(246,236,210,0.6)', 3.2, []);
+    drawPass('rgba(58,32,20,0.85)', 2, [5, 3]);
+    ctx.setLineDash([]);
   }
 
   function drawLabels(c, ox, oy, k, odd, H) {
@@ -1443,6 +1533,7 @@
       S.colors = d.colors || {};
       S.mapW = d.width || S.mapW;
       S.mapH = d.height || S.mapH;
+      S.ownerBorders = (d.borders || []).map(withBox);
       S.ownersImg = await loadImage(`data:image/png;base64,${d.png}`);
       draw();
     } catch (e) {
@@ -2203,6 +2294,39 @@
    * 操作流程
    * ------------------------------------------------------------------ */
 
+  // 预渲染:建完世界先让服务端把 S=2/4/8 的瓦片全部算好落盘,再进地图。
+  // 这样拖动 / 缩放不用再等瓦片,河流在所有倍率下也共用同一份几何。
+  async function prewarmWorld(worldId, style) {
+    const box = document.getElementById('prewarm');
+    if (!box || !worldId) return;
+    const fill = document.getElementById('prewarmFill');
+    const text = document.getElementById('prewarmText');
+    box.hidden = false;
+    if (fill) fill.style.width = '0%';
+    if (text) text.textContent = '准备中…';
+    try {
+      const q = `worldId=${encodeURIComponent(worldId)}&style=${encodeURIComponent(style)}`;
+      let st = await (await fetch(`/api/map/prewarm?${q}`, { method: 'POST' })).json();
+      const t0 = performance.now();
+      while (st.state === 'running') {
+        const pct = st.total ? Math.round((st.done / st.total) * 100) : 0;
+        const elapsed = (performance.now() - t0) / 1000;
+        const eta = st.done > 8 ? Math.max(1, Math.round((elapsed / st.done) * (st.total - st.done))) : null;
+        if (fill) fill.style.width = `${pct}%`;
+        if (text) text.textContent = `${pct}% · ${st.done}/${st.total} 块${eta ? ` · 约 ${eta} 秒` : ''}`;
+        await new Promise((r) => setTimeout(r, 500));
+        st = await (await fetch(`/api/map/prewarm?${q}`)).json();
+      }
+      if (fill) fill.style.width = '100%';
+      if (text) text.textContent = st.state === 'done' ? '渲染完成' : '部分瓦片渲染失败，仍可进入';
+      await new Promise((r) => setTimeout(r, 260));
+    } catch (e) {
+      if (text) text.textContent = '预渲染失败，直接进入';
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    box.hidden = true;
+  }
+
   async function createWorld() {
     try {
       setBusy(true, '正在生成世界…', '同样的种子 + 同样的地块数,每次都会得到同一个世界');
@@ -2215,6 +2339,7 @@
       S.plan = null;
       if (el.reviewPanel) el.reviewPanel.hidden = true;
       S.ownersImg = null;
+      S.ownerBorders = null;
       S.grid = null;
       S.sel = null;
       S.baseImg = null;
@@ -2235,6 +2360,7 @@
       el.polityDetail.innerHTML = '<div class="side-empty">世界建好了,点「开始会话」让 AI 君主接管。</div>';
       setStatus(`${d.worldId} · ${fmtInt(d.cells)} 地块 · 生成 ${d.generatedMs} ms`);
       setHint(`世界 ${d.worldId} 已生成(${fmtInt(d.cells)} 地块)。下一步:设置起始年,点「开始会话」。`);
+      await prewarmWorld(d.worldId, S.style);
       await loadBaseMap();
       if (S.baseImg) el.mapEmpty.classList.add('hidden');
       if (el.mapTitle) el.mapTitle.textContent = '世界已就绪';

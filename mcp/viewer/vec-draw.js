@@ -58,6 +58,297 @@
     }
   }
 
+  /* ---------- 林块矢量层 ----------
+   * 照搬主站 src/render/fantasy.ts 的 forestTiles(非投影、平面那条路径):
+   * 每个有林的地块画一个圆 —— 林块边界上的圆小、中心随机(拼成扇贝边),内部的圆大(连成一片);
+   * 团块里再画树冠(阔叶 / 雨林是圆 + 顶上一道墨弧,针叶是小尖角),外加东南侧树影和斜排线。
+   * 墨线、排线、阴影都是屏幕尺度,树冠数量随放大逐级增加(和主站 GLYPH_TIERS 同一套门槛),
+   * 所以必须浏览器端现画;服务端只给扁平数组 [x,y,kind,flags,i,…] + 间距 + 随机种子。
+   * 这里所有几何都按"世界单位"建进 Path2D,再由每个副本的 ctx 变换缩放到屏幕(和主站逐像素等价)。
+   */
+  const FOREST_TIERS = [1, 2, 3.5, 6];   // 主站 GLYPH_TIERS
+  const FOREST_CANOPY = { 1: 'rgb(150,165,108)', 2: 'rgb(118,140,104)', 3: 'rgb(118,145,90)' };
+  const FOREST_INK = 'rgba(58,45,34,';
+
+  /** 主站 src/gen/noise.ts 的 hash2(树冠随机数,必须逐位一致) */
+  function hash2(x, y, s) {
+    let h = (x * 374761393 + y * 668265263 + s * 982451653) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  }
+
+  function addCirclePath(p, cx, cy, R) {
+    p.moveTo(cx + R, cy);
+    p.arc(cx, cy, R, 0, Math.PI * 2);
+  }
+
+  /** 针叶林的扇贝边:上尖下圆的小树顶(主站 addPineTop) */
+  function addPineTopPath(p, cx, cy, R) {
+    p.moveTo(cx, cy - R * 1.55);
+    p.quadraticCurveTo(cx + R * 0.35, cy - R * 0.45, cx + R, cy + R * 0.3);
+    p.quadraticCurveTo(cx, cy + R * 1.15, cx - R, cy + R * 0.3);
+    p.quadraticCurveTo(cx - R * 0.35, cy - R * 0.45, cx, cy - R * 1.55);
+    p.closePath();
+  }
+
+  /** 针叶树冠的小尖角(closed = 封闭三角形,否则只画 ∧ 两笔;主站 addChevron) */
+  function addChevronPath(p, cx, cy, r, closed) {
+    p.moveTo(cx - r * 0.75, cy + r * 0.35);
+    p.lineTo(cx, cy - r * 0.95);
+    p.lineTo(cx + r * 0.75, cy + r * 0.35);
+    if (closed) p.closePath();
+  }
+
+  /**
+   * 把范围内(或整张图)的林块几何拼成每种林一组 4 条路径:
+   * shape = 圆 / 尖顶, crowns = 树冠墨弧, crownShade / crownFill = 树冠的阴影与填色。
+   * bounds = {x0,y0,x1,y1} 时只拼这些地块(已经加过林块半径余量),null = 整张图。
+   */
+  function buildForestPaths(vec, spacing, seed, gs, crownsPer, bounds) {
+    const data = vec.forest || [];
+    const out = { 1: null, 2: null, 3: null };
+    for (let n = 0; n + 4 < data.length; n += 5) {
+      const x = data[n], y = data[n + 1], kind = data[n + 2], flags = data[n + 3], i = data[n + 4];
+      if (bounds && (x < bounds.x0 || x > bounds.x1 || y < bounds.y0 || y > bounds.y1)) continue;
+      let g = out[kind];
+      if (!g) {
+        out[kind] = g = { shape: new Path2D(), crowns: new Path2D(), crownShade: new Path2D(), crownFill: new Path2D() };
+      }
+      const pointy = kind === 2;
+      const h1 = hash2(i, 1, seed);
+      if (flags & 1) {
+        // 林块边界:小圆 + 随机中心,扇贝边;临水的再缩一圈,海岸看着更瘦
+        let R = spacing * (0.62 + 0.32 * h1);
+        if (flags & 2) R *= 0.62;
+        const cx = x + (hash2(i, 2, seed) - 0.5) * spacing * 0.6;
+        const cy = y + (hash2(i, 3, seed) - 0.5) * spacing * 0.6;
+        if (pointy) addPineTopPath(g.shape, cx, cy, R);
+        else addCirclePath(g.shape, cx, cy, R);
+        continue;
+      }
+      // 内部地块:一个大圆保证连成一片,再往上叠树冠
+      addCirclePath(g.shape, x, y, spacing * 1.35);
+      for (let c = 0; c < crownsPer; c++) {
+        if (c === 0 && hash2(i, 4, seed) >= (kind === 3 ? 0.72 : 0.6)) continue;
+        const jx = c === 0 ? hash2(i, 2, seed) : hash2(i, 10 + c * 2, seed);
+        const jy = c === 0 ? hash2(i, 3, seed) : hash2(i, 11 + c * 2, seed);
+        const spread = c === 0 ? 0.6 : 1.05;
+        const tx = x + (jx - 0.5) * spacing * spread;
+        const ty = y + (jy - 0.5) * spacing * spread;
+        const rr = spacing * (0.3 + 0.14 * (c === 0 ? h1 : hash2(i, 20 + c, seed))) * gs;
+        const off = rr * 0.32;
+        if (pointy) {
+          addChevronPath(g.crownShade, tx + off, ty + off, rr, true);
+          addChevronPath(g.crownFill, tx, ty, rr, true);
+          addChevronPath(g.crowns, tx, ty, rr, false);
+        } else {
+          addCirclePath(g.crownShade, tx + off, ty + off, rr);
+          addCirclePath(g.crownFill, tx, ty, rr);
+          g.crowns.moveTo(tx - rr, ty);
+          g.crowns.arc(tx, ty, rr, Math.PI, Math.PI * 2);
+        }
+      }
+    }
+    return out;
+  }
+
+  /** 默认视图(relK ≤ 1.35)整张图的林块几何不变:缓存一份,平移 / 缩放时不再重拼 */
+  let forestFitCache = null;
+  function forestFitPaths(vec, spacing, seed) {
+    if (forestFitCache && forestFitCache.vec === vec) return forestFitCache.paths;
+    const paths = buildForestPaths(vec, spacing, seed, 1, 1, null);
+    forestFitCache = { vec: vec, paths: paths };
+    return paths;
+  }
+
+  /**
+   * 画一个副本里的林块(在湖 / 海岸墨线之后、河流之前 —— 和主站 detail.ts 的层级顺序一致)。
+   * 主站 forestTiles 的坐标是屏幕像素;这里几何按世界单位建好,靠 ctx 变换缩放,数值完全对应。
+   */
+  function drawForestInRect(g, vec, r, sx, sy, H, relK, cw, ch, W) {
+    const data = vec.forest;
+    const spacing = vec.forestSpacing || 0;
+    if (!data || !data.length || !spacing || !W) return;
+    const seed = vec.forestSeed || 0;
+    const gs = relK <= 1.35 ? 1 : Math.pow(relK / 1.35, -0.22);
+    let crownsPer = 1;
+    for (let t = 1; t < FOREST_TIERS.length; t++) if (relK >= FOREST_TIERS[t] * 0.95) crownsPer++;
+    const lw = 0.55 * gs;                              // 墨线 / 排线宽(世界单位)
+    const shadeD = spacing * 0.42 * gs;                // 东南侧树影的偏移
+    const reach = spacing * 1.8 + shadeD + lw + 2 / sx; // 一个林块最远画到中心外多远
+    // 本副本可见的世界范围(加余量):只跳过确实画不到的,不裁 —— 跨接缝 / 跨极的另一半由相邻副本补上
+    const wx0 = (0 - r.x) / sx;
+    const wx1 = (cw - r.x) / sx;
+    const wyA = r.odd ? (r.yTop + H - ch) / sy : (0 - r.yTop) / sy;
+    const wyB = r.odd ? (r.yTop + H) / sy : (ch - r.yTop) / sy;
+    const wy0 = Math.min(wyA, wyB);
+    const wy1 = Math.max(wyA, wyB);
+    const paths = relK <= 1.35
+      ? forestFitPaths(vec, spacing, seed)
+      : buildForestPaths(vec, spacing, seed, gs, crownsPer, { x0: wx0 - reach, y0: wy0 - reach, x1: wx1 + reach, y1: wy1 + reach });
+    if (!paths[1] && !paths[2] && !paths[3]) return;
+    // 排线间距微调到"一整圈正好整数条",左右接缝处排线对得上(和主站同一算法)
+    const hatchGap = W / Math.max(1, Math.round(W / (1.7 * gs)));
+    g.save();
+    g.translate(r.x, r.odd ? r.yTop + H : r.yTop);
+    g.scale(sx, r.odd ? -sy : sy);
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    for (const kind of [1, 3, 2]) {
+      const p = paths[kind];
+      if (!p) continue;
+      const canopy = FOREST_CANOPY[kind];
+      // 1. 轮廓:先描一道粗墨线,再用树冠色填满 → 只剩外圈扇贝边
+      g.strokeStyle = FOREST_INK + '0.85)';
+      g.lineWidth = lw * 2;
+      g.stroke(p.shape);
+      g.fillStyle = canopy;
+      g.fill(p.shape);
+      // 2. 东南侧阴影 + 斜排线:只在林块内部(裁剪到 shape)
+      g.save();
+      g.clip(p.shape);
+      g.fillStyle = FOREST_INK + '0.10)';
+      g.fillRect(wx0 - 2, wy0 - 2, wx1 - wx0 + 4, wy1 - wy0 + 4);
+      g.beginPath();
+      const qStart = Math.ceil((wx0 + wy0) / hatchGap);
+      const qEnd = (wx1 + wy1) / hatchGap;
+      for (let q = qStart; q < qEnd; q++) {
+        const c = q * hatchGap;
+        const ax = Math.max(wx0 - 2, c - wy1 - 2);
+        const bx = Math.min(wx1 + 2, c - wy0 + 2);
+        if (ax >= bx) continue;
+        g.moveTo(ax, c - ax);
+        g.lineTo(bx, c - bx);
+      }
+      g.strokeStyle = FOREST_INK + '0.42)';
+      g.lineWidth = 0.55 * gs;
+      g.stroke();
+      // 往西北平移后再填一遍树冠色 → 只有东南边那一圈还是暗的
+      g.translate(-shadeD, -shadeD);
+      g.fillStyle = canopy;
+      g.fill(p.shape);
+      g.restore();
+      // 3. 树冠:阴影 → 填色 → 墨弧
+      g.fillStyle = FOREST_INK + '0.22)';
+      g.fill(p.crownShade);
+      g.fillStyle = canopy;
+      g.fill(p.crownFill);
+      g.strokeStyle = FOREST_INK + '0.6)';
+      g.lineWidth = 0.55 * gs;
+      g.stroke(p.crowns);
+    }
+    g.restore();
+  }
+
+  /* ---------- 河流矢量层 ----------
+   * 照搬主站 render/common.ts 的 drawRivers(普通、非投影路径)与 fantasy.ts 的 fantasyRiverStyle:
+   * 河流是 [x,y,flux,…] 的三元组折线,屏幕上每段单独 stroke,线宽由该段 flux 和当前缩放现算,
+   * 所以放大时线宽会变、走线不变 —— 这正是"河流不能烘进位图、必须浏览器端矢量重绘"的原因。
+   */
+
+  /** 把 x 折回离 ref 最近的一圈(主站 gen/util.ts 的 nearX) */
+  function nearX(x, ref, W) { return W ? x - W * Math.round((x - ref) / W) : x; }
+
+  /** 河流分级:缩放越大画出来的河越多(主站 common.ts riverLod) */
+  function riverLod(k) { return Math.max(1, 4.5 * Math.pow(Math.max(1, k), -1.3)); }
+
+  /** 主站 fantasy.ts 的 fantasyRiverStyle(那边没 export,这里原样复制 6 行) */
+  function fantasyRiverStyle(k, threshold) {
+    const kk = Math.max(1, k);
+    return {
+      color: 'rgba(48,82,110,0.9)',
+      minW: 0.5,
+      maxW: 0.5 + 1.5 * Math.pow(kk, -0.2),
+      fluxRef: 900,
+      thin: Math.pow(kk, -0.6),
+      minFlux: threshold * riverLod(kk),
+    };
+  }
+
+  /** 线宽(世界单位):flux 只在一段范围内起作用(主站 common.ts riverWidth,power = 0.5) */
+  function riverWidthOf(style, threshold) {
+    const base = style.minW * (style.thin || 1);
+    const span = style.maxW - style.minW;
+    return function (f) {
+      return base + span * Math.min(1, Math.pow(Math.max(0, f - threshold) / style.fluxRef, 0.5));
+    };
+  }
+
+  /** 刚过阈值的河段再细一点(主站 common.ts lodTaper) */
+  function riverTaper(style, f) {
+    const m = style.minFlux;
+    if (!m) return 1;
+    const t = Math.min(1, Math.max(0, (f - m) / (0.8 * m)));
+    return 0.35 + 0.65 * t * t * (3 - 2 * t);
+  }
+
+  /**
+   * 河流几何:把每条河的 x 展开(跨 180 度处接着上一顶点延出去,折线才不会横穿整张图),
+   * 顺便算 bbox —— 和 strokeLines 一样用 bbox 判断要不要再画一份平移副本。
+   * 兼容两种结构:vec 原样的 {pts,cells},或 app.js 已套过 withBox 的 {p,…}。
+   */
+  function riverGeometry(rivers, W) {
+    const out = [];
+    for (const river of rivers || []) {
+      const raw = river && (river.pts || river.p);
+      if (!raw || raw.length < 6) continue;
+      const p = new Float64Array(raw.length);
+      for (let i = 0; i < raw.length; i++) p[i] = raw[i];
+      for (let i = 3; i < p.length; i += 3) p[i] = nearX(p[i], p[i - 3], W);
+      let x0 = Infinity, x1 = -Infinity;
+      for (let i = 0; i < p.length; i += 3) {
+        const x = p[i];
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+      }
+      out.push({ p: p, x0: x0, x1: x1 });
+    }
+    return out;
+  }
+
+  /**
+   * 在某个虚拟视口里画河流:每段一条独立路径(线宽逐段不同),moveTo / quadraticCurveTo / stroke
+   * 的顺序和主站 drawRivers 完全一致,只是把 (s, ox, oy) 换成本视口的 fx / fy。
+   * sx = 屏幕像素 / 整图像素(P / mapW),线宽最终 = 世界线宽 × sx。
+   */
+  function drawRiversInRect(g, geo, threshold, style, sx, fx, fy, cw, ch, W) {
+    const widthOf = riverWidthOf(style, threshold);
+    const minFlux = style.minFlux;
+    g.strokeStyle = style.color;
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    for (const river of geo) {
+      const p = river.p;
+      const m = p.length / 3;
+      if (m < 2) continue;
+      const shifts = river.x1 > W ? [0, -W] : river.x0 < 0 ? [0, W] : [0];
+      for (const sh of shifts) {
+        for (let i = 0; i < m - 1; i++) {
+          const f = p[i * 3 + 2];
+          if (f < minFlux) continue;
+          const x0 = fx(p[i * 3] + sh), y0 = fy(p[i * 3 + 1]);
+          const x1 = fx(p[(i + 1) * 3] + sh), y1 = fy(p[(i + 1) * 3 + 1]);
+          if (!Number.isFinite(x0 + y0 + x1 + y1)) continue;
+          const lw = widthOf(f) * riverTaper(style, f) * sx;
+          // pad 和主站一样按"线宽 + 两轴跨度"放宽,斜穿画布外的段不会被误裁
+          const pad = lw + Math.abs(x1 - x0) + Math.abs(y1 - y0);
+          if (x0 < -pad || y0 < -pad || x0 > cw + pad || y0 > ch + pad) continue;
+          g.lineWidth = lw;
+          g.beginPath();
+          if (i === 0 || p[(i - 1) * 3 + 2] < minFlux) {
+            g.moveTo(x0, y0);
+          } else {
+            g.moveTo((fx(p[(i - 1) * 3] + sh) + x0) / 2, (fy(p[(i - 1) * 3 + 1]) + y0) / 2);
+          }
+          if (i === m - 2) g.quadraticCurveTo(x0, y0, x1, y1);
+          else g.quadraticCurveTo(x0, y0, (x0 + x1) / 2, (y0 + y1) / 2);
+          g.stroke();
+        }
+      }
+    }
+  }
+
   /**
    * 把一个"虚拟视口"里的矢量层画进 g。
    * opts: { vec, rects, k, P, H, mapW, mapH, cw, ch, style, relK, tileFull, tileCover }
@@ -78,10 +369,16 @@
     const fine = relK >= 2.5;
     const coast = fine ? v.coastFine : v.coast;
     const lake = fine ? v.lakeFine : v.lake;
+    const ice = fine ? v.iceFine : v.ice;
     const ripples = fine ? v.rippleFine : v.ripple.slice(0, 2);
     const cw = opts.cw, ch = opts.ch;
     const tileFull = opts.tileFull;
     const tileCover = opts.tileCover || [];
+    // 河流:只算一次几何(展开 + bbox),各视口复用;白模不画。风格 k 用 relK(= S.view.k 缩放倍数),
+    // 和主站 fantasyRiverStyle(v.k, …) 同一个量(v.k 是缩放倍数,不是 P/mapW):放大 → 分级放宽、世界线宽变细、屏幕线宽再按 sx 放大。
+    const riverThreshold = v.riverThreshold || 0;
+    const riverStyle = white ? null : fantasyRiverStyle(relK, riverThreshold);
+    const riverGeo = white || !v.rivers || !v.rivers.length ? null : riverGeometry(v.rivers, W);
 
     for (const r of opts.rects) {
       const fx = (px) => r.x + px * sx;
@@ -116,6 +413,10 @@
       g.lineJoin = 'round';
       g.lineCap = 'butt';
       if (!white) strokeLines(ripples, inkSoft, 1);
+      // 冰缘:底图里的冰 / 海交界只有一条硬填色边,这里按主站 fantasyIceParts 的墨线补
+      // (主站 ICE_LW=1.5 / ICE_INK_A=0.62,屏幕上统一 1.15px 线宽、0.62 透明度)
+      if (ice && ice.length) strokeLines([ice], white ? 'rgba(70,72,76,0.62)' : 'rgba(58,45,34,0.62)', 1.15);
+
       if (!tileFull) {
         if (tileCover.length) {
           const cover = new Path2D();
@@ -126,6 +427,17 @@
         strokeLines([lake, coast], ink, 1.15);
       }
       g.restore();
+      // 林块:主站 detail.ts 的层级顺序是 海岸墨线 → 林块 → 河流 → 山符号,所以插在这里(河流之前)。
+      // 主站的林块从来不烘进底图,所以高清块(tileFull)里也照画;白模不画(和符号 / 河流一致)。
+      if (!white) drawForestInRect(g, v, r, sx, sy, H, relK, cw, ch, W);
+      // 河流画在湖 / 海岸墨线之后(与主站 detail.ts 的层级顺序一致:墨线 → 林块 → 河 → 山符号),
+      // 这样河口压在岸线墨线上而不是被墨线切断;tileCover 的裁剪已经结束,高清块里没烘河所以照画。
+      // 单独 save / restore:河流用 round cap,不能污染后面符号的笔状态。
+      if (riverGeo) {
+        g.save();
+        drawRiversInRect(g, riverGeo, riverThreshold, riverStyle, sx, fx, fy, cw, ch, W);
+        g.restore();
+      }
       if (white) continue;
       const gFill = new Path2D();
       const gLine = new Path2D();

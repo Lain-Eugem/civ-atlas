@@ -20,11 +20,15 @@ import {
   fantasyCoastLines,
   fantasyFullPixels,
   glyphScale,
+  iceLines,
+  inkRuns,
   planGlyphs,
   seaRippleLines,
   simplifyLine,
   type Glyph,
 } from '../src/render/fantasy';
+import { Biome } from '../src/gen/biomes';
+import { subSeed } from '../src/gen/util';
 import { macroGrids, realisticPixels, realisticWindowPixels, type MacroGrids } from '../src/render/realistic';
 import type { SurfaceLook } from '../src/render/surface';
 
@@ -65,6 +69,26 @@ export interface VectorData {
   rippleFine: number[][][];
   /** 山 / 丘陵 / 沙丘 / 草丛 / 沼泽符号:[x, y, kind, s, v, a, c, z] */
   glyphs: number[][];
+  /** 冰缘墨线(低倍率用的抽稀版),每条 [x0,y0,x1,y1,…] */
+  ice: number[][];
+  /** 冰缘墨线(放大后的精细版) */
+  iceFine: number[][];
+  /** 河流:pts = [x,y,flux,…] 三元组(和主站 drawRivers 同格式),cells = 河流经过的栅格序号 */
+  rivers: { pts: number[]; cells: number[] }[];
+  /** 河流分级阈值:flux 低于它的河段不画,和主站 world.riverThreshold 同义 */
+  riverThreshold: number;
+  /**
+   * 林块:扁平存 [x, y, kind, flags, i, …] 每个有林的地块一项。
+   * kind: 1 阔叶 / 2 针叶 / 3 雨林(和主站 fantasy.ts 的 F_BROAD / F_PINE / F_JUNGLE 同值);
+   * flags: 1 = 林块边界(有邻格不是同种林,画成扇贝边的小圆)、2 = 临水(圆会缩小);
+   * i = 地块序号,树冠的随机数按它现算(主站 forestTiles 的 hash2(i, …))。
+   * 树冠不烘进底图:前端照主站 render/fantasy.ts 的 forestTiles 现画,放大多少倍都保持矢量。
+   */
+  forest: number[];
+  /** 地块间距(世界单位)= world.mesh.spacing,林块几何按它铺 */
+  forestSpacing: number;
+  /** 树冠随机种子 = subSeed(seed, 'glyphs'),和主站 forestTiles 的 seed 同一个 */
+  forestSeed: number;
 }
 
 /** 每个世界只准备一次;WeakMap 保证世界被丢掉时这些大数组也能回收 */
@@ -78,6 +102,13 @@ function ctxOf(world: World): TerrainCtx {
   const ctx: TerrainCtx = { whole, src: zoomSource(world, whole), grids: macroGrids(whole), px: new Map(), fantasy: null, vectors: null };
   contexts.set(world, ctx);
   return ctx;
+}
+
+/**
+ * 整图 1 倍的栅格(海岸线、疆域归属、国界端点共用这一份:rasterize 一次要 852ms,别重复算)。
+ */
+export function worldRaster(world: World): Raster {
+  return ctxOf(world).whole;
 }
 
 /**
@@ -159,7 +190,20 @@ function wholePixels(world: World, ctx: TerrainCtx, style: TerrainStyle): Uint8C
   return px;
 }
 
-/** 生成矢量层:海岸线、近岸波纹、地形符号。全部抽稀过,总量不到 1 MB。 */
+/**
+ * 冰缘墨线:上游 fantasyFullPixels 在冰 / 海交界没有描边,只有一条硬色带。
+ * 取"群落 = 海冰"的像素(和 seaIceField 的 mask 同一判据),交给 iceLines 追线,
+ * 再用 inkRuns 拆成"只描冰 / 开阔海交界"的那几段。
+ */
+function iceInkRuns(r: Raster): Float32Array[] {
+  const mask = new Uint8Array(r.w * r.h);
+  for (let k = 0; k < mask.length; k++) if (r.biome[k] === Biome.SeaIce) mask[k] = 1;
+  const out: Float32Array[] = [];
+  for (const line of iceLines(r, mask)) for (const p of inkRuns(line, r.w)) out.push(p);
+  return out;
+}
+
+/** 生成矢量层:海岸线、近岸波纹、地形符号、冰缘墨线、河流、林块。墨线类都抽稀过,总量约 1 MB 级。 */
 export function renderVectors(world: World): VectorData {
   const ctx = ctxOf(world);
   if (ctx.vectors) return ctx.vectors;
@@ -170,7 +214,30 @@ export function renderVectors(world: World): VectorData {
   const flat = (arr: Float32Array[], tol: number): number[][] =>
     arr.map((p) => Array.from(simplifyLine(p, tol)));
   const groups = seaRippleLines(ctx.whole, fp.sea.dist, fp.sea.fade);
-  const glyphs: Glyph[] = planGlyphs(world).glyphs;
+  // planGlyphs 一次算出两样:地形符号和林块(主站 render/fantasy.ts 的 Plan),这里都复用
+  const plan = planGlyphs(world);
+  const glyphs: Glyph[] = plan.glyphs;
+  // 林块:每格是什么林(0 = 无 / 1 阔叶 / 2 针叶 / 3 雨林)主站已经按生物群系 + 低频噪声算好了,
+  // 这里只补两个标记 —— 林块边界(有邻格不是同种林 → 画成扇贝边)和临水(圆更小)。
+  // 前端只有一张扁平表,没有邻接关系,所以这两样必须在这算;树冠的随机数仍按地块序号 i 现算。
+  const mesh = world.mesh;
+  const forestKind = plan.forest;
+  const forest: number[] = [];
+  for (let i = 0; i < mesh.n; i++) {
+    const kind = forestKind[i];
+    if (!kind) continue;
+    let flags = 0;
+    for (let e = mesh.adjStart[i], e1 = mesh.adjStart[i + 1]; e < e1; e++) {
+      const j = mesh.adj[e];
+      if (forestKind[j] !== kind) flags |= 1;
+      if (world.water[j] !== 0) flags |= 2;
+      if (flags === 3) break;
+    }
+    // 坐标取到 0.01 世界单位:659% 时这不到 0.06 屏幕像素,肉眼无差;JSON 却能省一截
+    forest.push(Math.round(mesh.x[i] * 100) / 100, Math.round(mesh.y[i] * 100) / 100, kind, flags, i);
+  }
+  // 冰缘墨线:只追一次线,再抽稀成粗 / 细两份给不同倍率用
+  const iceRuns = iceInkRuns(ctx.whole);
   // 低倍率用抽稀版(线少、画得快),放大后换精细版 —— 否则 1 整图像素 = 十几屏幕像素,
   // 抽稀留下的折角会变成明显的多边形,就不像矢量线了
   ctx.vectors = {
@@ -181,6 +248,14 @@ export function renderVectors(world: World): VectorData {
     lakeFine: flat(lines.lake, 0.12),
     rippleFine: groups.map((group) => flat(group, 0.25)),
     glyphs: glyphs.map((g) => [g.x, g.y, g.kind, g.s, g.v, g.a, g.c, g.z]),
+    ice: flat(iceRuns, 0.9),
+    iceFine: flat(iceRuns, 0.12),
+    // 河流不抽稀:总共才一千多个顶点,而走线必须和主站一模一样(线宽由前端按 zoom 现算)
+    rivers: world.rivers.map((r) => ({ pts: Array.from(r.pts), cells: Array.from(r.cells) })),
+    riverThreshold: world.riverThreshold,
+    forest,
+    forestSpacing: mesh.spacing,
+    forestSeed: subSeed(world.params.seed, 'glyphs'),
   };
   return ctx.vectors;
 }
