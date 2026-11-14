@@ -56,6 +56,13 @@ export interface CustomStartInput {
   at?: { x: number; y: number };
   /** 目标州数,clamp 3..40;省略时用 8(新建)或保持当前州数(现有国) */
   size?: number;
+  /**
+   * 精确州号数组(连续点选的结果),优先于 size / at:
+   * - 已有国:把这个国家的疆域正好设成这些州(原来的其余州变无主,被拿州的原主可能灭亡)
+   * - 新建国:拿这些州建国(可以同时含无主州和别国的州;不强制连通,允许飞地)
+   * 给了 regionIds 就忽略 size 与 at。
+   */
+  regionIds?: number[];
   /** 角色卡字段:{ name?, persona?, traits?, preferences?, competence? } */
   card?: Record<string, unknown>;
   /** true = 不读 card,按引擎的 monarchCard 自动生成(新国用随机人名占位) */
@@ -129,6 +136,8 @@ export function applyCustomStart(s: Session, input: CustomStartInput = {}): Cust
   if (input.at && (typeof input.at.x !== 'number' || !Number.isFinite(input.at.x) || typeof input.at.y !== 'number' || !Number.isFinite(input.at.y))) {
     throw new Error('at 需要 { x, y } 两个有限数字(世界像素坐标)');
   }
+  // 连续点选的结果:先严格校验,全部合法才开始改,避免半途抛错留下脏状态。
+  const regionIds = readRegionIds(s, input.regionIds);
 
   const warnings: string[] = [];
   const prev = s.customStart;
@@ -154,19 +163,38 @@ export function applyCustomStart(s: Session, input: CustomStartInput = {}): Cust
     polityId = wantId;
     if (typeof input.at === 'object' && input.at) warnings.push('给了 polityId,忽略 at(位置只用于新建国家)');
   } else {
-    polityId = createNewNation(s, input, year, warnings);
+    polityId = regionIds ? createNationFromRegions(s, regionIds, year, warnings) : createNewNation(s, input, year, warnings);
     created = true;
   }
 
-  // 目标州数:新国在 createNewNation 里已经按 size 扩好;这里处理已有国 / 重设尺寸。
-  const sizes = sizesNow(s.civ);
-  const current = sizes.get(polityId) ?? 0;
-  const requestSize = typeof input.size === 'number' && Number.isFinite(input.size)
-    ? clampSize(input.size)
-    : undefined;
-  if (requestSize !== undefined && requestSize !== current) {
-    if (requestSize > current) growTerritory(s, polityId, requestSize, sizes, warnings);
-    else shrinkTerritory(s, polityId, requestSize, year, warnings);
+  if (regionIds) {
+    // 连续点选:regionIds 优先于 size / at,按所选州精确设置疆域。
+    if (typeof input.size === 'number') warnings.push('给了 regionIds,忽略 size(按所选州精确设置)');
+    if (input.at) warnings.push('给了 regionIds,忽略 at(落点只用于按大小扩地)');
+    if (!created) {
+      const before = sizesNow(s.civ).get(polityId) ?? 0;
+      const ctx = customStartCtx(year, warnings);
+      installRegions(s, polityId, regionIds, year, ctx);
+      const target = s.civ.polities[polityId];
+      if (target) {
+        const capRegion = capitalRegionOf(s.civ, target, year);
+        // 首都州没被选中:沿用现有规则从剩下的州里随机迁都(capitals 追加一条)
+        if (!regionIds.includes(capRegion)) migrateCapital(s, polityId, ctx);
+        const after = sizesNow(s.civ).get(polityId) ?? 0;
+        warnings.push(`按所选州设置疆域:现在 ${after} 州(原 ${before} 州)`);
+      }
+    }
+  } else {
+    // 目标州数:新国在 createNewNation 里已经按 size 扩好;这里处理已有国 / 重设尺寸。
+    const sizes = sizesNow(s.civ);
+    const current = sizes.get(polityId) ?? 0;
+    const requestSize = typeof input.size === 'number' && Number.isFinite(input.size)
+      ? clampSize(input.size)
+      : undefined;
+    if (requestSize !== undefined && requestSize !== current) {
+      if (requestSize > current) growTerritory(s, polityId, requestSize, sizes, warnings);
+      else shrinkTerritory(s, polityId, requestSize, year, warnings);
+    }
   }
 
   // 改完 civ 换一个对象:edits.ts 的 polityKey 按 civ 对象缓存(WeakMap),不换对象新 id 的键是 undefined。
@@ -253,7 +281,24 @@ function createNewNation(s: Session, input: CustomStartInput, year: number, warn
   growTerritory(s, newId, target, sizes, warnings);
   const cap = pickCapital(s, newId, seedRegion, year, sizes, warnings);
 
+  finishNewPolity(s, newId, cap, year, warnings);
+  return newId;
+}
+
+/**
+ * 新国家的收尾:定民族 → 借最大国家的族群特征 / 颜色 → 推入 civ.polities → 预生成国名。
+ * createNewNation(按 size 扩地)与 createNationFromRegions(按连续点选的州)共用。
+ */
+function finishNewPolity(
+  s: Session,
+  newId: number,
+  cap: { settlement: number; region: number },
+  year: number,
+  warnings: string[],
+): void {
+  const civ = s.civ;
   let culture = pickCulture(civ, newId);
+  const sizes = sizesNow(civ);
   const alive = alivePolities(civ, year, sizes);
   const biggest = alive[0] ?? null;
   if (culture < 0) {
@@ -293,7 +338,128 @@ function createNewNation(s: Session, input: CustomStartInput, year: number, warn
   }
   if (!p.name) warnings.push('没能预生成国名:第一回合结算后会由引擎起名');
   warnings.push(`国名/颜色在第一回合结算时会被引擎按全图规则重算(预览可能与结算后略有出入),州数与角色卡不受影响`);
+}
+
+/**
+ * 按"连续点选"的州号数组新建国家:拿这些州(允许同时是无主州和别国的州),
+ * 选中的州里没有城时把最近一座城连州一起拿来定都;被拿空的国家走 endNation 收尾。
+ */
+function createNationFromRegions(s: Session, regionIds: number[], year: number, warnings: string[]): number {
+  const civ = s.civ;
+  const newId = civ.polities.length;
+  const ctx = customStartCtx(year, warnings);
+  const ids = [...regionIds];
+
+  // 先确认定都方案(全在内存副本上,不动 civ)
+  let capSettlement = pickSettlementInRegions(civ, ids, ids[0]!);
+  if (capSettlement < 0) {
+    const seedCell = civ.regions.seat[ids[0]!];
+    let nearest = -1;
+    let nearestD = Number.POSITIVE_INFINITY;
+    for (const st of civ.settlements) {
+      if (st.cell < 0) continue;
+      const d = pointDistance(s, seedCell, st.cell);
+      if (d < nearestD) {
+        nearestD = d;
+        nearest = st.id;
+      }
+    }
+    if (nearest < 0) throw new Error('这个年份地图上还没有城,无法新建国家');
+    const st = civ.settlements[nearest]!;
+    if (st.region < 0) throw new Error('找到的城没有所属州,无法新建国家');
+    if (!ids.includes(st.region)) ids.push(st.region);
+    capSettlement = nearest;
+    warnings.push('所选州里没有城:把最近的一座城连同它的州一起拿来当国都');
+  }
+
+  // 拿地:被拿空的国家整国灭亡(清战争 / 条约 / 角色卡 / 控制方式等)
+  const sizes = sizesNow(civ);
+  const stolen = new Map<number, number>();
+  for (const r of ids) {
+    const owner = civ.polity[r];
+    if (owner >= 0) {
+      stolen.set(owner, (stolen.get(owner) ?? 0) + 1);
+      sizes.set(owner, (sizes.get(owner) ?? 1) - 1);
+      if ((sizes.get(owner) ?? 0) <= 0) endNation(s, owner, ctx, 'remove');
+    }
+    civ.polity[r] = newId;
+    sizes.set(newId, (sizes.get(newId) ?? 0) + 1);
+  }
+  for (const [owner, n] of stolen) {
+    const p = civ.polities[owner];
+    if (p) warnings.push(`从「${polityName(p, year)}」手里接管 ${n} 州`);
+  }
+  const capRegion = civ.settlements[capSettlement]!.region;
+  finishNewPolity(s, newId, { settlement: capSettlement, region: capRegion }, year, warnings);
+  warnings.push(`新国家按所选 ${ids.length} 个州建立`);
   return newId;
+}
+
+/** 开局定制用的最小 SetupContext:只为复用 endNation / migrateCapital 的收尾逻辑 */
+function customStartCtx(year: number, warnings: string[]): SetupContext {
+  return {
+    year,
+    force: false,
+    warnings,
+    removed: [],
+    added: [],
+    resized: [],
+    movedCapitals: [],
+    warsEnded: [],
+    treatiesEnded: [],
+    needConfirm: [],
+  };
+}
+
+/** 已有国按所选州精确设置疆域:原国其余州变无主,被拿州的原主可能灭亡(走 endNation) */
+function installRegions(s: Session, polityId: number, regionIds: number[], year: number, ctx: SetupContext): void {
+  const civ = s.civ;
+  const want = new Set(regionIds);
+  const sizes = sizesNow(civ);
+  let released = 0;
+  for (const r of ownRegions(civ, polityId)) {
+    if (want.has(r)) continue;
+    civ.polity[r] = -1;
+    sizes.set(polityId, (sizes.get(polityId) ?? 1) - 1);
+    released++;
+  }
+  const stolen = new Map<number, number>();
+  let taken = 0;
+  for (const r of regionIds) {
+    if (civ.polity[r] === polityId) continue;
+    const owner = civ.polity[r];
+    if (owner >= 0) {
+      stolen.set(owner, (stolen.get(owner) ?? 0) + 1);
+      sizes.set(owner, (sizes.get(owner) ?? 1) - 1);
+      if ((sizes.get(owner) ?? 0) <= 0) endNation(s, owner, ctx, 'remove');
+    }
+    civ.polity[r] = polityId;
+    sizes.set(polityId, (sizes.get(polityId) ?? 0) + 1);
+    taken++;
+  }
+  if (released) ctx.warnings.push(`按所选州设置:放掉 ${released} 州(变无主)`);
+  for (const [owner, n] of stolen) {
+    const p = civ.polities[owner];
+    if (p) ctx.warnings.push(`从「${polityName(p, year)}」手里接管 ${n} 州`);
+  }
+  if (taken) ctx.warnings.push(`按所选州设置:接管 ${taken} 州`);
+}
+
+/** 校验 regionIds(严格整数州号,去重,范围内,非空);没给返回 null */
+function readRegionIds(s: Session, raw: unknown): number[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) throw new Error('regionIds 要是州号数组');
+  const out: number[] = [];
+  for (const v of raw) {
+    const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : Number.NaN;
+    if (!Number.isInteger(n)) throw new Error(`regionIds 里 ${JSON.stringify(v)} 不是整数州号`);
+    if (n < 0 || n >= s.civ.regions.count) {
+      throw new Error(`regionIds 里州 ${n} 越界(这个世界共 ${s.civ.regions.count} 个州)`);
+    }
+    if (!out.includes(n)) out.push(n);
+  }
+  if (!out.length) throw new Error('regionIds 不能是空数组(至少要选一个州)');
+  return out;
 }
 
 /** 种子州:给了 at 取最近陆上州;没给回退到最大的无主州;落点属于小国时尽量改到附近无主州。 */
@@ -721,8 +887,10 @@ export interface StartNationSpec {
   polityId?: number;
   /** 新建时的落点(世界像素坐标,与地图点选回调同一坐标系) */
   at?: { x: number; y: number };
-  /** 目标州数:新建默认 6,现有国省略 = 不调 */
+  /** 目标州数:新建默认 6,现有国省略 = 不调;给了 regionIds 时忽略 */
   size?: number;
+  /** 精确州号数组(优先于 size / at):新建=拿这些州建国,现有国=正好设成这些州 */
+  regionIds?: number[];
   /** 角色卡字段(与 applyCustomStart 的 card 同义) */
   card?: Record<string, unknown>;
   /** true = 不读 card,按引擎的 monarchCard 自动生成 */
@@ -859,7 +1027,7 @@ export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSet
   /* ---- 1. 解析 + 预校验(全部通过才开始改,避免半途抛错留下脏状态) ---- */
   const removeIds = readIdList(setup.remove, 'remove');
   const removeRegions = readRegionList(setup.removeRegions, s.civ.regions.count);
-  const specs = readNations(setup.nations);
+  const specs = readNations(setup.nations, s.civ.regions.count);
   const controls = readControls(setup.controls);
   const targetCount = setup.count === undefined || setup.count === null ? null : readCount(setup.count);
   const sizes0 = sizesNow(s.civ);
@@ -921,26 +1089,41 @@ export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSet
     removeOneRegion(s, r, ctx, false);
   }
 
-  /* ---- 3. nations:新建 / 调州数 ---- */
+  /* ---- 3. nations:新建 / 调州数 / 按所选州精确设置 ---- */
   for (const spec of specs) {
     let id: number;
     if (spec.polityId !== undefined) {
       id = spec.polityId;
-      const current = sizesNow(s.civ).get(id) ?? 0;
-      const want = spec.size === undefined ? undefined : clampSize(spec.size);
-      if (want !== undefined && want !== current) {
-        const sizes = sizesNow(s.civ);
-        if (want > current) growTerritory(s, id, want, sizes, ctx.warnings);
-        else shrinkTerritory(s, id, want, year, ctx.warnings);
-        const after = sizesNow(s.civ).get(id) ?? 0;
-        if (after !== current) {
-          const p = s.civ.polities[id]!;
+      if (spec.regionIds) {
+        if (spec.size !== undefined) ctx.warnings.push(`nations:P${id} 给了 regionIds,忽略 size`);
+        installRegions(s, id, spec.regionIds, year, ctx);
+        const p = s.civ.polities[id];
+        if (p) {
+          const capRegion = capitalRegionOf(s.civ, p, year);
+          if (!spec.regionIds.includes(capRegion)) migrateCapital(s, id, ctx);
+          const after = sizesNow(s.civ).get(id) ?? 0;
           ctx.resized.push({ polityId: id, name: polityName(p, year), regions: after });
+          ctx.warnings.push(`P${id} 按所选 ${spec.regionIds.length} 州设置疆域:现在 ${after} 州`);
+        }
+      } else {
+        const current = sizesNow(s.civ).get(id) ?? 0;
+        const want = spec.size === undefined ? undefined : clampSize(spec.size);
+        if (want !== undefined && want !== current) {
+          const sizes = sizesNow(s.civ);
+          if (want > current) growTerritory(s, id, want, sizes, ctx.warnings);
+          else shrinkTerritory(s, id, want, year, ctx.warnings);
+          const after = sizesNow(s.civ).get(id) ?? 0;
+          if (after !== current) {
+            const p = s.civ.polities[id]!;
+            ctx.resized.push({ polityId: id, name: polityName(p, year), regions: after });
+          }
         }
       }
     } else {
       try {
-        id = createNewNation(s, { at: spec.at, size: spec.size ?? START_ADD_SIZE_DEFAULT }, year, ctx.warnings);
+        id = spec.regionIds
+          ? createNationFromRegions(s, spec.regionIds, year, ctx.warnings)
+          : createNewNation(s, { at: spec.at, size: spec.size ?? START_ADD_SIZE_DEFAULT }, year, ctx.warnings);
       } catch (e) {
         ctx.warnings.push(`新建国家失败:${e instanceof Error ? e.message : String(e)}`);
         continue;
@@ -1099,7 +1282,7 @@ function readCount(raw: unknown): number {
   return Math.min(START_COUNT_MAX, Math.max(START_COUNT_MIN, Math.round(n)));
 }
 
-function readNations(raw: unknown): StartNationSpec[] {
+function readNations(raw: unknown, regionCount: number): StartNationSpec[] {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) throw new Error('nations 要是数组');
   return raw.map((v, i) => {
@@ -1110,6 +1293,18 @@ function readNations(raw: unknown): StartNationSpec[] {
       const id = Number(o.polityId);
       if (!Number.isInteger(id) || id < 0) throw new Error(`nations[${i}].polityId 要是国家编号`);
       spec.polityId = id;
+    }
+    if (o.regionIds !== undefined && o.regionIds !== null) {
+      if (!Array.isArray(o.regionIds)) throw new Error(`nations[${i}].regionIds 要是州号数组`);
+      const ids: number[] = [];
+      for (const rv of o.regionIds) {
+        const r = Number(rv);
+        if (!Number.isInteger(r)) throw new Error(`nations[${i}].regionIds 里 ${JSON.stringify(rv)} 不是整数州号`);
+        if (r < 0 || r >= regionCount) throw new Error(`nations[${i}].regionIds 里州 ${r} 越界(共 ${regionCount} 州)`);
+        if (!ids.includes(r)) ids.push(r);
+      }
+      if (!ids.length) throw new Error(`nations[${i}].regionIds 不能是空数组(至少要选一个州)`);
+      spec.regionIds = ids;
     }
     if (o.at !== undefined && o.at !== null) {
       if (typeof o.at !== 'object' || Array.isArray(o.at)) throw new Error(`nations[${i}].at 要是 { x, y }`);

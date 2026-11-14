@@ -1669,6 +1669,58 @@
     requestDraw();
   }
 
+  // ---- 给开局选点 / 外部模块用的地图视图钩子 ----
+  function worldToScreen(wx, wy) {
+    const m = viewMetrics();
+    return { x: m.oxAbs + wx * m.k, y: m.oyAbs + wy * m.k };
+  }
+  function screenToWorld(cx, cy) {
+    const m = viewMetrics();
+    return { x: (cx - m.oxAbs) / m.k, y: (cy - m.oyAbs) / m.k };
+  }
+  let flyToken = 0;
+  // 平滑飞到世界坐标 (wx,wy) 居中;k 是最终总缩放(px/世界像素),不传则 2.2x fit
+  function flyTo(wx, wy, kWant, ms) {
+    if (!S.baseImg || !S.mapW) return false;
+    const fit = fitScale();
+    const kTo = clamp(kWant == null ? fit * 2.2 : kWant, fit, fit * 12);
+    const m0 = viewMetrics();
+    const cx0 = (S.cw / 2 - m0.oxAbs) / m0.k;
+    const W = S.mapW || 2048;
+    const wxNear = wx + Math.round((cx0 - wx) / W) * W;
+    const x1 = (S.mapW * kTo) / 2 - wxNear * kTo;
+    const y1 = (S.mapH * kTo) / 2 - wy * kTo;
+    const kz0 = S.view.k;
+    const kz1 = clamp(kTo / fit, 1, 12);
+    const x0 = S.view.x;
+    const y0 = S.view.y;
+    const token = ++flyToken;
+    const t0 = performance.now();
+    const dur = Math.max(0, ms == null ? 480 : ms);
+    beginInteractive();
+    function step(now) {
+      if (token !== flyToken) return;
+      const t = dur <= 0 ? 1 : Math.max(0, Math.min(1, (now - t0) / dur));
+      const e = t * t * (3 - 2 * t);
+      S.view.k = kz0 + (kz1 - kz0) * e;
+      S.view.x = x0 + (x1 - x0) * e;
+      S.view.y = y0 + (y1 - y0) * e;
+      normalizeView();
+      draw();
+      if (t < 1) requestAnimationFrame(step);
+      else beginInteractive();
+    }
+    requestAnimationFrame(step);
+    return true;
+  }
+  window.CivMap = {
+    flyTo,
+    stop: () => { flyToken++; },
+    view: () => ({ k: S.view.k, x: S.view.x, y: S.view.y, cw: S.cw, ch: S.ch, mapW: S.mapW, mapH: S.mapH, fit: fitScale() }),
+    worldToScreen,
+    screenToWorld,
+  };
+
   // 浮窗的开关:参数抽屉、面板收起、缩放按钮
   function bindChrome() {
     // 开局设置:君主角色卡 / 起始疆域大小与位置

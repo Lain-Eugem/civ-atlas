@@ -62,6 +62,14 @@
   var confirmAction = null;
   /** bindPick 注册的外部回调(可选) */
   var externalPick = null;
+  /** ② 连续点选已选的州号(升序);提交时作为 regionIds 优先于 size/at */
+  var regionSel = [];
+  /** ② 疆域连续点选覆盖层是否打开 */
+  var regionPickerOn = false;
+  /** ② 点选覆盖层当前高亮的国家编号 */
+  var regionHighlight = null;
+  /** 防止「点选回调同步下拉 → 下拉 change」再飞一次 */
+  var syncingFromPicker = false;
 
   function $(id) {
     return document.getElementById(id);
@@ -145,7 +153,15 @@
       '#startCustomPanel .start-confirm[hidden]{display:none!important}',
       '#startCustomPanel .start-confirm .msg{font-size:12px;line-height:1.5;color:#7a5212;white-space:pre-wrap}',
       '#startCustomPanel .start-confirm .btns{display:flex;gap:6px}',
-      '#startCustomPanel .start-confirm .btns .btn{flex:1 1 0;font-size:12px;padding:3px 6px}'
+      '#startCustomPanel .start-confirm .btns .btn{flex:1 1 0;font-size:12px;padding:3px 6px}',
+      // ② 连续点选:已选州盒子
+      '#startCustomPanel .start-regions{display:flex;flex-direction:column;gap:4px;border:1px solid #7fc7dd;border-radius:6px;background:rgba(64,196,236,.08);padding:5px 7px}',
+      '#startCustomPanel .start-regions[hidden]{display:none!important}',
+      '#startCustomPanel .start-regions-head{display:flex;align-items:center;gap:6px;font-size:12px;color:#1a6e86}',
+      '#startCustomPanel .start-regions-head .btn{margin-left:auto;font-size:11px;padding:1px 6px}',
+      '#startCustomPanel .start-region-chips{display:flex;flex-wrap:wrap;gap:3px;max-height:72px;overflow:auto}',
+      '#startCustomPanel .start-region-chip{display:inline-flex;align-items:center;gap:2px;font-size:11px;line-height:1.4;padding:0 5px;border-radius:9px;background:rgba(40,196,236,.2);color:#12566b;border:1px solid rgba(20,140,170,.35);white-space:nowrap}',
+      '#startCustomPanel .start-region-chip button{border:0;background:transparent;color:#12566b;cursor:pointer;font-size:12px;padding:0 1px;line-height:1}'
     ].join('\n');
     document.head.appendChild(style);
   }
@@ -193,8 +209,13 @@
       '    <div class="start-section-head"><span>② 君主定制</span><span class="hint" id="startCustomState"></span></div>',
       '    <label class="field"><span>君主国家</span><select id="startNation"></select></label>',
       '    <div class="start-coord">',
-      '      <button class="btn" id="startPick" type="button">📍 在地图上点选</button>',
+      '      <button class="btn" id="startPick" type="button">🗺 在地图上选疆域</button>',
       '      <span class="hint" id="startAtLabel">未选位置(默认落在最大的无主州)</span>',
+      '    </div>',
+      '    <div class="start-hint">点国家高亮全部州并飞首都;点州选中/取消;Esc 退出</div>',
+      '    <div class="start-regions" id="startRegionBox" hidden>',
+      '      <div class="start-regions-head"><span>已选 <b id="startRegionCount">0</b> 州</span><button class="btn ghost" id="startRegionClear" type="button">清空</button></div>',
+      '      <div class="start-region-chips" id="startRegionChips"></div>',
       '    </div>',
       '    <label class="field"><span>初始州数 <b id="startSizeVal">8</b></span>',
       '      <input id="startSize" type="range" min="3" max="40" step="1" value="8">',
@@ -239,8 +260,10 @@
     el('startClose').addEventListener('click', close);
     el('startCancel').addEventListener('click', close);
     el('startApply').addEventListener('click', onApply);
-    el('startPick').addEventListener('click', function () { onPick('monarch'); });
+    el('startPick').addEventListener('click', toggleRegionPicker);
     el('startAddPick').addEventListener('click', function () { onPick('add'); });
+    el('startRegionClear').addEventListener('click', clearRegionSelection);
+    el('startRegionChips').addEventListener('click', onRegionChipsClick);
     el('startRandom').addEventListener('click', randomizeCard);
     el('startNation').addEventListener('change', function () {
       customDirty = true;
@@ -376,14 +399,35 @@
       size.disabled = false;
       el('startSizeVal').textContent = String(v);
       pickedAt = null;
-      el('startAtLabel').textContent = '现有国家:按国都位置,不需要点选';
-      el('startPick').disabled = true;
+      // 下拉选国 = 高亮该国并飞首都(和地图点选保持一致);从点选回调同步过来的不再重复飞
+      if (!syncingFromPicker && regionPickerOn && window.CivRegionPicker &&
+          n.polityId !== regionHighlight) {
+        regionHighlight = n.polityId;
+        window.CivRegionPicker.highlightPolity(n.polityId, true);
+      }
     } else {
       size.disabled = false;
-      el('startAtLabel').textContent = pickedAt
+    }
+    renderPickButton();
+  }
+
+  /** ② 点选按钮与说明文字(随已选州数变化) */
+  function renderPickButton() {
+    var btn = $('startPick');
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = regionPickerOn ? '✕ 退出选疆域'
+      : (regionSel.length ? '🗺 继续选疆域(' + regionSel.length + ' 州)' : '🗺 在地图上选疆域');
+    var label = $('startAtLabel');
+    if (!label) return;
+    if (regionSel.length) {
+      label.textContent = '已选 ' + regionSel.length + ' 州(提交时按这些州精确设置,忽略州数/落点)';
+    } else if (selectedNation()) {
+      label.textContent = '现有国家:按国都位置;要改疆域请点「在地图上选疆域」';
+    } else {
+      label.textContent = pickedAt
         ? '已选位置:x=' + Math.round(pickedAt.x) + ', y=' + Math.round(pickedAt.y)
         : '未选位置(默认落在最大的无主州)';
-      el('startPick').disabled = false;
     }
   }
 
@@ -419,6 +463,130 @@
 
   function bindPick(cb) {
     externalPick = typeof cb === 'function' ? cb : null;
+  }
+
+  // ── ② 疆域连续点选(CivRegionPicker 覆盖层) ───────────────────────────────
+  function regionName(region) {
+    var atlas = window.CivRegionAtlas;
+    var m = atlas && atlas.meta ? atlas.meta(region) : null;
+    return m && m.name ? m.name : ('州 #' + (region + 1));
+  }
+
+  function renderRegionBox() {
+    var box = $('startRegionBox');
+    if (!box) return;
+    box.hidden = regionSel.length === 0;
+    var count = $('startRegionCount');
+    if (count) count.textContent = String(regionSel.length);
+    var chips = $('startRegionChips');
+    if (chips) {
+      chips.innerHTML = regionSel.map(function (r) {
+        return '<span class="start-region-chip">' + esc(regionName(r)) +
+          '<button type="button" data-region-remove="' + r + '" title="移除这个州">×</button></span>';
+      }).join('');
+    }
+    renderPickButton();
+  }
+
+  function syncNationSelect(pid) {
+    var select = $('startNation');
+    if (!select || pid == null) return;
+    var v = String(pid);
+    if (select.value === v) return;
+    if (!select.querySelector('option[value="' + v + '"]')) return;
+    select.value = v;
+    syncingFromPicker = true;
+    try { onNationChanged(); } finally { syncingFromPicker = false; }
+  }
+
+  function onPickerSelection(sel, hlPid) {
+    regionSel = (sel || []).slice();
+    regionHighlight = hlPid == null ? null : hlPid;
+    customDirty = true;
+    renderRegionBox();
+    if (hlPid != null) syncNationSelect(hlPid);
+    if (typeof externalPick === 'function') externalPick(null);
+  }
+
+  function onRegionChipsClick(e) {
+    var t = e.target && e.target.closest ? e.target.closest('button[data-region-remove]') : null;
+    if (!t) return;
+    var r = Number(t.getAttribute('data-region-remove'));
+    var idx = regionSel.indexOf(r);
+    if (idx < 0) return;
+    regionSel.splice(idx, 1);
+    customDirty = true;
+    renderRegionBox();
+    if (window.CivRegionPicker && window.CivRegionPicker.isActive()) {
+      window.CivRegionPicker.setSelection(regionSel);
+    }
+  }
+
+  function clearRegionSelection() {
+    regionSel = [];
+    regionHighlight = null;
+    customDirty = true;
+    renderRegionBox();
+    if (window.CivRegionPicker && window.CivRegionPicker.isActive()) {
+      window.CivRegionPicker.setSelection([]);
+    }
+  }
+
+  function nationPickerData() {
+    return nations.map(function (n) {
+      return { polityId: n.polityId, name: n.name, color: n.color, capital: n.capital };
+    });
+  }
+
+  function openRegionPicker() {
+    if (!window.CivRegionPicker) {
+      toastMsg('选疆域模块没加载:刷新页面再试', true);
+      return;
+    }
+    if (!nations.length) {
+      loadNations().then(openRegionPicker);
+      return;
+    }
+    if (regionPickerOn) return;
+    var current = selectedNation();
+    regionPickerOn = true;
+    var ok = window.CivRegionPicker.open({
+      nations: nationPickerData(),
+      api: cfg && cfg.api,
+      sessionId: cfg && cfg.sessionId,
+      initialPolityId: current ? current.polityId : regionHighlight,
+      initialSelection: regionSel,
+      onSelection: onPickerSelection,
+      onNation: function (pid) { syncNationSelect(pid); },
+      onExit: function () {
+        regionPickerOn = false;
+        renderPickButton();
+        renderRegionBox();
+      }
+    });
+    if (!ok) {
+      regionPickerOn = false;
+      toastMsg('地图还没准备好,稍后再试点选', true);
+      return;
+    }
+    renderPickButton();
+    toastMsg('点国家高亮全部州并飞首都;点州选中/取消;Esc 退出');
+  }
+
+  /** 关闭点选覆盖层;clearSelection=true 时同时清空已选州 */
+  function closeRegionPicker(clearSelection) {
+    if (window.CivRegionPicker && window.CivRegionPicker.isActive()) window.CivRegionPicker.close();
+    regionPickerOn = false;
+    if (clearSelection) {
+      regionSel = [];
+      regionHighlight = null;
+    }
+    renderRegionBox();
+  }
+
+  function toggleRegionPicker() {
+    if (regionPickerOn) closeRegionPicker(false);
+    else openRegionPicker();
   }
 
   // ── ① 开局国家设置:加载 + 预览 ────────────────────────────────────────────
@@ -671,21 +839,22 @@
   /** 收集 ② 君主定制的请求 body(不含 sessionId,由调用方补) */
   function collect() {
     var n = selectedNation();
-    var body = {
-      size: Number(el('startSize').value),
-      autoCard: el('startAutoCard').checked
-    };
-    if (n) {
-      body.polityId = n.polityId;
+    var autoCard = el('startAutoCard').checked;
+    var body = { autoCard: autoCard };
+    if (n) body.polityId = n.polityId;
+    if (regionSel.length) {
+      // 连续点选:按所选州精确设置(服务端 regionIds 优先于 size/at)
+      body.regionIds = regionSel.slice();
     } else {
-      if (pickedAt) body.at = { x: pickedAt.x, y: pickedAt.y };
-      if (body.autoCard) {
+      body.size = Number(el('startSize').value);
+      if (!n && pickedAt) body.at = { x: pickedAt.x, y: pickedAt.y };
+      if (!n && autoCard) {
         // 新国自动卡:后端用占位名;仍然允许给一个名字
         var name = el('startName').value.trim();
         if (name) body.card = { name: name };
       }
     }
-    if (!body.autoCard) body.card = collectCard();
+    if (!autoCard) body.card = collectCard();
     return body;
   }
 
@@ -789,6 +958,11 @@
       var warns = result.warnings && result.warnings.length ? '\n⚠ ' + result.warnings.join('\n⚠ ') : '';
       toastMsg(summary + warns);
       customDirty = false;
+      regionSel = [];
+      regionHighlight = null;
+      if (window.CivRegionPicker && window.CivRegionPicker.isActive()) window.CivRegionPicker.close();
+      regionPickerOn = false;
+      renderRegionBox();
       if (data && data.state && cfg) cfg.state = data.state;
       if (cfg && typeof cfg.onApplied === 'function') {
         try {
@@ -807,9 +981,11 @@
     if (!cfg || busy) return;
     var hasSetup = !!setupBody(false);
     if (!hasSetup && !customDirty) {
-      toastMsg('没有要应用的改动:先调数量/控制方式/删国/新增国家,或选择君主国家改角色卡');
+      toastMsg('没有要应用的改动:先调数量/控制方式/删国/新增国家,或在地图上选疆域、改角色卡');
       return;
     }
+    // 提交期间关掉点选覆盖层(已选州保留在 regionSel 里,提交时照样带上)
+    if (regionPickerOn) closeRegionPicker(false);
     busy = true;
     setBtnBusy(true);
     hideConfirm();
@@ -863,17 +1039,21 @@
     buildPanel();
     pickedAt = null;
     addAt = null;
+    regionSel = [];
+    regionHighlight = null;
+    if (window.CivRegionPicker && window.CivRegionPicker.isActive()) window.CivRegionPicker.close();
+    regionPickerOn = false;
     resetLocalPreview();
     el('startMsg').textContent = '';
     el('startMsg').className = 'start-msg';
-    el('startAtLabel').textContent = '未选位置(默认落在最大的无主州)';
-    el('startPick').disabled = false;
     el('startSize').value = String(8);
     el('startSizeVal').textContent = '8';
     el('startAutoCard').checked = true;
     el('startCardFields').disabled = true;
     el('startName').value = '';
     el('startPersona').value = '';
+    renderRegionBox();
+    renderPickButton();
     el(PANEL_ID).hidden = false;
     setBtnBusy(false);
     loadConfig();
@@ -881,6 +1061,10 @@
   }
 
   function close() {
+    if (regionPickerOn && window.CivRegionPicker && window.CivRegionPicker.isActive()) {
+      window.CivRegionPicker.close();
+    }
+    regionPickerOn = false;
     var panel = $(PANEL_ID);
     if (panel) panel.hidden = true;
   }
@@ -892,6 +1076,10 @@
     bindPick: bindPick,
     pickAt: pickAt,
     // 调试/测试用:当前本地预览的 start-setup 请求体
-    setupBody: setupBody
+    setupBody: setupBody,
+    // 调试/测试用:连续点选
+    regionSelection: function () { return regionSel.slice(); },
+    openRegionPicker: openRegionPicker,
+    closeRegionPicker: closeRegionPicker
   };
 })();

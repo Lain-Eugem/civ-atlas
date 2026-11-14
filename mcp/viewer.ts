@@ -1163,7 +1163,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const at = regionAtlas(s.world, s.civ, scale);
       const buf = Buffer.from(at.data.buffer, at.data.byteOffset, at.data.byteLength);
       const gz = gzipSync(buf, { level: 6 });
-      json = JSON.stringify({ w: at.w, h: at.h, scale: at.scale, regions: at.regions, dataGzB64: gz.toString('base64') });
+      json = JSON.stringify({
+        w: at.w,
+        h: at.h,
+        scale: at.scale,
+        regions: at.regions,
+        // 州 → 国 对照(每州所属国 id,-1 无主),开局连续点选用,客户端不用再拉新接口
+        owner: Array.from(s.civ.polity.subarray(0, s.civ.regions.count)),
+        dataGzB64: gz.toString('base64'),
+      });
       atlasCache.set(key, json);
       if (atlasCache.size > 6) atlasCache.clear();
     }
@@ -1497,6 +1505,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         input.at = { x: Number(atRaw.x), y: Number(atRaw.y) };
       }
       if (args.size !== undefined && args.size !== null && args.size !== '') input.size = Number(args.size);
+      if (args.regionIds !== undefined && args.regionIds !== null && !Array.isArray(args.regionIds)) {
+        fail(res, 400, 'regionIds 要是州号数组');
+        return true;
+      }
+      if (Array.isArray(args.regionIds)) input.regionIds = args.regionIds;
       if (args.card && typeof args.card === 'object') input.card = args.card as Record<string, unknown>;
       if (args.autoCard === true) input.autoCard = true;
       const result = applyCustomStart(s, input);

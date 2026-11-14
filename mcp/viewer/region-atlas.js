@@ -6,12 +6,14 @@
  *   { w, h, scale,
  *     regions: [{ region, name, polity:{id,name,color}|null, biomeName, area, capacity,
  *                 elevation, seatName, cells, river:{cells,majorCells,lengthKm,maxFlux}|null }],
+ *     owner: number[]     // 州 → 国 id(-1 无主),开局连续点选用;旧服务端没有时从 regions[].polity.id 拼
  *     dataGzB64: string }
  * dataGzB64 = gzip(Uint16Array 小端, 长度 w*h, 0xFFFF=水) 再 base64。
  * 默认 scale=2 时 w*h = 1024×512,世界主图是 2048×1024(mapW = w*scale)。
  *
  * 用途:悬停时用 lookup(世界像素) 在本地拿州 id(3×3 多数派修正半像素错位),
- * 不再每次 pointermove 都打 /api/map/region-info;meta(id) 取该州的展示信息。
+ * 不再每次 pointermove 都打 /api/map/region-info;meta(id) 取该州的展示信息;
+ * ownerOf(region) / regionsOf(polity) 给区域点选面板用;snapshot() 给高亮覆盖层画栅格。
  */
 (function () {
   'use strict';
@@ -135,8 +137,32 @@
    * 对外 API
    * ------------------------------------------------------------------ */
 
-  /**
-   * 拉取并解码一个会话的地区栅格。
+  /** 州 → 国:服务端 owner 数组优先;旧服务端没下发时退回用 regions[].polity.id 拼 */
+  function ownerArrayFrom(regions, resOwner) {
+    if (Array.isArray(resOwner)) {
+      const out = new Int16Array(resOwner.length);
+      for (let i = 0; i < resOwner.length; i++) out[i] = Number(resOwner[i]) | 0;
+      return out;
+    }
+    if (!regions.length) return null;
+    let max = -1;
+    for (let i = 0; i < regions.length; i++) {
+      const r = regions[i];
+      if (r && typeof r.region === 'number' && r.region > max) max = r.region;
+    }
+    if (max < 0) return null;
+    const out = new Int16Array(max + 1);
+    out.fill(-1);
+    for (let i = 0; i < regions.length; i++) {
+      const r = regions[i];
+      if (!r || typeof r.region !== 'number') continue;
+      const pid = r.polity && typeof r.polity.id === 'number' ? r.polity.id : -1;
+      out[r.region] = pid | 0;
+    }
+    return out;
+  }
+
+  /** 拉取并解码一个会话的地区栅格。
    * @param {function(string):Promise<object>} apiFetch app.js 里的 api(url) 或 fetch 包装
    * @param {string|function():string} sessionId 会话 id(也可传函数,每次调用取当前值)
    * @param {{scale?:number}} [options]
@@ -192,7 +218,8 @@
       const respMapH = Number(res.mapH !== undefined ? res.mapH : res.worldH);
       const mapW = isFinite(respMapW) && respMapW > 0 ? respMapW : w * useScale;
       const mapH = isFinite(respMapH) && respMapH > 0 ? respMapH : h * useScale;
-      state = { w, h, scale: useScale, cells, regions, byId, mapW, mapH };
+      const owner = ownerArrayFrom(regions, res.owner);
+      state = { w, h, scale: useScale, cells, regions, byId, owner, mapW, mapH };
       return true;
     } catch (err) {
       if (myToken === loadToken) state = null;
@@ -220,6 +247,46 @@
     return lookupFrom(state.cells, state.w, state.h, mx, my, mapW, mapH);
   }
 
+  /** 州 id → 所属国 id(0 起,-1=无主);未加载/越界 → -1 */
+  function ownerOf(regionId) {
+    if (!state || typeof regionId !== 'number' || !isFinite(regionId) || regionId < 0) return -1;
+    if (state.owner && regionId < state.owner.length) return state.owner[regionId];
+    const m = state.byId.get(regionId);
+    return m && m.polity && typeof m.polity.id === 'number' ? m.polity.id : -1;
+  }
+
+  /** 某国的全部州 id(按州号升序);未加载 → [] */
+  function regionsOf(polityId) {
+    const out = [];
+    if (!state || typeof polityId !== 'number' || polityId < 0) return out;
+    if (state.owner) {
+      for (let r = 0; r < state.owner.length; r++) if (state.owner[r] === polityId) out.push(r);
+      return out;
+    }
+    for (const pair of state.byId) {
+      const m = pair[1];
+      if (m && m.polity && m.polity.id === polityId) out.push(pair[0]);
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  }
+
+  /** 只读快照(高亮覆盖层用):cells / owner 是内部数组,调用方不要改。 */
+  function snapshot() {
+    if (!state) return null;
+    return {
+      w: state.w,
+      h: state.h,
+      scale: state.scale,
+      mapW: state.mapW,
+      mapH: state.mapH,
+      cells: state.cells,
+      owner: state.owner,
+      regions: state.regions,
+      byId: state.byId,
+    };
+  }
+
   /** 栅格/世界尺寸信息;未加载 = null */
   function size() {
     if (!state) return null;
@@ -238,6 +305,9 @@
     count: count,
     meta: meta,
     lookup: lookup,
+    ownerOf: ownerOf,
+    regionsOf: regionsOf,
+    snapshot: snapshot,
     size: size,
     clear: clear,
     /** 纯函数测试入口:lookupFrom(cells, w, h, mx, my, mapW, mapH) */
