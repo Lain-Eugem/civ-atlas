@@ -29,12 +29,17 @@ export function pluginsInWorld(m: Pick<WorldManifest, 'parts' | 'plugins'>, inst
   const layers = new Map<string, string[]>();
   for (const p of m.parts) {
     const ids = pluginLayerOf(p.name);
-    if (ids) layers.set(ids[0], [...(layers.get(ids[0]) ?? []), ids[1]]);
+    if (!ids) continue;
+    const list = layers.get(ids[0]);
+    if (list) list.push(ids[1]);
+    else layers.set(ids[0], [ids[1]]);
   }
-  const ids = [...new Set([...m.plugins.map((p) => p.id), ...data.keys(), ...layers.keys()])];
+  const byId = new Map(m.plugins.map((p) => [p.id, p]));
+  const installedById = new Map(installed.map((p) => [p.id, p]));
+  const ids = [...new Set([...byId.keys(), ...data.keys(), ...layers.keys()])];
   return ids.map((id) => {
-    const plugin = m.plugins.find((p) => p.id === id) ?? null;
-    const have = installed.find((p) => p.id === id);
+    const plugin = byId.get(id) ?? null;
+    const have = installedById.get(id);
     const here = !have ? 'none' : plugin && have.current.sum === plugin.sum ? 'same' : 'other';
     return { id, plugin, data: data.get(id) ?? null, layers: layers.get(id) ?? [], here };
   });
@@ -130,9 +135,10 @@ export const checkSimPlugins = (world: readonly WorldPlugin[], installed: readon
 export const checkMapPlugins = (world: readonly WorldPlugin[], installed: readonly InstalledSim[]): MapPluginCheck[] => checkPlugins(mapPluginsIn(world), installed);
 
 function checkPlugins(list: readonly WorldPlugin[], installed: readonly InstalledSim[]): PluginCheck[] {
+  const installedById = new Map(installed.map((p) => [p.id, p]));
   return list.map((plugin): PluginCheck => {
     const id = plugin.id;
-    const have = installed.find((p) => p.id === id);
+    const have = installedById.get(id);
     if (!have) return { id, plugin, status: 'missing' };
     if (have.current.sum === plugin.sum) return { id, plugin, status: 'ready', which: 'current' };
     if (have.previous?.sum === plugin.sum) return { id, plugin, status: 'ready', which: 'previous' };

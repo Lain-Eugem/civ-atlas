@@ -18,9 +18,10 @@
  *   - 世界生成和推演都是纯计算,接口本身不改变确定性。
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFileSync, existsSync } from 'node:fs';
-import { extname, join, normalize, resolve, sep } from 'node:path';
-import { deflateSync } from 'node:zlib';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
+import { deflateSync, gzipSync } from 'node:zlib';
+import { constants as osConstants, setPriority } from 'node:os';
 
 import {
   createWorld,
@@ -34,12 +35,17 @@ import {
   isFinished,
   sessionSummary,
   magicView,
+  worldIdOf,
+  nationControlOf,
+  nationControlView,
   type EventView,
   type PolityView,
   type RulerView,
   type Session,
 } from './engine';
-import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, setMonarchCard, verifySession } from './monarch';
+import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, monarchPanels, setMonarchCard, verifySession } from './monarch';
+import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, autoNationName, inferCardFromBiography, hasUsableCities, noCitiesMessage, previewNationAt, type StartSetupInput } from './monarch-start';
+import { CARD_LIFESPAN_DEFAULT } from '../src/gen/civ/monarchCard';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
@@ -54,8 +60,15 @@ import {
   type FieldRamp,
   type FieldStyle,
 } from './field-render';
-import { DEFAULT_MAGIC_STYLE, renderMagicMap, magicDataJson, magicLegendOf, magicLayerOf } from './magic-render';
-import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
+import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf, parseMagicColors } from './magic-render';
+import { isTerrainStyle, renderTile, renderVectors, renderVeinOverlay, renderWhole, type TerrainStyle } from './terrain';
+import { renderOwnerPixels, ownerCivData, renderOwnerTilePixels } from './owner-map';
+import { buildLabels } from './labels';
+import { regionAtlas, regionInfoAt } from './region-info';
+import { cancelPlayerCommand, parsePlayerCommand, playerCommandView, queuePlayerCommand } from './player-commands';
+import { cleanOrders } from './orders';
+import { dialogueView } from './dialogue';
+import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
 
@@ -108,7 +121,7 @@ function pngChunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([len, typ, data, crc]);
 }
 
-function encodePng(width: number, height: number, rgba: Uint8Array): Buffer {
+function encodePng(width: number, height: number, rgba: Uint8Array | Uint8ClampedArray): Buffer {
   const stride = width * 4;
   const raw = Buffer.alloc((stride + 1) * height);
   for (let y = 0; y < height; y++) {
@@ -393,76 +406,35 @@ function renderWorldMap(world: World): MapImage {
 interface OwnerMap extends MapImage {
   grid: { w: number; h: number; owner: number[] };
   colors: Record<string, string>;
+  /** 国界线:扁平 [x0,y0,x1,y1,…],主图像素坐标(跨 180° 的线会超出 [0,W],前端按 shift 再画一份) */
+  regions: number[][];
+  borders: number[][];
   fingerprint: string;
 }
 
-/** 疆域图:只画三个顶点同属一国的三角形,边界自然留缝露出地形;水/无主透明 */
+/** 疆域图:逐像素归属 + 水彩罩染 + 平滑国界,和主站同一套画法(见 mcp/owner-map.ts);水/无主透明 */
 function renderOwnerMap(s: Session): OwnerMap {
   const world = s.world;
   const civ: Civ = s.civ;
-  const W = MAP_OUT_W;
-  const H = Math.max(64, Math.round((MAP_OUT_W * world.height) / world.width));
-  const sx = W / world.width;
-  const sy = H / world.height;
-  const px = new Uint8Array(W * H * 4); // 全透明
-  const n = world.mesh.n;
-  const ownerOf = new Int16Array(n);
-  const colorOfPolity = (id: number): RGB => {
-    const p = civ.polities[id];
-    return p ? (p.color as unknown as RGB) : [128, 128, 128];
-  };
-  for (let i = 0; i < n; i++) {
-    const region = civ.regions.of[i] ?? -1;
-    const owner = region >= 0 ? (civ.polity[region] ?? -1) : -1;
-    ownerOf[i] = owner;
-  }
+  const pixels = renderOwnerPixels(world, civ);
+  const W = pixels.width;
+  const H = pixels.height;
+  // Uint8ClampedArray → Uint8Array 零拷贝视图(encodePng 收 Uint8Array)
+  const px = new Uint8Array(pixels.rgba.buffer, pixels.rgba.byteOffset, pixels.rgba.byteLength);
+
   const colors: Record<string, string> = {};
   for (const p of civ.polities) {
-    if (p.ended === undefined) colors[String(p.id)] = hexOf(colorOfPolity(p.id));
+    if (p.ended === undefined) colors[String(p.id)] = hexOf(p.color);
   }
 
-  const stampRadius = Math.max(1, Math.round(world.mesh.spacing * sx * 0.55));
-  const stampColor = (i: number): RGB | null => {
-    const id = ownerOf[i]!;
-    return id >= 0 ? colorOfPolity(id) : null;
-  };
-  stampCells(px, W, H, sx, sy, n, world.mesh.x, world.mesh.y, stampColor, stampRadius);
-
-  const tri = world.mesh.triangles;
-  for (let t = 0; t + 2 < tri.length; t += 3) {
-    const ia = tri[t]!;
-    const ib = tri[t + 1]!;
-    const ic = tri[t + 2]!;
-    const oa = ownerOf[ia]!;
-    if (oa < 0 || ownerOf[ib] !== oa || ownerOf[ic] !== oa) continue;
-    const c = colorOfPolity(oa);
-    const ax = (world.mesh.x[ia] ?? 0) * sx;
-    const bx = (world.mesh.x[ib] ?? 0) * sx;
-    const cx = (world.mesh.x[ic] ?? 0) * sx;
-    const ay = (world.mesh.y[ia] ?? 0) * sy;
-    const by = (world.mesh.y[ib] ?? 0) * sy;
-    const cy = (world.mesh.y[ic] ?? 0) * sy;
-    const span = Math.max(ax, bx, cx) - Math.min(ax, bx, cx);
-    if (span > W / 2) {
-      const wxs = [ax, bx, cx].map((v) => (v > W / 2 ? v - W : v));
-      triangleFill(px, W, H, wxs[0]!, ay, wxs[1]!, by, wxs[2]!, cy, c, c, c);
-      triangleFill(px, W, H, wxs[0]! + W, ay, wxs[1]! + W, by, wxs[2]! + W, cy, c, c, c);
-    } else {
-      triangleFill(px, W, H, ax, ay, bx, by, cx, cy, c, c, c);
-    }
-  }
-
-  // 半透明,让底下的地形/雪线透出来;国界处本来就没画,会留一道细缝
-  for (let o = 3; o < px.length; o += 4) {
-    if (px[o] === 255) px[o] = 172;
-  }
-
-  // 点击选国用的低分辨率网格:每格取落进去的最后一个有主地块
+  // 点击/悬停选国用的低分辨率网格:每格取落进去的最后一个有主地块
+  const n = world.mesh.n;
   const gw = 240;
   const gh = Math.max(32, Math.round((gw * H) / W));
   const ownerGrid = new Int16Array(gw * gh).fill(-1);
   for (let i = 0; i < n; i++) {
-    const id = ownerOf[i]!;
+    const region = civ.regions.of[i] ?? -1;
+    const id = region >= 0 ? (civ.polity[region] ?? -1) : -1;
     if (id < 0) continue;
     const gx = Math.min(gw - 1, Math.max(0, Math.floor(((world.mesh.x[i] ?? 0) / world.width) * gw)));
     const gy = Math.min(gh - 1, Math.max(0, Math.floor(((world.mesh.y[i] ?? 0) / world.height) * gh)));
@@ -474,6 +446,8 @@ function renderOwnerMap(s: Session): OwnerMap {
     rgba: px,
     grid: { w: gw, h: gh, owner: Array.from(ownerGrid) },
     colors,
+    borders: pixels.borders,
+    regions: pixels.regions,
     fingerprint: '',
   };
 }
@@ -523,10 +497,14 @@ function stateView(s: Session): Record<string, unknown> {
   const events = chron.entries;
   const wars = events.filter((e) => e.kind === 'war' && e.year <= year && e.end >= year);
 
-  const kingCount = s.monarch
+  const kingIds = s.monarch
     ? pickMonarchIds(civ, year, (s.monarch.config as unknown as { polities: 'all' | number | number[] }).polities)
-        .length
-    : 0;
+    : [];
+  // 只数「控制方式 = AI」的国家:标成 program 的国家由引擎自动推演,不占君主席位
+  const kingCount = kingIds.filter((id) => nationControlOf(s, id) === 'ai').length;
+  // P5:君主面板(每个 AI 国的 AP / 位置 / 后代 / 日志);当前选中国优先
+  const panels = s.monarch ? monarchPanels(s) : [];
+  const focusPanel = panels.find((p) => p.polityId === s.playerPolityId) ?? panels[0] ?? null;
 
   return {
     summary: sessionSummary(s),
@@ -547,6 +525,11 @@ function stateView(s: Session): Record<string, unknown> {
     commands: st.commands,
     monarch: s.monarch ? { ...monarchStatus(s), kingCount } : null,
     monarchRounds: s.monarch ? s.monarch.rounds.map(trimRound) : [],
+    // P5:君主机制(行动点 / 位置 / 后代 / 事件日志);monarchAp 等是「当前聚焦国」的便捷别名
+    monarchPanels: panels,
+    monarchAp: focusPanel?.ap ?? null,
+    monarchLocation: focusPanel?.location ?? null,
+    monarchHeirs: focusPanel?.heirs ?? [],
     // DM 小决策(oracle)的状态;天灾会真改引擎,小贸易只记叙事
     dm: s.dm ? dmStatus(s) : null,
     dmRounds: s.dm
@@ -594,9 +577,21 @@ function stateView(s: Session): Record<string, unknown> {
     features: s.features,
     review: s.review,
     cards: s.cards ? [...s.cards.values()] : [],
+    // 本局君主寿命(岁):默认 90;开局角色卡启用种族系统时按卡上的 lifespan
+    monarchLifespan: s.monarch?.lifespan ?? CARD_LIFESPAN_DEFAULT,
     memory: s.memory ? [...s.memory.values()] : [],
     intel: s.intel ?? {},
     pendingPlan: !!s.pendingPlan,
+    // 开局定制(角色卡/起始疆域);没定制 = null
+    customStart: s.customStart ? { ...s.customStart, warnings: [...s.customStart.warnings] } : null,
+    // 开局国家设置(数量 / 控制方式 / 增删):nationControl 是应用后的即时结果
+    nationControl: nationControlView(s),
+    startSetup: s.startSetup ?? null,
+    pendingStartSetup: s.pendingStartSetup ?? null,
+    // DM 硬命令(上帝视角):不依赖任何"玩家国家";playerPolityId 只是历史遗留的面板聚焦字段
+    playerPolityId: s.playerPolityId ?? null,
+    playerPolityName: s.playerPolityId != null ? polityName(civ.polities[s.playerPolityId], year) : null,
+    playerCommands: playerCommandView(s),
   };
 }
 
@@ -605,7 +600,9 @@ function stateView(s: Session): Record<string, unknown> {
  * ------------------------------------------------------------------ */
 
 const baseCache = new Map<string, Buffer>();
-/** 高清瓦片:key = worldId | 画法 | LOD | 球面展开坐标上的块号 */
+/** 瓦片像素的渲染版本:terrain.ts 改了底图 / 瓦片的上色、河网等算法时 +1 */
+const TILE_RENDER_VER = 11;
+/** 高清瓦片:key = worldId | 画法 | 渲染版本 | LOD | 球面展开坐标上的块号 */
 const tileCache = new Map<string, Buffer>();
 /** 每块瓦片自己的海岸 / 湖岸线(按该块的倍率追的,和这块地形严丝合缝) */
 const tileLines = new Map<string, { sea: number[][]; lake: number[][] }>();
@@ -620,6 +617,26 @@ const fieldFrames = new Map<string, FieldFrame>();
 const fieldPngs = new Map<string, { png: Buffer; legend: unknown }>();
 /** 「魔力」动态图层的 PNG 缓存:键 = sessionId|年份 */
 const magicPngs = new Map<string, { png: Buffer; legend: unknown; frameYear: number | null }>();
+/** 「魔力」高清瓦片缓存:键 = sessionId|年份|S|x|y|size(每块只算一次) */
+const magicTilePngs = new Map<string, Buffer>();
+/** 疆域高清瓦片缓存:键 = sessionId|状态指纹|S|x|y|size(和整张疆域图同时失效) */
+const ownerTilePngs = new Map<string, Buffer>();
+/** 标签层缓存:键 = sessionId|年份(世界 / 文明状态不变时只生成一次) */
+const labelsCache = new Map<string, string>();
+const dialogueCache = new Map<string, string>();
+const veinCache = new Map<string, string>();
+/** Region atlas cache: key = sessionId|fingerprint|scale */
+const atlasCache = new Map<string, string>();
+
+/** 会话状态变了:整张疆域图和它的疆域瓦片都作废(瓦片按 session 前缀清) */
+function invalidateOwnerCache(sid: string): void {
+  ownerCache.delete(sid);
+  const prefix = `${sid}|`;
+  for (const key of ownerTilePngs.keys()) if (key.startsWith(prefix)) ownerTilePngs.delete(key);
+  for (const key of atlasCache.keys()) if (key.startsWith(prefix)) atlasCache.delete(key);
+  // 标签层也按会话缓存:开局增删国家发生在同一回合里,年份没变,不清理会继续显示已删国家的国名。
+  for (const key of labelsCache.keys()) if (key.startsWith(prefix)) labelsCache.delete(key);
+}
 
 function optNum(v: string | null): number | undefined {
   if (v === null || v === '') return undefined;
@@ -719,17 +736,17 @@ function parseTileQuery(q: URLSearchParams): TileQuery {
   if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('x / y 必须是数字');
   if (!Number.isInteger(size) || size < 16 || size > 1024) throw new Error('size 超出范围');
   const style = styleOf(q);
-  if (style === 'classic') throw new Error('classic 画法没有高清瓦片');
-  return { worldId, style, S, x, y, size, key: `${worldId}|${style}|${S}|${x}|${y}|${size}` };
+  return { worldId, style, S, x, y, size, key: `${worldId}|${style}|r${TILE_RENDER_VER}|${S}|${x}|${y}|${size}` };
 }
 
-function getBasePng(worldId: string, style: TerrainStyle): Buffer {
+async function getBasePng(worldId: string, style: TerrainStyle): Promise<Buffer> {
   const key = `${worldId}|${style}`;
   const hit = baseCache.get(key);
   if (hit) return hit;
   const rec = getWorldRecord(worldId);
-  // classic = 改造前沙盒自己的三角栅格底图,留作对照 / 兜底;其余三种直接跑主站的渲染管线
-  const map = style === 'classic' ? renderWorldMap(rec.world) : renderWhole(rec.world, style);
+  // 所有画法(含 classic)都走主站同一条渲染管线;首次渲染在 worker 池里跑(不阻塞其它请求),
+  // 池不可用就原地渲染。
+  const map = (await renderViaPool(worldId, rec.world, { kind: 'whole', style })) ?? renderWhole(rec.world, style);
   const png = encodePng(map.width, map.height, map.rgba);
   baseCache.set(key, png);
   return png;
@@ -748,18 +765,136 @@ function cacheTile(key: string, png: Buffer, lines?: { sea: number[][]; lake: nu
   }
 }
 
-function getOwnerMap(s: Session): { png: Buffer; grid: { w: number; h: number; owner: number[] }; colors: Record<string, string>; fingerprint: string; width: number; height: number } {
+// ---- 预渲染:启动时把 S=2/4/8 的瓦片算好落盘,前端按进度条等到全部就绪 ----
+const PREWARM_LEVELS = [2, 4, 8] as const;
+const PREWARM_SIZE = 512;
+const TILE_DISK_ROOT = resolve('.runs', 'tiles');
+
+interface PrewarmState { state: 'running' | 'done' | 'failed'; done: number; total: number; startedAt: number; style: TerrainStyle }
+const prewarmState = new Map<string, PrewarmState>();
+
+function tileDiskPath(t: TileQuery, ext = 'png'): string {
+  return join(TILE_DISK_ROOT, t.worldId, t.style, `v${TILE_RENDER_VER}`, String(t.S), `${t.x}_${t.y}_${t.size}.${ext}`);
+}
+
+function readTileDisk(t: TileQuery, ext = 'png'): Buffer | undefined {
+  try {
+    const p = tileDiskPath(t, ext);
+    return existsSync(p) ? readFileSync(p) : undefined;
+  } catch { return undefined; }
+}
+
+function writeTileDisk(t: TileQuery, png: Buffer, lines?: { sea: number[][]; lake: number[][] }): void {
+  try {
+    const p = tileDiskPath(t);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, png);
+    if (lines) writeFileSync(tileDiskPath(t, 'json'), JSON.stringify(lines));
+  } catch { /* 磁盘缓存失败不影响出图 */ }
+}
+
+/** 只保留最近 keep 个世界的瓦片目录,避免 .runs 无限膨胀 */
+function pruneTileDisk(keep = 1): void {
+  try {
+    if (!existsSync(TILE_DISK_ROOT)) return;
+    const dirs = readdirSync(TILE_DISK_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory())
+      .map((d) => ({ name: d.name, m: statSync(join(TILE_DISK_ROOT, d.name)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    for (const d of dirs.slice(keep)) rmSync(join(TILE_DISK_ROOT, d.name), { recursive: true, force: true });
+  } catch { /* 清理失败不影响启动 */ }
+}
+
+function startPrewarm(worldId: string, style: TerrainStyle): PrewarmState {
+  const key = `${worldId}|${style}`;
+  const cur = prewarmState.get(key);
+  if (cur && cur.state === 'running') return cur;
+  const jobs: TileQuery[] = [];
+  for (const S of PREWARM_LEVELS) {
+    const cols = 4 * S;
+    const rows = 2 * S;
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const x = col * PREWARM_SIZE;
+        const y = row * PREWARM_SIZE;
+        jobs.push({ worldId, style, S, x, y, size: PREWARM_SIZE, key: `${worldId}|${style}|r${TILE_RENDER_VER}|${S}|${x}|${y}|${PREWARM_SIZE}` });
+      }
+    }
+  }
+  const st: PrewarmState = { state: 'running', done: 0, total: jobs.length, startedAt: Date.now(), style };
+  prewarmState.set(key, st);
+  void (async () => {
+    const rec = getWorldRecord(worldId);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < jobs.length) {
+        const t = jobs[next++]!;
+        if (!existsSync(tileDiskPath(t))) {
+          const map = (await renderViaPool(worldId, rec.world, { kind: 'tile', style: t.style, S: t.S, x: t.x, y: t.y, size: t.size })) ??
+            renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
+          const png = encodePng(map.width, map.height, map.rgba);
+          const lines = { sea: map.sea ?? [], lake: map.lake ?? [] };
+          cacheTile(t.key, png, lines);
+          writeTileDisk(t, png, lines);
+        }
+        st.done++;
+      }
+    };
+    try {
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      st.state = 'done';
+    } catch {
+      st.state = 'failed';
+    }
+  })();
+  return st;
+}
+
+function getOwnerMap(s: Session): {
+  png: Buffer;
+  grid: { w: number; h: number; owner: number[] };
+  colors: Record<string, string>;
+  regions: number[][];
+  borders: number[][];
+  fingerprint: string;
+  width: number;
+  height: number;
+} {
   const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
   const hit = ownerCache.get(s.id);
   if (hit && hit.fingerprint === fingerprint) {
-    const j = hit.json as { png: string; grid: { w: number; h: number; owner: number[] }; colors: Record<string, string>; width: number; height: number };
+    const j = hit.json as {
+      png: string;
+      grid: { w: number; h: number; owner: number[] };
+      colors: Record<string, string>;
+      borders: number[][];
+      regions: number[][];
+      width: number;
+      height: number;
+    };
     return { ...j, png: Buffer.from(j.png, 'base64'), fingerprint };
   }
   const map = renderOwnerMap(s);
   const png = encodePng(map.width, map.height, map.rgba);
-  const json = { png: png.toString('base64'), grid: map.grid, colors: map.colors, width: map.width, height: map.height };
+  const json = {
+    png: png.toString('base64'),
+    grid: map.grid,
+    colors: map.colors,
+    borders: map.borders,
+    regions: map.regions,
+    width: map.width,
+    height: map.height,
+  };
   ownerCache.set(s.id, { fingerprint, json });
-  return { png, grid: map.grid, colors: map.colors, width: map.width, height: map.height, fingerprint };
+  return {
+    png,
+    grid: map.grid,
+    colors: map.colors,
+    borders: map.borders,
+    regions: map.regions,
+    width: map.width,
+    height: map.height,
+    fingerprint,
+  };
 }
 
 function eventsOf(s: Session): { entries: EventView[]; total: number } {
@@ -852,7 +987,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
   if (method === 'GET' && pathname === '/api/map/base') {
     const worldId = url.searchParams.get('worldId') ?? '';
     if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
-    sendImmutablePng(res, getBasePng(worldId, styleOf(url.searchParams)));
+    sendImmutablePng(res, await getBasePng(worldId, styleOf(url.searchParams)));
     return true;
   }
 
@@ -871,6 +1006,34 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     return true;
   }
 
+  // 细沟描线(卫星画风高倍用):底图上的沟影来自 raster 的逐像素汇流明暗,和河网不是同一套数据,
+  // 所以单独下发一份折线 + 强度;只在卫星画风打开时按需拉,每世界算一次(约 2.5s)。
+  if (method === 'GET' && pathname === '/api/map/veins') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    let json = veinCache.get(worldId);
+    if (!json) {
+      const rec = getWorldRecord(worldId);
+      json = JSON.stringify(renderVeinOverlay(rec.world));
+      veinCache.set(worldId, json);
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
+    return true;
+  }
+
+  // 预渲染:POST 启动,GET 查进度。前端建完世界先等它把 S=2/4/8 的瓦片算完再进地图。
+  if (pathname === '/api/map/prewarm') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    const style = styleOf(url.searchParams);
+    const st = method === 'POST'
+      ? startPrewarm(worldId, style)
+      : prewarmState.get(`${worldId}|${style}`) ?? { state: 'idle', done: 0, total: 0, startedAt: 0, style };
+    sendJson(res, 200, { state: st.state, done: st.done, total: st.total, style });
+    return true;
+  }
+
   // 放大后按屏幕现算的一块(同主站 tileWorker):(x, y) 是球面展开平面上的坐标,可以越过南北极
   if (method === 'GET' && (pathname === '/api/map/tile' || pathname === '/api/map/coast')) {
     let t: TileQuery;
@@ -880,16 +1043,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       fail(res, 400, e instanceof Error ? e.message : '瓦片参数不合法');
       return true;
     }
-    const render = (): { png: Buffer; sea: number[][]; lake: number[][] } => {
+    const render = async (): Promise<{ png: Buffer; sea: number[][]; lake: number[][] }> => {
       const rec = getWorldRecord(t.worldId);
-      const map = renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
-      return { png: encodePng(map.width, map.height, map.rgba), sea: map.sea, lake: map.lake };
+      // 池里渲染后再送回主线程编码;池不可用/超时就回退单进程。
+      const map =
+        (await renderViaPool(t.worldId, rec.world, { kind: 'tile', style: t.style, S: t.S, x: t.x, y: t.y, size: t.size })) ??
+        renderTile(rec.world, t.style, t.S, t.x, t.y, t.size);
+      return { png: encodePng(map.width, map.height, map.rgba), sea: map.sea ?? [], lake: map.lake ?? [] };
     };
     if (pathname === '/api/map/tile') {
-      let png = tileCache.get(t.key);
+      let png = tileCache.get(t.key) ?? readTileDisk(t);
       if (!png) {
-        const r = render();
+        const r = await render();
         cacheTile(t.key, r.png, { sea: r.sea, lake: r.lake });
+        writeTileDisk(t, r.png, { sea: r.sea, lake: r.lake });
         png = r.png;
       }
       sendImmutablePng(res, png);
@@ -898,9 +1065,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     // 海岸线:按这块瓦片自己的倍率追的,和这块的地形严丝合缝(1 倍底图追的那份放大后会对不上)
     let lines = tileLines.get(t.key);
     if (!lines) {
-      const r = render();
+      const disk = readTileDisk(t, 'json');
+      if (disk) {
+        try { lines = JSON.parse(disk.toString('utf8')) as { sea: number[][]; lake: number[][] }; } catch { lines = undefined; }
+      }
+    }
+    if (!lines) {
+      const r = await render();
       lines = { sea: r.sea, lake: r.lake };
       cacheTile(t.key, r.png, lines);
+      writeTileDisk(t, r.png, lines);
     }
     sendImmutableJson(res, lines);
     return true;
@@ -917,8 +1091,127 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       colors: m.colors,
       width: m.width,
       height: m.height,
+      borders: m.borders,
+      regions: m.regions,
       fingerprint: m.fingerprint,
     });
+    return true;
+  }
+
+  // 标签层:地名 / 河名 / 湖名 / 国名,按会话当前年份生成(几百条,JSON 传一次)
+  if (method === 'GET' && pathname === '/api/labels') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const year = s.play.year;
+    const key = `${s.id}|${year}`;
+    let json = labelsCache.get(key);
+    if (!json) {
+      json = JSON.stringify(buildLabels(s.world, s.civ, { year }));
+      labelsCache.set(key, json);
+      if (labelsCache.size > 8) labelsCache.clear();
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
+    return true;
+  }
+
+  // 疆域高清瓦片:放大后按当前倍率现算一块(和 /api/map/tile 同一套坐标约定);
+  // 整张疆域网(/api/map/owners)仍负责缩小时的兜底 + 240 网格 + 国界线。
+  if (method === 'GET' && pathname === '/api/map/owner-tile') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const S = Number(q.get('S'));
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    const size = Number(q.get('size'));
+    if (!Number.isFinite(S) || S < 0.25 || S > 24) { fail(res, 400, 'S 超出范围'); return true; }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
+    const s = getSession(sid);
+    const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
+    const key = `${sid}|${fingerprint}|${S}|${x}|${y}|${size}`;
+    const hit = ownerTilePngs.get(key);
+    if (hit) { sendPng(res, hit); return true; }
+    const civ = ownerCivData(s.civ);
+    const map =
+      (await renderViaPool(worldIdOf(s.worldParams), s.world, { kind: 'owner', S, x, y, size, civ })) ??
+      renderOwnerTilePixels(s.world, civ, S, x, y, size);
+    const png = encodePng(map.width, map.height, map.rgba);
+    if (ownerTilePngs.size > 512) ownerTilePngs.clear();
+    ownerTilePngs.set(key, png);
+    sendPng(res, png);
+    return true;
+  }
+
+  // 州信息:鼠标悬停时按世界像素查这一州的归属 / 群落 / 河流(像素→州 的索引服务端按世界缓存)
+  if (method === 'GET' && pathname === '/api/map/region-info') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    const s = getSession(sid);
+    const info = regionInfoAt(s.world, s.civ, x, y);
+    sendJson(res, 200, { info });
+    return true;
+  }
+
+  // Region atlas: downsampled pixel->region grid (gzip base64) + all region metadata.
+  // The client keeps it locally so hover needs zero requests; built once per session state.
+  if (method === 'GET' && pathname === '/api/map/region-atlas') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, 'missing sessionId'); return true; }
+    const scale = Math.max(1, Math.min(8, Math.round(Number(q.get('scale') ?? 2)) || 2));
+    const s = getSession(sid);
+    const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
+    const key = `${s.id}|${fingerprint}|${scale}`;
+    let json = atlasCache.get(key);
+    if (!json) {
+      const at = regionAtlas(s.world, s.civ, scale);
+      const buf = Buffer.from(at.data.buffer, at.data.byteOffset, at.data.byteLength);
+      const gz = gzipSync(buf, { level: 6 });
+      json = JSON.stringify({
+        w: at.w,
+        h: at.h,
+        scale: at.scale,
+        regions: at.regions,
+        // 州 → 国 对照(每州所属国 id,-1 无主),开局连续点选用,客户端不用再拉新接口
+        owner: Array.from(s.civ.polity.subarray(0, s.civ.regions.count)),
+        dataGzB64: gz.toString('base64'),
+      });
+      atlasCache.set(key, json);
+      if (atlasCache.size > 6) atlasCache.clear();
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
+    return true;
+  }
+
+  // DM 对话 / Jev 裁决:从会话日志里整理出“每回合说了什么、裁了什么”,日志页签直接渲染
+  if (method === 'GET' && pathname === '/api/dialogue') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const rawLimit = q.get('limit');
+    const limit = rawLimit === null || rawLimit === '' ? 80 : Number(rawLimit);
+    if (!Number.isFinite(limit)) { fail(res, 400, 'limit 必须是数字'); return true; }
+    const kindRaw = q.get('kind');
+    const kind = kindRaw === 'dm' || kindRaw === 'jev' || kindRaw === 'monarch' ? kindRaw : undefined;
+    const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
+    const key = `${s.id}|${fingerprint}|${limit}|${kind ?? ''}`;
+    let json = dialogueCache.get(key);
+    if (!json) {
+      json = JSON.stringify(dialogueView(s, { limit, kind }));
+      dialogueCache.set(key, json);
+      if (dialogueCache.size > 16) dialogueCache.clear();
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
     return true;
   }
 
@@ -994,12 +1287,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const sid = url.searchParams.get('sessionId') ?? '';
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
     const s = getSession(sid);
+    const colors = parseMagicColors(url.searchParams.get('colors'));
     const view = magicView(s);
     sendJson(res, 200, {
       enabled: !!view,
       strength: view?.strength ?? null,
       layers: view?.layers ?? [],
-      legend: magicLegendOf(s.civ, s.play.year),
+      legend: magicLegendOf(s.civ, s.play.year, colors ?? undefined),
       year: s.play.year,
       yearNow: gameYearOf(s.play.year),
     });
@@ -1012,13 +1306,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const s = getSession(sid);
     const layer = magicLayerOf(s.civ);
     if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const colors = parseMagicColors(url.searchParams.get('colors'));
+    const colorKey = colors ? colors.join(',') : '';
     const asked = optNum(url.searchParams.get('year'));
     const lo = layer.years[0];
     const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(lo, asked));
-    const key = `${s.id}|${year}`;
+    const key = `${s.id}|${year}|${colorKey}`;
     const hit = magicPngs.get(key);
     if (hit) { sendPng(res, hit.png); return true; }
-    const out = renderMagicMap(s.world, s.civ, year, DEFAULT_MAGIC_STYLE);
+    const style = colors ? { ...DEFAULT_MAGIC_STYLE, colors } : DEFAULT_MAGIC_STYLE;
+    const out = renderMagicMap(s.world, s.civ, year, style);
     if (!out) { fail(res, 404, '没有魔力图层'); return true; }
     if (magicPngs.size > 24) magicPngs.clear();
     magicPngs.set(key, { png: out.png, legend: out.legend, frameYear: out.frameYear });
@@ -1032,11 +1329,66 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const s = getSession(sid);
     const layer = magicLayerOf(s.civ);
     if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const colors = parseMagicColors(url.searchParams.get('colors'));
     const asked = optNum(url.searchParams.get('year'));
     const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
-    const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)));
+    const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)), colors ?? undefined);
     if (!data) { fail(res, 404, '没有魔力图层'); return true; }
-    sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year) });
+    sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year, colors ?? undefined) });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/magic/tile') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const layer = magicLayerOf(s.civ);
+    if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
+    const S = Number(q.get('S'));
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    const size = Number(q.get('size'));
+    if (!Number.isFinite(S) || S < 0.25 || S > 24) { fail(res, 400, 'S 超出范围'); return true; }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
+    const asked = optNum(q.get('year'));
+    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
+    const colors = parseMagicColors(q.get('colors'));
+    const colorKey = colors ? colors.join(',') : '';
+    const key = `${s.id}|${year}|${S}|${x}|${y}|${size}|${colorKey}`;
+    const hit = magicTilePngs.get(key);
+    if (hit) { sendPng(res, hit); return true; }
+    const style = colors ? { ...DEFAULT_MAGIC_STYLE, colors } : DEFAULT_MAGIC_STYLE;
+    const out = renderMagicTile(s.world, s.civ, year, S, x, y, size, style);
+    if (!out) { fail(res, 404, '没有魔力图层'); return true; }
+    if (magicTilePngs.size > 512) magicTilePngs.clear();
+    magicTilePngs.set(key, out.png);
+    sendPng(res, out.png);
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/start/config') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    sendJson(res, 200, startConfigStatus(getSession(sid)));
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/start/nations') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    sendJson(res, 200, { nations: listStartNations(s) });
+    return true;
+  }
+
+  // P1.5:新建国家表单的「🎲自动命名」;规则与服务端自动命名一致,不撞现有国名
+  if (method === 'GET' && pathname === '/api/start/auto-name') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    sendJson(res, 200, { name: autoNationName(s) });
     return true;
   }
 
@@ -1097,6 +1449,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         llm: args.features && typeof args.features === 'object' ? (args.features as Record<string, unknown>).llm !== false : true,
         jev: args.features && typeof args.features === 'object' ? (args.features as Record<string, unknown>).jev === true : false,
       };
+      // 开局国家设置(数量 / 控制方式 / 增删):可以在建会话时一起带上,建完立刻应用
+      const setupArg =
+        args.setup && typeof args.setup === 'object' && !Array.isArray(args.setup)
+          ? (args.setup as StartSetupInput)
+          : undefined;
       const { session, summary } = openSession({
         worldId,
         startYear,
@@ -1107,10 +1464,139 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         review: args.review === true,
         ...(dmPreset ? { dmPreset: true } : {}),
         ...(magicField !== undefined ? { magicField } : {}),
+        ...(setupArg ? { setup: setupArg } : {}),
       });
-      ownerCache.delete(session.id);
+      let startSetup: unknown = null;
+      if (setupArg) {
+        try {
+          startSetup = applyStartSetup(session);
+        } catch (e) {
+          fail(res, 400, e instanceof Error ? e.message : String(e));
+          return true;
+        }
+      }
+      invalidateOwnerCache(session.id);
       chronCache.delete(session.id);
-      sendJson(res, 200, { session: summary, state: stateView(session) });
+      sendJson(res, 200, { session: summary, state: stateView(session), ...(startSetup ? { startSetup } : {}) });
+      return true;
+    }
+
+    // 角色卡:从生平推断性格(LLM 可用且 DM 非 mock 时走 LLM,否则关键词规则;离线也有结果)
+    if (pathname === '/api/start/infer-card') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const biography = typeof args.biography === 'string' ? args.biography : '';
+      let result: unknown;
+      try {
+        result = await inferCardFromBiography(s, biography, { llm: args.llm !== false });
+      } catch (e) {
+        fail(res, 400, e instanceof Error ? e.message : String(e));
+        return true;
+      }
+      sendJson(res, 200, { ok: true, result });
+      return true;
+    }
+
+    // 落点预览:只算不改状态(P1.6 落点 hover/无城市引导用;无城市年份返回 409 NO_CITIES)
+    if (pathname === '/api/start/preview-nation') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const atRaw = args.at as Record<string, unknown> | undefined;
+      const input: { at?: { x: number; y: number }; size?: number; allowExclaves?: boolean } = {};
+      if (atRaw && typeof atRaw === 'object' && Number.isFinite(Number(atRaw.x)) && Number.isFinite(Number(atRaw.y))) {
+        input.at = { x: Number(atRaw.x), y: Number(atRaw.y) };
+      }
+      if (args.size !== undefined && args.size !== null && args.size !== '') input.size = num(args, 'size', 8);
+      if (args.allowExclaves === true) input.allowExclaves = true;
+      try {
+        sendJson(res, 200, previewNationAt(s, input));
+      } catch (e) {
+        const err = e as Error & { code?: string };
+        if (err.code === 'NO_CITIES') {
+          sendJson(res, 409, { code: 'NO_CITIES', error: err.message });
+        } else {
+          fail(res, 400, err.message);
+        }
+      }
+      return true;
+    }
+
+    // 开局国家设置:数量 / 控制方式 / 增删国家(只允许第一回合前,每个会话一次)
+    if (pathname === '/api/session/start-setup') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const setupYear = Math.floor(s.play.year);
+      // P1.6:年份太早(如第 1 年)城市还没建立,明确 409 提示,避免前端只看到"点了没反应"
+      if (!hasUsableCities(s, setupYear)) {
+        sendJson(res, 409, { code: 'NO_CITIES', error: noCitiesMessage(s, setupYear) });
+        return true;
+      }
+      const setup: Record<string, unknown> = {};
+      if (args.count !== undefined && args.count !== null && args.count !== '') setup.count = num(args, 'count', 0);
+      if (args.remove !== undefined) setup.remove = args.remove;
+      if (args.removeRegions !== undefined) setup.removeRegions = args.removeRegions;
+      if (args.controls !== undefined) setup.controls = args.controls;
+      if (args.nations !== undefined) setup.nations = args.nations;
+      else if (args.add !== undefined) setup.nations = args.add;
+      if (args.force === true) setup.force = true;
+      if (args.names !== undefined) setup.names = args.names;
+      // 历史遗留兼容:旧面板会带 playerPolityId,现在界面不再发送,也不表示"玩家国家"。
+      if (args.playerPolityId !== undefined) setup.playerPolityId = args.playerPolityId === null ? null : Number(args.playerPolityId);
+      if (args.cleanExclaves !== undefined) setup.cleanExclaves = args.cleanExclaves;
+      if (args.allowExclaves === true) setup.allowExclaves = true;
+      let result: unknown;
+      try {
+        result = applyStartSetup(s, setup as StartSetupInput);
+      } catch (e) {
+        const err = e as Error & { needConfirm?: unknown };
+        if (Array.isArray(err.needConfirm)) {
+          // 删到最后一州:前端据此弹确认框,确认后带 force:true 再提交
+          sendJson(res, 409, { error: err.message, needConfirm: err.needConfirm });
+        } else {
+          fail(res, 400, err.message);
+        }
+        return true;
+      }
+      invalidateOwnerCache(s.id);
+      chronCache.delete(s.id);
+      sendJson(res, 200, { ok: true, result, state: stateView(s) });
+      return true;
+    }
+
+    // 开局定制:君主角色卡 + 起始疆域大小/位置(只允许第一回合前)
+    if (pathname === '/api/session/custom-start') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const customYear = Math.floor(s.play.year);
+      // P1.6:无城市年份明确 409,而不是让 applyCustomStart 抛 500
+      if (!hasUsableCities(s, customYear)) {
+        sendJson(res, 409, { code: 'NO_CITIES', error: noCitiesMessage(s, customYear) });
+        return true;
+      }
+      const atRaw = args.at as Record<string, unknown> | undefined;
+      const input: Record<string, unknown> = {};
+      if (args.polityId !== undefined && args.polityId !== null && args.polityId !== '') input.polityId = Number(args.polityId);
+      if (atRaw && typeof atRaw === 'object' && Number.isFinite(Number(atRaw.x)) && Number.isFinite(Number(atRaw.y))) {
+        input.at = { x: Number(atRaw.x), y: Number(atRaw.y) };
+      }
+      if (args.size !== undefined && args.size !== null && args.size !== '') input.size = Number(args.size);
+      if (args.regionIds !== undefined && args.regionIds !== null && !Array.isArray(args.regionIds)) {
+        fail(res, 400, 'regionIds 要是州号数组');
+        return true;
+      }
+      if (Array.isArray(args.regionIds)) input.regionIds = args.regionIds;
+      if (args.card && typeof args.card === 'object') input.card = args.card as Record<string, unknown>;
+      if (args.autoCard === true) input.autoCard = true;
+      if (args.allowExclaves === true) input.allowExclaves = true;
+      const result = applyCustomStart(s, input);
+      // m05242 修正:custom-start 的 polityId 只表示"要改哪一国的君主卡/疆域",不再写入 playerPolityId(没有玩家国家)。
+      invalidateOwnerCache(s.id);
+      chronCache.delete(s.id);
+      sendJson(res, 200, { state: stateView(s), result });
       return true;
     }
 
@@ -1148,7 +1634,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
       const round = await monarchRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
       return true;
     }
@@ -1173,7 +1659,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
             .filter((r) => Number.isInteger(r.polityId) && Number.isInteger(r.index))
         : undefined;
       const round = await monarchCommit(s, reject ? { reject } : {});
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
       return true;
     }
@@ -1218,8 +1704,43 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         ...(args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) }),
         ...(Array.isArray(args.decisions) ? { decisions: args.decisions } : {}),
       });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { dm, state: stateView(s) });
+      return true;
+    }
+
+    // 推演中的 DM 对话框:上帝视角直接对任意国家下硬命令(解析 → 引擎校验 → 排队,下一回合开始执行)
+    // 修正(m05242):这里没有"玩家国家",命令必须显式点名国家;不再读取 playerPolityId。
+    if (pathname === '/api/dm/chat') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const text = String(args.text ?? '').trim();
+      const polities = (stateGet(s, { chronicle: false }).polities as { id: number; name: string; key: string }[])
+        .map((p) => ({ id: p.id, name: p.name, key: p.key }));
+      const parsed = parsePlayerCommand(text, { polities });
+      let reply: Record<string, unknown> = { ...parsed };
+      if (parsed.ok) {
+        const cleaned = cleanOrders(s.play, parsed.commands);
+        if (!cleaned.commands.length) {
+          reply = { ...parsed, ok: false, rejected: cleaned.rejected.map((r) => r.reason) };
+        } else {
+          const rec = queuePlayerCommand(s, { text, commands: parsed.commands, summary: parsed.summary });
+          reply = rec
+            ? { ...parsed, queued: rec }
+            : { ...parsed, ok: false, rejected: ['待执行命令已满(最多 10 条),先撤销几条再发'] };
+        }
+      }
+      sendJson(res, 200, { reply, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/dm/chat/cancel') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const rec = cancelPlayerCommand(s, Math.round(num(args, 'id', 0)));
+      sendJson(res, 200, { cancelled: rec, state: stateView(s) });
       return true;
     }
 
@@ -1247,7 +1768,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
       const petty = await pettyRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { petty, state: stateView(s) });
       return true;
     }
@@ -1257,7 +1778,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
       const turn = turnStep(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { turn, state: stateView(s) });
       return true;
     }
@@ -1346,8 +1867,24 @@ function parseArgs(argv: string[]): { port: number } {
   return { port };
 }
 
+/**
+ * 后台渲染给前台让路:把 viewer 进程优先级降到「低于正常」。
+ * 用户在别的窗口打字/聊天时,调度器会优先照顾前台应用;本进程只在有空闲 CPU 时干活。
+ * 浏览器侧还有「空闲 6 秒才预取」与「拖动中不画细节层」两道闸,这里再压一层。
+ */
+function softenPriority(): void {
+  try {
+    setPriority(process.pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
+  } catch {
+    // 权限不够(或平台不支持)就算了,不影响功能
+  }
+}
+
 function main(): void {
   const { port } = parseArgs(process.argv.slice(2));
+  softenPriority();
+  pruneTileDisk(1);
+  process.on('exit', () => disposeMapPools());
   const server = createServer((req, res) => {
     void handle(req, res);
   });

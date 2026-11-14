@@ -323,11 +323,11 @@ $env:JEV_API_KEY = (Get-Content -Raw C:\path\to\jev-key.txt).Trim()
 
 静态场只能看;这一层把「魔脉」做成**跟着历史逐年变化、并且真的影响推演**的场,思路来自引擎自带的官方示例插件 `examples/plugins/magic/`(表卡 + 影响口 + 图层,不依赖 QuickJS,内联成原生 `SimPlugin`,见 `src/gen/civ/magicPlugin.ts`):
 
-- **引擎侧**:三张按州记的表——`vein`(灵脉,约 1/16 的州有,一次生成后不变)、`rural`(接官方乡村人口表)、`magic`(每 5 年按 `spread/seep/fade/drain` 扩散、渗出、衰减、被人口耗散);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(强度 1 时 0–100 浓度≈1–2 倍)。图层每 50 年存一帧(`keep=50`),跟着 `Civ.simLayers` 一起存档/回放。
+- **引擎侧**:两张按地块记的表——`vein`(灵脉,约 6% 的地块有,一次生成后不变)、`magic`(每 5 年按 `spread/seep/fade/drain` 在相邻地块间扩散、渗入、自然消退);`influences: ['city.capacity']` 把浓度换算成城人口上限倍率(先把地块值按州求均值,跳过水面;强度 1 时 0–100 浓度≈1–2 倍)。图层每 100 年存一帧(`keep=100`,地块图层的格数固定,字节上限 7.8 MB),跟着 `Civ.simLayers` 一起存档/回放。
 - **开关**:`civ_session_open` 加 `magicField: true`(默认强度 1)或 `magicField: number`(0–3,0.5 一档);`civ_state_get` 返回 `magic`(强度 + 图层元数据/统计)。**不给 `magicField` 时,引擎行为和官方规则逐字节一致**;`magicField: 0` 只记图层、不改数值,也拿来做确定性对账。
-- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计)。
-- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,图例显示真实刻度(0–100);hover 同时显示地块静态场与州魔力浓度。
-- **自检**:`node mcp/.build/mcp/selftest-magic.js`(34 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
+- **渲染层** `mcp/magic-render.ts`:只读 `simLayers` 的 `magic` 层,按当前回合选帧(取不晚于该年的最后一帧),两帧之间可线性插值;整张 PNG 与地形底图同为 2048×1024——先把每块地的值经 `sphereField` 按球面三角形重心插值铺成连续场(相邻地块之间线性过渡),再叠显示级盒式模糊与高值辉光,低值近透明;`GET /api/magic/meta|base|data`(PNG 叠在底图上,`data` 给 hover 网格/图例/统计,`grid` 存地块编号、水面为 −1,并带 `unit`/`count`)。放大超过约 2 倍后,查看器改用 `renderMagicTilePixels` 的窗口化瓦片(与地形瓦片同一网格 `x=i*512,y=j*512`,按瓦片自己的倍率做球面覆盖、模糊与辉光,所以放大不糊),路由 `GET /api/magic/tile?sessionId=&year=&S=&x=&y=&size=`;瓦片没铺满前用整张 2048 图兜底。所有 `/api/magic/*` 都接受可选 `colors=#rrggbb,#......`(2–8 个,只改显示、不改数值),并纳入 PNG/瓦片缓存键。
+- **查看器**:顶部勾「魔力场」→ 强度(0–3);「本局动态层 · 魔力」面板可选图层年份、回到本回合,还能选色带(默认紫 / 余烬 / 青翠 / 冰蓝 / 灰阶 / 自定义三色取色器,写进 localStorage),图例与瓦片颜色跟着变;hover 同时显示地块静态场与地块魔力浓度。想分清「地图本来的颜色」和「魔力的颜色」时,把顶部「画法」切到**白模(灰白)**:地形只画灰白浮雕与海岸,所有彩色都来自叠加层(魔力/疆域/静态场)。
+- **自检**:`node mcp/.build/mcp/selftest-magic.js`(35 项:强度 0 = 官方指纹、强度 1.5 不同、同配置两次逐位一致、图层元数据/帧数、≥60% 共有城人口更高、回合后出现新帧、回放对账、工具开关、强度归一化)。
 
 ## 可配置场(阶段A:玩家自己造「铲子」)
 
@@ -426,12 +426,12 @@ node mcp/.build/mcp/viewer.js --port 5190
 查看器是**独立进程**(零新依赖,只监听 127.0.0.1),内置前端在 `mcp/viewer/`(浅色界面照主站的 `src/ui/theme.css`;系统跟随深浅色):
 
 - 参数栏:种子、地块数、起始年、每回合年数、回合数、君主范围(`全部` 或前 N 国)、DM 规则预设、mock 决策、**魔力场与强度**;真模型设置(provider / baseUrl / model / Key)可折叠,Key 只存在服务端内存。参数收在顶栏「参数」打开的浮窗里。
-- 地图:**铺满整个窗口**当背景。顶栏「画法」切换主站同款的四种地形(默认手绘羊皮纸);东西相连,越过南北极也会按球面接法(纬度镜像 + 经度挪半圈)接到另一侧,所以**上下左右都能无限拖**;放大超过 1 倍底图后按 √2 分档现算高清块,越放大越锐利;滚轮 / 双击 / 右下角按钮缩放,「复位」回到默认视图。点选国家、hover 数值、国都标注都按同一套跨极变换反算。
+- 地图:**铺满整个窗口**当背景。顶栏「画法」切换五种地形(手绘羊皮纸 / 卫星写实 / 地理图 / **白模(灰白)** / 旧沙盒底图),白模只画灰白浮雕与海岸、不画生物群系颜色,专门用来看叠加层(魔力/疆域/静态场)的颜色;东西相连,越过南北极也会按球面接法(纬度镜像 + 经度挪半圈)接到另一侧,所以**上下左右都能无限拖**;放大超过 1 倍底图后按 √2 分档现算高清块,越放大越锐利;滚轮 / 双击 / 右下角按钮缩放,「复位」回到默认视图。点选国家、hover 数值、国都标注都按同一套跨极变换反算。
 - 右侧:国家列表(色块 / 州数 / 君主)与选中详情(君主倾向、邻国、进行中的战争),可收起到只剩标题条。
 - 底部标签页:AI 决策(每回合每君主看到什么、为什么下命令、命令/拒收/耗时)、编年史(按类型着色)、回合日志(领土变化 / 指纹),同样可收起。
 - 左侧行动栏:创建世界 → 开始会话 → 跑一回合 → 自动播放,以及回放对账、导出会话;这三块都是浮在地图上的玻璃卡片,地图始终露在中间。
 - 按钮:创建世界、开始会话、跑一回合、自动播放、回放对账、导出会话。
-- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data`、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
+- 接口:`/api/world`、`/api/session`、`/api/monarch/setup`、`/api/monarch/round`、`/api/dm/setup`、`/api/dm/round`、`/api/petty/setup`、`/api/petty/round`、`/api/field/meta|base|data|legend`、`/api/magic/meta|base|data|tile`(都接受可选 `colors=#rrggbb,...`)、`/api/state`、`/api/map/base?worldId=&style=`(整张 PNG,style 含 white)、`/api/map/tile?worldId=&style=&S=&x=&y=&size=`(放大块 PNG)、`/api/map/coast?worldId=&style=&S=&x=&y=&size=`(同一块自带的海岸 / 湖岸线 JSON)、`/api/map/vectors?worldId=`(波纹 / 符号 / 低倍率海岸线 JSON)、`/api/map/owners`、`/api/chronicle`、`/api/verify`、`/api/export`、`/api/health`。
 
 ### 地形渲染:复用主站的管线
 
@@ -440,7 +440,7 @@ node mcp/.build/mcp/viewer.js --port 5190
 | 环节 | 用的模块 |
 |---|---|
 | 1 倍整张主图 | `src/gen/raster.ts` 的 `rasterize(world, 1, false)`,2048 × 1024 |
-| 上色 | `src/render/fantasy.ts` 的 `fantasyFullPixels`;写实风用 `realistic.ts` 的 `realisticPixels` / `realisticWindowPixels` |
+| 上色 | `src/render/fantasy.ts` 的 `fantasyFullPixels`;写实风用 `realistic.ts` 的 `realisticPixels` / `realisticWindowPixels`;白模用本文件 `whitePixels()`(灰白浮雕 + 浅灰海,不画生物群系颜色) |
 | 放大现算一块 | `src/gen/rasterWindow.ts` 的 `zoomSource` + `rasterizeWindow` |
 | 矢量细节层 | `src/render/fantasy.ts` 的 `fantasyCoastLines` / `seaRippleLines` / `planGlyphs` / `simplifyLine` → 浏览器 Canvas 画 |
 | 编码 | 仍然是 `mcp/png.ts` 手写 zlib,不碰 canvas / sharp |
@@ -453,13 +453,17 @@ node mcp/.build/mcp/viewer.js --port 5190
   **海岸 / 湖岸线跟着瓦片走**(`mcp/coast-trace.ts`):上面那份是在 1 倍底图(2048 × 1024)上追一次就固定的,而瓦片是按当前倍率重新栅格化的 —— 两边的水陆边界差 1 个底图像素,放大到 400% 就是 3~4 个屏幕像素,线会"浮"在海岸外面(实测偏差 mean 2.9 / p90 6.6 / max 11.4 瓦片像素)。现在 `renderTile()` 顺手把这块自己的水陆图走一遍 marching squares,接成折线(Douglas–Peucker 抽稀 0.25 瓦片像素,点数砍一半)随 `/api/map/coast` 发给前端,前端按瓦片的贴图尺寸缩放后画在瓦片矩形内 —— 实测偏差 0.5 瓦片像素(就是边界像素本身的量化下限)。全局那份只用来补瓦片还没到的空白:前端把瓦片矩形做成 `Path2D` 用 `evenodd` 裁掉;当前层铺满视口时(`S.tileFull`)整份都不画。
   前端按**每一小段线段**做视口裁剪(不是整条折线的包围盒:长海岸线横跨整幅地图时,整条 bbox 判断会漏画局部,出现"一半有描边一半没有"),并且每 3000 段 `stroke()` 一次,避免上万段塞进同一个路径时后半段丢失。跨 180° 经线的海岸线坐标会伸出左右边界(`fantasyCoastLines` 里 3 条线就占了近一半点数),前端照主站 `chunkPath` / `wrapShifts` 的做法,对 `x1 > W` 的线在另一侧补一份 `x − W`、对 `x0 < 0` 的补 `x + W`,贴着边界的符号同样补一份 —— 否则那段海岸只在某一份平铺副本里出现,把地图拖到屏幕边缘时就整段消失,移回中间又出现。换档时 `S.tileSeq++` 让上一档没发完的瓦片请求作废,避免不同倍数混在一起。矢量接口取不到(监视台进程还是旧代码)时会明确弹提示让用户重启,因为此时位图墨线已被服务端抹掉。
 - **窗口起点必须是整数**(`src/gen/rasterWindow.ts`):`renderTile` 的起点是 `(x − pad) % W`,而 `W = 底图宽 × S`(S 取 √2 的整数半次幂)不是整数,会算出 `3067.999999999999`。`coverWindow` 用 `cosLat[py]` / `cosLon[px]` 按下标取,带小数的下标直接取到 `undefined`,三角形内测试全部落空、整段被静默跳过 —— 表现为瓦片上一条几十像素高、完全没铺地形的横带(水陆图退化成"陆地"),前端就会在那里画出一条笔直的海岸线,而且只在大倍率下显眼。现在行列区间往外取整到整数(整数起点时结果逐位不变,主站不受影响),`selftest-coast` 里钉了这条用例:小数起点不得有整行漏铺、瓦片里不得有整行发黑。
-- **拖动 / 缩放的流畅度**:Canvas2D 的瓶颈是填充率,高 DPI 大窗口一帧要铺 700 万像素,再乘上好几层(底图 + 瓦片 + 场 + 矢量)。现在做了五件事:
+- **拖动 / 缩放的流畅度**:Canvas2D 的瓶颈是填充率,高 DPI 大窗口一帧要铺 700 万像素,再乘上好几层(底图 + 瓦片 + 场 + 矢量)。现在做了九件事:
   1. **合帧**:`requestDraw()` 把拖动 / 滚轮事件合并到 `requestAnimationFrame`,一帧最多画一次(以前每个 pointermove 都同步重绘,事件一密就排队卡死)。
   2. **海岸线连着描**:连续可见的线段共用一个 `moveTo` + 一串 `lineTo`,线帽改成 `butt`。以前每段单独 `moveTo` 再配圆头线帽,等于给一万多段各画两个圆 —— dpr2 / 1920 宽下**单帧 400ms 以上**,改完掉到 20ms 级。
   3. **符号整帧两条路径**:所有可见符号合成两条 `Path2D`(实心三角 + 线条),整帧只调一次 `fill` + 一次 `stroke`,不再是每个符号 2~4 次。
-  4. **瓦片盖满就不画底图**:高倍率下把 2048 宽的整图放大到几万像素、再被瓦片完全盖住,纯属白填。
+  4. **瓦片盖满就不画底图**:高倍率下把 2048 宽的整图放大到几万像素、再被瓦片完全盖住,纯属白填;同档待加载瓦片并发从 3 提到 6(`loadHiTiles` / `loadMagicTiles` 每批 `p += 6` + `Promise.all`)。
   5. **交互时降分辨率**:画布按"最多铺 320 万像素"反推一个系数(`S.rs`),拖动 / 滚轮时降到 0.5~1(1920 宽的 dpr2 约 0.65),手停 220ms 后恢复满分辨率重画一次。dpr1 的小窗口不触发。
-  实测(Playwright + 无头 Chromium,SwiftShader 软件光栅,1920×1000):dpr1 两档缩放都是 11ms/帧;dpr2 从 **493ms/帧降到 44ms**(100%)、**66ms 降到 22ms**(338%)。
+  6. **矢量层交给 Worker**(`vec-draw.js` + `vec-worker.js`):墨线 / 符号的绘制逻辑抽到共享文件,主线程只发参数,Worker 用 `OffscreenCanvas` 画好 `ImageBitmap` 再贴回来;跨极镜像与 ±180° 补线一起烘进去。Worker 不可用(旧浏览器 / 脚本被拦)时自动回退主线程直接描线。
+  7. **交互期降级**:拖动 / 滚轮进行中(距最后一次输入 < 200ms)不画矢量层、不画高清瓦片、不画魔力瓦片,只铺 2048 底图 + 疆域;停手 260ms 后 `requestDraw()` 恢复完整细节,矢量位图也在这时由 Worker 重建。手绘风拖动从改前 **avg 17.9ms / p99 44.5ms / >33ms 12 帧** 降到 **avg 12–13ms / p50 11.1ms / >33ms 3 帧**。
+  8. **后台预取其它画法**:世界 / 会话空闲 6 秒且没有待加载瓦片时,按顺序把其它四种画法的 `/api/map/base` 提前拉好,存进 `S.baseCache`(换世界清空);预取 fetch 用 `priority: 'low'`,给正在拖的请求让路。之后切「画法」直接命中缓存,实测切换耗时从首次 2–3 秒降到 **0.5–1.6ms**。
+  9. **服务端渲染池**(`mcp/map-pool.ts` + `mcp/map-worker.ts`):每个世界懒创建 2 个 `worker_threads`(世界 clone 一次,约 6MB),`/api/map/base` 与瓦片渲染在池里跑,主线程只做 PNG 编码与回包;池挂了或超时自动回退单进程渲染。同时把 viewer 进程优先级降到「低于正常」(`os.setPriority`),用户在前台打字 / 聊天时让路。实测并发 4 块瓦片 3.1s→2.6s(约 1.2×,瓦片本身 CPU 紧,收益主要在不再阻塞主线程与多请求排队)。
+  实测(Playwright + 无头 Chromium,SwiftShader 软件光栅,1920×1000):dpr1 两档缩放都是 11ms/帧;dpr2 从 **493ms/帧降到 44ms**(100%)、**66ms 降到 22ms**(338%);矢量 Worker 生效后 162% 视图拖动稳定在 **12ms/帧**。
 - **跨极**:`/api/map/tile` 的 `(x, y)` 是球面展开坐标,可以出上下边。`n = floor(y / H)` 为奇数时(越过一次极点),按 `(x − W/2, (n+1)H − y)` 取源窗口、渲染结果上下翻回来;这是球面在极点的真实接法,和 main 的地球仪跨极一致。前端底图、疆域 / 场图层、国都标注用同一套变换逐层平铺。
 - **构建补丁**:`src/render/labels/fonts.ts` 里有一句 Vite 专属的 `import.meta.env.BASE_URL`,CommonJS 产物里是语法错误。`mcp/build-compat.cjs` 在每次构建后把产物里的它换成 `'./'`(不改上游源码);`mcp/build.ps1` 和 `scripts/lib/sandboxViewer.ts` 都会调用。因此 tsc 会报那两条 TS1343/TS2339,但产物完整,构建脚本以「关键产物在不在」判成败。
 - 首次生成底图约 2–3 秒(世界生成另算),放大后高清块会在几秒内逐块变清晰(实测单块冷渲染 300–900ms、一屏 6–12 块);瓦片缓存在服务端(最多 192 块)、浏览器 `S.tiles`(最多 160 块)和浏览器磁盘缓存里,拖动与切档都按世界坐标复用。
@@ -476,10 +480,12 @@ node mcp/.build/mcp/viewer.js --port 5190
 - **小事件裁决层(已完成,官方 Jev + v2)**:`src/gen/civ/petty.ts`(20 个模式 + 确定性抽样)、`mcp/petty-client.ts`(官方 Jev `POST /api/v1/decisions`)、`mcp/petty-budget.ts`(token 估算与 P0/P1/P2 打包)、`mcp/petty-queue.ts`(严格串行优先队列/超时/背压/熔断)、`mcp/petty.ts`(扫描→预算→队列→抽样→落效果→日志/DM 摘要);v2 效果 = 城市折损 `sacks` + 发展 `boost`;**MCP 工具增至 20 个(现在 21)**;查看器已加「小事件裁决层」面板(mock 或官方 Jev,Key 只在服务端内存)。
 - **DM 故事事件(已完成,选项 C)**:新增第 26 种干预 `story`(`src/gen/civ/storyEngine.ts` + `mcp/dm.ts` 白名单编译):DM 可以按故事自由写标题/叙事,效果只能落在 4 类引擎效果(城市折损 `sack` / 人口上限 `capacity`(走 `reshaped` 时间线,不改写历史)/ 发展 `dev` / 叙事 `note`)上,≤3 条;命令入日志,回放逐位一致;命令目录随后增到 27 种(新增 `intel`)、查看器标成「故事事件」。
 - **自定义场原型(已完成)**:`src/gen/field.ts`(计算层,魔脉/矿产/辐射三种、逐字节确定、FNV-1a hash)+ `mcp/field-render.ts`(渲染层,色带/拉伸/等高线/辉光/浮雕/透明度,只读数值)+ `mcp/png.ts` + 查看器「自定义场」面板与 `/api/field/*`;计算与渲染彻底分开,改样式不再重算;自检 43 项。
-- **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/rural/magic 三张表 + `city.capacity` 影响口 + 每 50 年一帧图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,PNG + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 34 项。
+- **魔力动态层(已完成)**:`src/gen/civ/magicPlugin.ts`(原生 `SimPlugin`,vein/magic 两张按地块记的表 + `city.capacity` 影响口(按州聚合)+ 每 100 年一帧地块图层)+ `mcp/magic-render.ts`(只读图层,按年份选帧/插值,2048 PNG / LOD 瓦片 + 图例)+ `civ_session_open` 的 `magicField/magicStrength` + `civ_state_get.magic` + 查看器「本局动态层 · 魔力」面板与 `/api/magic/*`;强度 0 时引擎指纹与官方逐字节一致;自检 35 项。
 - **可配置场(阶段A,已完成)**:`src/gen/civ/fieldPlugin.ts` 把玩家给的 `FieldSpec`(密度/源强/扩散/渗出/衰减/人口耗散/强度/图层 + 1–6 条 `influences`)变成本地 `SimPlugin`;`civ_session_open` 的 `fields`(最多 4 份)、`civ_field_catalog` 列出可接的影响口(`city.capacity`/`war.odds`/`unrest.add` 等)与示例 spec;`civ_state_get` 返回 `fields`/`layers`;玩家自己决定影响哪些数值;不给 `fields` 或强度 0 时官方指纹逐字节不变;自检 46 项。
 - **官方 .civplugin 加载器(阶段B,已完成)**:`mcp/plugin-loader.ts` 在 mcp 的 CommonJS 产物里用 QuickJS 直装官方推演插件(文件或源码目录,最多 4 个);`civ_session_open` 加 `plugins` 路径数组,插件与内置魔力场/自定义场同走 `CivParams.plugins`;summary/session.json 记插件 id,`civ_state_get.layers` 能看插件图层;非 sim 插件/坏路径/重复 id/超上限都有中文错误;自检 22 项。
 - **地块级场(阶段C,已完成)**:`FieldSpec.unit` 支持 `tile`(按世界全部 mesh 地块逐年演化);插件层 Host 支持 tile 表/图层(内存按地块、落盘按 `cell`),`fieldPlugin` 把地块值聚合成州均值后接影响口;`civ_state_get.layers` 带 `unit: "tile"`;官方 `.civplugin` 接口第 1 版不动;自检 30 项。
+- **君主沙盒四功能(已完成)**:首次引导(LLM/Jev 两把 Key)、LLM 扮演与 Jev 判断双开关、君主角色卡 + 独立记忆、高影响命令 Jev 审核(soften/reject)+ 玩家/DM 复核;回合拆成 `monarchPlan`/`monarchCommit`;新增第 27 种干预 `intel`(渗透,含 blown 冷却)与逐州属性/情报注入提示词;自检 45 项。
+- **单端口沙盒与地形渲染(已完成)**:`scripts/lib/sandboxViewer.ts` 把查看器挂到同一个 `pnpm dev` 的 `/sandbox/`(自动构建 MCP + 代理 viewer 子进程),地形复用上游 raster/render 管线(手绘/卫星/地理/经典四种画法、放大按 √2 分档只算可见瓦片、跨极拖动、矢量墨线、按瓦片追海岸线);自检 18 项(coast)。
 
 ## 目录
 
@@ -491,6 +497,8 @@ mcp/
   prompt.ts          君主系统提示词
   llm.ts             DeepSeek/百炼/自定义 OpenAI 兼容 + mock 决策
   dm.ts              DM 小决策(OpenAI 兼容 oracle + 天灾/小贸易/故事事件编译 + 日志)
+  intel.ts           渗透情报编排(Jev + 确定性抽签,blown 冷却)
+  monarch-audit.ts   高影响命令审核(declare/press/destroy/cede 的 allow/soften/reject)
   petty-client.ts    官方 Jev 客户端(POST /api/v1/decisions,鉴权/解析/错误映射)
   petty-budget.ts    token 估算 + P0/P1/P2 预算打包
   petty-queue.ts     严格串行优先队列(超时/背压/熔断/降级)
@@ -506,17 +514,26 @@ mcp/
   selftest-petty-core.ts   小事件核心自检(58 项,不联网)
   selftest-petty-oracle.ts 小事件端到端自检(53 项,mock)
   selftest-field.ts        自定义场自检(43 项,确定性/数值/渲染)
-  selftest-magic.ts        魔力动态层自检(34 项,引擎影响/图层/回放)
+  selftest-magic.ts        魔力动态层自检(35 项,引擎影响/地块图层/回放)
   selftest-field-plugin.ts 可配置场自检(46 项,spec 校验/影响口/确定性)
   selftest-plugin-loader.ts 官方 .civplugin 加载器自检(22 项,QuickJS/会话/回放)
   selftest-tile-field.ts   地块级场自检(30 项,按地块演化/落盘往返/回放)
+  selftest-monarch-sandbox.ts 君主沙盒四功能自检(45 项,引导/双开关/君主卡/审核/复核)
+  selftest-coast.ts        地形瓦片海岸线自检(18 项,瓦片与底图偏差)
   plugin-loader.ts   官方 .civplugin 加载器(CJS 里用 QuickJS wasm + simPluginsOn)
   vite-url.d.ts      mcp 构建认 Vite 的 `?url` 导入(只给类型)
+  build-compat.cjs   tsc 产物里 `import.meta.env.BASE_URL` 的构建兼容补丁(只改 .build)
+  terrain.ts         地形渲染(2048 底图 + 512 瓦片 + 矢量层,复用上游 raster/风格)
+  map-worker.ts      worker_threads 入口:把世界 clone 进去,按消息渲染整图/瓦片
+  map-pool.ts        每世界 2 线程的地图渲染池(懒创建/排队/超时回退单进程)
+  coast-trace.ts     按瓦片自己的倍率追水陆边界(marching squares,Douglas–Peucker 抽稀)
   png.ts             纯 Node PNG 编码(渲染层共用)
   field-render.ts    场渲染层(只读数值上色,输出 PNG + 图例)
-  magic-render.ts    魔力图层渲染(按年份选帧/插值,PNG + 图例)
+  magic-render.ts    魔力图层渲染(逐地块值 2048 球面插值连续场 + 平滑/辉光;放大后按 LOD 现算窗口化瓦片;支持 colors 覆盖色带)
   viewer.ts             本地浏览器查看器(HTTP + PNG 地图 + 场叠加)
   viewer/               index.html / style.css / app.js
+  viewer/vec-draw.js    矢量墨线/符号的共享绘制逻辑(主线程兜底与 Worker 共用)
+  viewer/vec-worker.js  Web Worker:OffscreenCanvas 画矢量位图回传
   tsconfig.build.json / build.ps1
   .build/            产物(不提交)
   .runs/             会话日志(不提交)

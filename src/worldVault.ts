@@ -58,6 +58,7 @@ import {
   type WorldPlugin,
   type WorldReaders,
 } from './gen/worldFormat';
+import { pluginsInWorld } from './plugin/pluginWorld';
 import { currentSchema } from './gen/worldMigrate';
 import { parseManifest, validatePluginLayer, validateThumb } from './gen/worldValidate';
 import { writeZip, type ZipInput } from './gen/zipStore';
@@ -1239,6 +1240,15 @@ export async function worldPluginsOf(id: string): Promise<Pick<WorldManifest, 'p
   return m ? { plugins: m.plugins, parts: m.parts } : null;
 }
 
+/** 复制出来的清单:配方照原来的、只换名字;revision.n = 这一份是目标世界的第几份修订 */
+function copyRowOf(base: RevisionRow, prev: WorldManifest, to: string, title: string | undefined, n: number): RevisionRow {
+  const named = title === undefined ? {} : { title };
+  const manifest: WorldManifest = { ...prev, id: to, ...(prev.title !== undefined ? named : {}), recipe: { ...prev.recipe, ...named }, revision: { n } };
+  const text = manifestBytes(manifest);
+  parseManifest(text, { readers: { ...prev.readers } });
+  return { id: to, n, text: new TextDecoder().decode(text), keys: [...base.keys], content: base.content, recipeKey: base.recipeKey, generator: base.generator, source: 'made', at: Date.now() };
+}
+
 /**
  * 复制一个世界:from 最新的修订原样成为 to 的第一份修订(块不动、插件记录和插件存的数据、图层都在),清单里的配方照原来的、只换名字。
  * from 没有修订、to 已经有修订(别的标签页抢先转了) = false
@@ -1248,16 +1258,50 @@ export async function copyRevision(from: string, to: string, title: string | und
     const base = chainOf(await rowsOf(from)).at(-1);
     const prev = base ? manifestOf(base) : null;
     if (!base || !prev) return false;
-    const named = title === undefined ? {} : { title };
-    const manifest: WorldManifest = { ...prev, id: to, ...(prev.title !== undefined ? named : {}), recipe: { ...prev.recipe, ...named }, revision: { n: 1 } };
-    const text = manifestBytes(manifest);
-    parseManifest(text, { readers: { ...prev.readers } });
-    const row: RevisionRow = { id: to, n: 1, text: new TextDecoder().decode(text), keys: [...base.keys], content: base.content, recipeKey: base.recipeKey, generator: base.generator, source: 'made', at: Date.now() };
-    const out = await publish(row, 0);
+    const out = await publish(copyRowOf(base, prev, to, title, 1), 0);
     if (out === 'missing') throw new VaultError('corrupt', '写清单时块不全');
     return out === 'ok';
   } catch (e) {
     throw asVaultError(e);
+  }
+}
+
+/** 把源世界的插件内容复制到副本的结果 */
+export type CopyPluginRevisionResult =
+  /** 源世界没有插件记录、插件存的数据、图层(读是读到了) */
+  | 'none'
+  | 'ok'
+  /** 副本已经被别的标签页、后台转存或用户改动抢先写了修订,这一份不覆盖 */
+  | 'conflict'
+  /** 源世界的最新修订读不到、清单读不懂、块不全 */
+  | 'corrupt'
+  | 'full'
+  | 'unavailable'
+  | 'failed';
+
+/**
+ * 只把「用到的插件」复制到副本:源世界读一次,没有插件记录、插件数据、图层 = none(读失败不是 none,是 corrupt);
+ * 有 = 把最新修订原样写成 to 的修订。如果后台转存抢先给 to 写了第一份(不带插件),而 to 还只有这一份、又是自动转出来的,
+ * 就在它上面再补一份插件版修订(别盖掉用户后来自己存的内容);只有一份以上(用户动过) = conflict。
+ */
+export async function copyPluginRevision(from: string, to: string, title: string | undefined): Promise<CopyPluginRevisionResult> {
+  try {
+    const base = chainOf(await rowsOf(from)).at(-1);
+    const prev = base ? manifestOf(base) : null;
+    if (!base || !prev) return 'corrupt';
+    if (!pluginsInWorld(prev, []).length) return 'none';
+    const first = await publish(copyRowOf(base, prev, to, title, 1), 0);
+    if (first === 'missing') return 'corrupt';
+    if (first === 'ok') return 'ok';
+    const existing = chainOf(await rowsOf(to));
+    const last = existing.at(-1);
+    if (existing.length !== 1 || !last || last.source !== 'made') return 'conflict';
+    const second = await publish(copyRowOf(base, prev, to, title, last.n + 1), last.n);
+    if (second === 'missing') return 'corrupt';
+    return second === 'ok' ? 'ok' : 'conflict';
+  } catch (e) {
+    const err = asVaultError(e);
+    return err.kind === 'full' || err.kind === 'unavailable' ? err.kind : err.kind === 'memory' || err.kind === 'failed' ? 'failed' : 'corrupt';
   }
 }
 
@@ -1591,5 +1635,5 @@ export async function rosterCopy(id: string): Promise<{ recipe: SaveFile; thumb:
 }
 
 /** 主线程通过后台线程调的几样(worldVaultWorker.ts、ui/worldStore.ts) */
-export const vaultOps = { commitWorld, draftFile, adoptFile, latestOf, revisionsOf, readRevision, revisionFile, zipBlobs, sweepParts, spaceOf, spaceBoard, fullStates, purgeWorld, clearVault, stateOf, patchState, patchStates, rosterOf, rosterCopy, readAuthor, changeAuthor, readPluginData, changePluginData, readPluginLayers, changePluginLayer, worldPluginsOf, copyRevision, opaquePartsOf };
+export const vaultOps = { commitWorld, draftFile, adoptFile, latestOf, revisionsOf, readRevision, revisionFile, zipBlobs, sweepParts, spaceOf, spaceBoard, fullStates, purgeWorld, clearVault, stateOf, patchState, patchStates, rosterOf, rosterCopy, readAuthor, changeAuthor, readPluginData, changePluginData, readPluginLayers, changePluginLayer, worldPluginsOf, copyRevision, copyPluginRevision, opaquePartsOf };
 export type VaultOps = typeof vaultOps;

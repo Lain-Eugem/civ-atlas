@@ -13,6 +13,7 @@
  * 纯计算:不碰页面,worker / Node 都能跑;同一个世界、同一块,结果一样。
  */
 import type { World } from './world';
+import type { Mesh } from './mesh';
 import type { Raster } from './raster';
 import { bankBytes, carveValleys, noiseTiles, rasterBase, sampleSpline, shadeSphere, stampVeins, streamsOf, valleyLines, veinLinesOf, type SphereGrid, type ValleyLines } from './raster';
 import type { DrainLines } from './pixelDrain';
@@ -330,7 +331,7 @@ function arcZ(px: number, py: number, pz: number, qx: number, qy: number, qz: nu
  * 这一块里每个像素在哪个球面三角形里、重心权重(同 sphereCover;只扫经纬度范围和这一块相交的三角形)。
  * W × H = S 倍主图;这一块左上角在 (x0, y0)
  */
-function coverWindow(src: ZoomSource, W: number, H: number, x0: number, y0: number, g: SphereGrid) {
+function coverWindow(src: { nrm: Float64Array; box: Float32Array }, W: number, H: number, x0: number, y0: number, g: SphereGrid) {
   const { w, h, cosLon, sinLon, cosLat, sinLat } = g;
   const { nrm, box } = src;
   const N = w * h;
@@ -413,4 +414,39 @@ function coverWindow(src: ZoomSource, W: number, H: number, x0: number, y0: numb
     wb[k] = wb[j];
   }
   return { tri, wa, wb };
+}
+
+const boundsCache = new WeakMap<Mesh, { nrm: Float64Array; box: Float32Array }>();
+
+/**
+ * 只算「某一块 S 倍窗口里每像素属于哪个球面三角形、重心权重多少」,不铺地形。
+ * 供渲染层(如 mcp/magic-render.ts 的魔力瓦片)复用同一套球面覆盖;w×h 是块大小,
+ * x0 / y0 是这一块左上角在 S 倍主图(W = 世界宽 × S)里的坐标。
+ */
+export function sphereCoverWindow(world: World, S: number, x0: number, y0: number, w: number, h: number): { tri: Int32Array; wa: Float32Array; wb: Float32Array } {
+  const W = Math.round(world.width * S);
+  const H = Math.round(world.height * S);
+  const cosLon = new Float32Array(w);
+  const sinLon = new Float32Array(w);
+  const cosLat = new Float32Array(h);
+  const sinLat = new Float32Array(h);
+  for (let px = 0; px < w; px++) {
+    const l = ((x0 + px + 0.5) / W) * 2 * Math.PI - Math.PI;
+    cosLon[px] = Math.cos(l);
+    sinLon[px] = Math.sin(l);
+  }
+  for (let py = 0; py < h; py++) {
+    // 上下出了主图的行按贴着极点算(和 rasterizeWindow 一致)
+    const yy = Math.min(H - 0.5, Math.max(0.5, y0 + py + 0.5));
+    const l = Math.PI / 2 - (yy / H) * Math.PI;
+    cosLat[py] = Math.cos(l);
+    sinLat[py] = Math.sin(l);
+  }
+  const mesh = world.mesh;
+  let b = boundsCache.get(mesh);
+  if (!b) {
+    b = triangleBounds(mesh.xyz!, mesh.triangles);
+    boundsCache.set(mesh, b);
+  }
+  return coverWindow(b, W, H, x0, y0, { w, h, cosLon, sinLon, cosLat, sinLat });
 }

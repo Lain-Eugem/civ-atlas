@@ -990,15 +990,40 @@ export async function keepMapCopy(id: string, o: { edits?: WorldEdits; title?: s
   return { ok: false, kind: stuck === 'full' ? 'full' : 'failed', message: why?.error ?? '没能存下这一份' };
 }
 
-/** 复制一份:from 用了插件(推演、地图、工具)的,它最新的修订原样给 to,不然 to 打开时按不带插件长。没用插件、读不了 = none */
-export async function copyWorldPlugins(from: string, to: string): Promise<'none' | 'ok' | 'failed'> {
-  const used = await call('worldPluginsOf', [from]).catch(() => null);
-  if (!used?.plugins.length) return 'none';
+/** 复制插件内容到副本的结果(界面按这个显示原因,不再一律当成存储满) */
+export type CopyWorldPluginsResult =
+  /** 源世界没有插件记录、插件存的数据、图层(确实读到了) */
+  | { status: 'none' }
+  | { status: 'ok' }
+  /** 副本已经被后台转存或用户改动抢先写了修订,这一份不覆盖 */
+  | { status: 'conflict' }
+  /** 源世界的最新修订读不到、清单读不懂、块不全 */
+  | { status: 'unreadable' }
+  | { status: 'full' }
+  | { status: 'unavailable' }
+  | { status: 'failed' };
+
+/** 复制一份:from 用了插件(推演、地图、工具)的,它最新的修订原样给 to,不然 to 打开时按不带插件长。没用插件 = none;读失败 = unreadable */
+export async function copyWorldPlugins(from: string, to: string): Promise<CopyWorldPluginsResult> {
   try {
     const title = loadWorld(to)?.save.title;
-    return (await call('copyRevision', [from, to, title])) ? 'ok' : 'failed';
-  } catch {
-    return 'failed';
+    const r = await call('copyPluginRevision', [from, to, title]);
+    switch (r) {
+      case 'none':
+      case 'ok':
+      case 'conflict':
+      case 'full':
+      case 'unavailable':
+        return { status: r };
+      case 'corrupt':
+        return { status: 'unreadable' };
+      default:
+        return { status: 'failed' };
+    }
+  } catch (e) {
+    const kind = errKind(e);
+    if (kind === 'full' || kind === 'unavailable') return { status: kind };
+    return { status: 'failed' };
   }
 }
 

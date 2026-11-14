@@ -12,31 +12,62 @@
  * render/labels/fonts.ts 里的 import.meta.env(Vite 专属),由构建产物的兼容补丁处理,见 mcp/build.ps1
  * 与 scripts/lib/sandboxViewer.ts。
  */
-import type { World } from '../src/gen/world';
+import type { River, World } from '../src/gen/world';
 import { rasterize, type Raster } from '../src/gen/raster';
 import { rasterizeWindow, zoomSource, WINDOW_PAD, type ZoomSource } from '../src/gen/rasterWindow';
+import { riverGeometry } from '../src/gen/riverGeometry';
+import { creeksOf } from '../src/gen/creeks';
 import { traceMaskValue } from './coast-trace';
 import {
   fantasyCoastLines,
   fantasyFullPixels,
   glyphScale,
+  iceLines,
+  inkRuns,
   planGlyphs,
   seaRippleLines,
   simplifyLine,
   type Glyph,
 } from '../src/render/fantasy';
+import { Biome } from '../src/gen/biomes';
+import { subSeed } from '../src/gen/util';
 import { macroGrids, realisticPixels, realisticWindowPixels, type MacroGrids } from '../src/render/realistic';
 import type { SurfaceLook } from '../src/render/surface';
 
-/** 沙盒里可选的地形画法。classic = 改造前的三角栅格底图,由 viewer.ts 自己画,这里不处理。 */
-export const TERRAIN_STYLES = ['fantasy', 'satellite', 'geo', 'classic'] as const;
+/** 沙盒里可选的地形画法。classic = 主站经典卫星画法(realistic 的 'classic' look),和 geo/satellite 同一条写实流水线。 */
+export const TERRAIN_STYLES = ['fantasy', 'satellite', 'geo', 'white', 'classic'] as const;
 export type TerrainStyle = (typeof TERRAIN_STYLES)[number];
 
 export function isTerrainStyle(x: unknown): x is TerrainStyle {
   return TERRAIN_STYLES.includes(x as TerrainStyle);
 }
 
-const LOOK: Record<'satellite' | 'geo', SurfaceLook> = { satellite: 'detail', geo: 'geo' };
+const LOOK: Record<'satellite' | 'geo' | 'classic', SurfaceLook> = { satellite: 'detail', geo: 'geo', classic: 'classic' };
+
+/**
+ * 河网几何的固定线宽档:只用来算 DenseRiver.w(真正下发的是 f / m,前端按当前画风和缩放现算宽度)。
+ * 走向、f、m 都与画风无关,所以这一份几何所有画风共用。
+ */
+const RIVER_GEOM_WIDTH = { minW: 0.55, maxW: 2.45, fluxRef: 1400 } as const;
+/** 河口喇叭口倍率,和主站 realisticRiverStyle 的 mouthFlare 一致 */
+const RIVER_MOUTH_FLARE = 1.5;
+/** 河宽曲线的次方,和主站 realisticRiverStyle 的 widthPower 一致 */
+const RIVER_WIDTH_POWER = 0.65;
+/** 折线抽稀容差(世界单位):1200% 时约 0.2 屏幕像素,肉眼看不出来 */
+const RIVER_NET_TOL = 0.02;
+/** 带小溪那份河网的容差:溪多(约 4.7 万点),放到 0.03(1200% 时约 0.4 屏幕像素)压一压体积 */
+const RIVER_NET_TOL_CREEK = 0.03;
+/** 细沟描线:和主站 realistic 的可见性曲线用同一套常数(VEIN_C / VEIN_E,见 render/realistic.ts) */
+const VEIN_A0 = 8;
+const VEIN_A1 = 800;
+const VEIN_C0 = 0.3;
+const VEIN_C1 = 0.85;
+const VEIN_E0 = 700;
+const VEIN_E1 = 1500;
+/** 整条线最强处低于这个强度就不画(主站底图上几乎看不出来) */
+const VEIN_MIN_STRENGTH = 0.06;
+/** 细沟折线抽稀容差(世界单位):细沟是极淡的影子,0.3 的弦高误差看不出来 */
+const VEIN_RDP_TOL = 0.3;
 
 interface TerrainCtx {
   /** 1 倍整张主图:放大现算要用的海冰 / 细沟 / 大尺度晕渲都从它取 */
@@ -49,9 +80,37 @@ interface TerrainCtx {
   fantasy: ReturnType<typeof fantasyFullPixels> | null;
   /** 矢量层缓存(海岸线 / 波纹 / 符号),只算一次 */
   vectors: VectorData | null;
+  /** 河网几何缓存(与画风无关,只算一次) */
+  riverNet: RiverNetLine[] | null;
+  /** 带小溪的河网几何缓存(放大后 geo/satellite/white/classic 用,和主站 realistic 的 riversOf 同一套) */
+  riverNetCreek: RiverNetLine[] | null;
+}
+
+/**
+ * 一条河网折线:x/y = 折线坐标(1 倍整图像素,可能跨 180° 展开成连续坐标),
+ * f = 每点流量,m = 每点线宽系数(含源头收细与河口喇叭口)。客户端现算宽度:
+ * 宽 = 河宽(f, 画风) × (m[i] + m[i+1]) / 2。
+ */
+export interface RiverNetLine {
+  x: number[];
+  y: number[];
+  f: number[];
+  m: number[];
 }
 
 /** 送到浏览器用 Canvas 画的矢量层。坐标都是 1 倍整张主图的像素(0..2048, 0..1024)。 */
+/**
+ * 细沟描线(卫星画风专用):扁平三元组 [x, y, s] 连成的一条线,
+ * s = 0–1 的可见强度(集水面积对数插值 × 海拔淡出,与主站底图明暗同一套曲线)。
+ */
+export interface VeinLine {
+  p: number[];
+}
+
+/** 细沟层:每世界算一次,由 GET /api/map/veins 单独下发(只在卫星画风高倍时用) */
+export interface VeinOverlay {
+  lines: VeinLine[];
+}
 export interface VectorData {
   /** 海岸线,每条 [x0,y0,x1,y1,…] */
   coast: number[][];
@@ -65,19 +124,74 @@ export interface VectorData {
   rippleFine: number[][][];
   /** 山 / 丘陵 / 沙丘 / 草丛 / 沼泽符号:[x, y, kind, s, v, a, c, z] */
   glyphs: number[][];
+  /** 冰缘墨线(低倍率用的抽稀版),每条 [x0,y0,x1,y1,…] */
+  ice: number[][];
+  /** 冰缘墨线(放大后的精细版) */
+  iceFine: number[][];
+  /**
+   * 写实系(geo / satellite / classic)的海岸墨线:和手绘 coast 是同一套追线(fantasyCoastLines)、
+   * 同一份水陆边界,只是写实系按主站地图册(realistic.ts MATERIALS.geo.coast)的墨色 / 线宽画。
+   * 单独给一份字段,写实系不必依赖手绘那份;单档抽稀 tol 0.9(1 整图像素)+ 坐标量化 0.1,
+   * 约 +63KB(未量化会到 +122KB,多种子实测 63–81KB)。
+   */
+  coastReal: number[][];
+  /** 写实系湖岸墨线(见 coastReal) */
+  lakeReal: number[][];
+  /** 河流分级阈值:flux 低于它的河段不画,和主站 world.riverThreshold 同义 */
+  riverThreshold: number;
+  /**
+   * 河网:主站地理图那套 riverGeometry(并干流 + 统一平滑 + Catmull-Rom 加密 + 河口喇叭口)的几何,
+   * 已按水陆图裁掉水面、RDP 抽稀到 0.02 世界单位。所有画风与缩放共用这一份,只按 f/m 重算线宽。
+   */
+  riverNet?: RiverNetLine[];
+  /**
+   * 放大后用的河网 = 河道 + 小溪(主站 realistic 在 k>1 时用 riversOf 把小溪 creeks.ts 并进河网,
+   * 汇合处一起平滑,所以小溪终点正好落在干流折线上)。手绘风不用这份(主站手绘只画 world.rivers)。
+   */
+  riverNetCreek?: RiverNetLine[];
+  /**
+   * 林块:扁平存 [x, y, kind, flags, i, …] 每个有林的地块一项。
+   * kind: 1 阔叶 / 2 针叶 / 3 雨林(和主站 fantasy.ts 的 F_BROAD / F_PINE / F_JUNGLE 同值);
+   * flags: 1 = 林块边界(有邻格不是同种林,画成扇贝边的小圆)、2 = 临水(圆会缩小);
+   * i = 地块序号,树冠的随机数按它现算(主站 forestTiles 的 hash2(i, …))。
+   * 树冠不烘进底图:前端照主站 render/fantasy.ts 的 forestTiles 现画,放大多少倍都保持矢量。
+   */
+  forest: number[];
+  /** 地块间距(世界单位)= world.mesh.spacing,林块几何按它铺 */
+  forestSpacing: number;
+  /** 树冠随机种子 = subSeed(seed, 'glyphs'),和主站 forestTiles 的 seed 同一个 */
+  forestSeed: number;
 }
 
 /** 每个世界只准备一次;WeakMap 保证世界被丢掉时这些大数组也能回收 */
 const contexts = new WeakMap<World, TerrainCtx>();
+/** 细沟层缓存(每世界一次;1 倍栅格带 gully 约 2.5s,世界丢掉时一起回收) */
+const veinOverlays = new WeakMap<World, VeinOverlay>();
 
 function ctxOf(world: World): TerrainCtx {
   const hit = contexts.get(world);
   if (hit) return hit;
   // gully = false:沟壑只影响写实风的明暗,手绘风用不到;省掉一整张图的逐像素噪声
   const whole = rasterize(world, 1, false);
-  const ctx: TerrainCtx = { whole, src: zoomSource(world, whole), grids: macroGrids(whole), px: new Map(), fantasy: null, vectors: null };
+  const ctx: TerrainCtx = {
+    whole,
+    src: zoomSource(world, whole),
+    grids: macroGrids(whole),
+    px: new Map(),
+    fantasy: null,
+    vectors: null,
+    riverNet: null,
+    riverNetCreek: null,
+  };
   contexts.set(world, ctx);
   return ctx;
+}
+
+/**
+ * 整图 1 倍的栅格(海岸线、疆域归属、国界端点共用这一份:rasterize 一次要 852ms,别重复算)。
+ */
+export function worldRaster(world: World): Raster {
+  return ctxOf(world).whole;
 }
 
 /**
@@ -91,6 +205,55 @@ function cleanInk(px: Uint8ClampedArray, patch: ReturnType<typeof fantasyFullPix
   patch.iceW.putInto(px);
 }
 
+/**
+ * 白模画法:灰白、无生物群系颜色,只留海拔晕渲 + 海陆/湖泊/海冰,方便和叠在上面的
+ * 「自定义场 / 魔力」颜色区分开 —— 看到的彩色就是图层本身的颜色。
+ * 输出与 rasterize 同尺寸的 RGBA,后续整图/瓦片共用同一份逻辑。
+ */
+function whitePixels(r: Raster): Uint8ClampedArray {
+  const { w, h, elev, water, ice } = r;
+  const out = new Uint8ClampedArray(w * h * 4);
+  const clamp255 = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : v | 0);
+  const mix = (a: readonly number[], b: readonly number[], t: number): [number, number, number] => {
+    const k = t < 0 ? 0 : t > 1 ? 1 : t;
+    return [a[0]! + (b[0]! - a[0]!) * k, a[1]! + (b[1]! - a[1]!) * k, a[2]! + (b[2]! - a[2]!) * k];
+  };
+  const LAND = [233, 231, 226] as const;
+  const PEAK = [250, 249, 246] as const;
+  const SEA = [196, 206, 212] as const;
+  const DEEP = [170, 184, 191] as const;
+  const LAKE = [214, 223, 227] as const;
+  const ICE = [244, 247, 248] as const;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const p = row + x;
+      const o = p * 4;
+      const sea = water[p]!;
+      let c: readonly [number, number, number] = LAND;
+      if (sea !== 0) {
+        c = sea === 2 ? LAKE : mix(SEA, DEEP, Math.min(1, Math.max(0, -elev[p]!) / 4200));
+        const ic = ice[p]!;
+        if (ic >= 0.5) c = mix(c, ICE, Math.min(1, (ic - 0.5) * 2));
+      } else {
+        // 越高越接近白,再叠西北向山体晕渲;海冰/湖泊不参与晕渲
+        c = mix(LAND, PEAK, Math.min(1, Math.max(0, (elev[p]! - 1200) / 2600)));
+        const xl = x > 0 ? elev[p - 1]! : elev[p]!;
+        const xr = x < w - 1 ? elev[p + 1]! : elev[p]!;
+        const yu = y > 0 ? elev[p - w]! : elev[p]!;
+        const yd = y < h - 1 ? elev[p + w]! : elev[p]!;
+        const shade = Math.min(1.16, Math.max(0.74, 1 + ((xr - xl) * 0.55 + (yd - yu) * 0.85) / 1400));
+        c = [c[0]! * shade, c[1]! * shade, c[2]! * shade];
+      }
+      out[o] = clamp255(c[0]!);
+      out[o + 1] = clamp255(c[1]!);
+      out[o + 2] = clamp255(c[2]!);
+      out[o + 3] = 255;
+    }
+  }
+  return out;
+}
+
 /** 整张像素层(每种画法算一次):既是底图,也是高清块的颜色基准 */
 function wholePixels(world: World, ctx: TerrainCtx, style: TerrainStyle): Uint8ClampedArray {
   let px = ctx.px.get(style);
@@ -100,15 +263,269 @@ function wholePixels(world: World, ctx: TerrainCtx, style: TerrainStyle): Uint8C
       ctx.fantasy = fp;
       cleanInk(fp.px, fp.patch);
       px = fp.px;
+    } else if (style === 'white') {
+      px = whitePixels(ctx.whole);
     } else {
-      px = realisticPixels(ctx.whole, LOOK[style as 'satellite' | 'geo'] ?? 'detail').px;
+      px = realisticPixels(ctx.whole, LOOK[style as 'satellite' | 'geo' | 'classic'] ?? 'detail').px;
     }
     ctx.px.set(style, px);
   }
   return px;
 }
 
-/** 生成矢量层:海岸线、近岸波纹、地形符号。全部抽稀过,总量不到 1 MB。 */
+/**
+ * 冰缘墨线:上游 fantasyFullPixels 在冰 / 海交界没有描边,只有一条硬色带。
+ * 取"群落 = 海冰"的像素(和 seaIceField 的 mask 同一判据),交给 iceLines 追线,
+ * 再用 inkRuns 拆成"只描冰 / 开阔海交界"的那几段。
+ */
+function iceInkRuns(r: Raster): Float32Array[] {
+  const mask = new Uint8Array(r.w * r.h);
+  for (let k = 0; k < mask.length; k++) if (r.biome[k] === Biome.SeaIce) mask[k] = 1;
+  const out: Float32Array[] = [];
+  for (const line of iceLines(r, mask)) for (const p of inkRuns(line, r.w)) out.push(p);
+  return out;
+}
+
+const round2 = (v: number): number => Math.round(v * 100) / 100;
+const round1 = (v: number): number => Math.round(v * 10) / 10;
+
+/**
+ * RDP 折线抽稀:返回保留下来的点索引(首尾一定保留)。用下标而不是坐标,是为了 f / m 能按同一套
+ * 下标取出来,和抽稀后的折线点一一对应(宽度不能插值错位)。
+ */
+function rdpKeep(x: number[], y: number[], tol: number): number[] {
+  const n = x.length;
+  const keep = new Uint8Array(n);
+  keep[0] = 1;
+  keep[n - 1] = 1;
+  const tol2 = tol * tol;
+  const stack: number[] = [0, n - 1]; // 成对压栈:[起点, 终点]
+  while (stack.length > 0) {
+    const i1 = stack.pop()!;
+    const i0 = stack.pop()!;
+    if (i1 - i0 < 2) continue;
+    const dx = x[i1]! - x[i0]!;
+    const dy = y[i1]! - y[i0]!;
+    const len2 = dx * dx + dy * dy;
+    let best = -1;
+    let far = tol2;
+    for (let i = i0 + 1; i < i1; i++) {
+      const px = x[i]! - x[i0]!;
+      const py = y[i]! - y[i0]!;
+      // 到首尾连线的垂距平方;首尾重合时退化成到点的距离
+      const d2 = len2 > 0 ? ((px * dy - py * dx) * (px * dy - py * dx)) / len2 : px * px + py * py;
+      if (d2 > far) {
+        far = d2;
+        best = i;
+      }
+    }
+    if (best < 0) continue;
+    keep[best] = 1;
+    stack.push(i0, best, best, i1);
+  }
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(i);
+  return out;
+}
+
+/**
+ * 河网几何:每世界只算一次(所有画风、所有缩放共用)。主站的河网最后用画布 destination-in
+ * 按水陆蒙版裁掉水面(河口伸进海里的那一小截),这里没有画布蒙版,就逐点判水;在水陆交界处
+ * 二分插一个点,让河端正好落在岸上。裁完再 RDP 抽稀:2.8 万个加密点直接下发要 2.4MB JSON。
+ */
+function riverNetOf(world: World, ctx: TerrainCtx): RiverNetLine[] {
+  const hit = ctx.riverNet;
+  if (hit) return hit;
+  const out = buildRiverNet(world, ctx, world.rivers, RIVER_NET_TOL);
+  ctx.riverNet = out;
+  return out;
+}
+
+/** 放大后的河网:河道 + 小溪,只给 geo / satellite / white 用(主站 realistic 的 riversOf(k>1)) */
+function riverNetCreekOf(world: World, ctx: TerrainCtx): RiverNetLine[] {
+  const hit = ctx.riverNetCreek;
+  if (hit) return hit;
+  const out = buildRiverNet(world, ctx, [...world.rivers, ...creeksOf(world)], RIVER_NET_TOL_CREEK);
+  ctx.riverNetCreek = out;
+  return out;
+}
+
+function buildRiverNet(world: World, ctx: TerrainCtx, rivers: River[], tol: number): RiverNetLine[] {
+  const raster = ctx.whole;
+  const W = world.width; // 世界坐标 = 1 倍整图像素坐标(scale = 1),wrap 也用同一个宽度
+  const dense = riverGeometry(
+    rivers,
+    world.riverThreshold,
+    RIVER_GEOM_WIDTH,
+    RIVER_MOUTH_FLARE,
+    RIVER_WIDTH_POWER,
+    world.width,
+  );
+  const isLand = (x: number, y: number): boolean => {
+    let xx = Math.round(((x % W) + W) % W);
+    if (xx >= raster.w) xx -= raster.w;
+    let yy = Math.round(y);
+    yy = yy < 0 ? 0 : yy >= raster.h ? raster.h - 1 : yy;
+    return raster.water[yy * raster.w + xx] === 0;
+  };
+  const out: RiverNetLine[] = [];
+  for (const d of dense) {
+    const n = d.x.length;
+    if (n < 2) continue;
+    let cur: RiverNetLine | null = null;
+    let wasLand = isLand(d.x[0]!, d.y[0]!);
+    let lx = d.x[0]!;
+    let ly = d.y[0]!;
+    let lf = d.f[0]!;
+    let lm = d.m[0]!;
+    if (wasLand) cur = { x: [lx], y: [ly], f: [lf], m: [lm] };
+    for (let i = 1; i < n; i++) {
+      const qx = d.x[i]!;
+      const qy = d.y[i]!;
+      const qf = d.f[i]!;
+      const qm = d.m[i]!;
+      const land = isLand(qx, qy);
+      if (land === wasLand) {
+        if (cur) {
+          cur.x.push(qx);
+          cur.y.push(qy);
+          cur.f.push(qf);
+          cur.m.push(qm);
+        }
+      } else if (wasLand) {
+        // 陆地 → 水:这一段到岸边为止;二分找水陆分界,插一个点让河口贴岸
+        let ax = lx;
+        let ay = ly;
+        let af = lf;
+        let am = lm;
+        let bx = qx;
+        let by = qy;
+        let bf = qf;
+        let bm = qm;
+        for (let it = 0; it < 8; it++) {
+          const mx = (ax + bx) / 2;
+          const my = (ay + by) / 2;
+          const mf = (af + bf) / 2;
+          const mm = (am + bm) / 2;
+          if (isLand(mx, my)) {
+            ax = mx;
+            ay = my;
+            af = mf;
+            am = mm;
+          } else {
+            bx = mx;
+            by = my;
+            bf = mf;
+            bm = mm;
+          }
+        }
+        if (cur) {
+          cur.x.push(ax);
+          cur.y.push(ay);
+          cur.f.push(af);
+          cur.m.push(am);
+          pushRiverNet(out, cur, tol);
+        }
+        cur = null;
+      } else {
+        // 水 → 陆地:从岸边重新起一段(河穿过湖泊时会被切成几段)
+        cur = { x: [qx], y: [qy], f: [qf], m: [qm] };
+      }
+      lx = qx;
+      ly = qy;
+      lf = qf;
+      lm = qm;
+      wasLand = land;
+    }
+    if (cur) pushRiverNet(out, cur, tol);
+  }
+  return out;
+}
+
+/** 抽稀并压成下发格式(坐标 / 流量 / 宽度系数都取到 0.01) */
+function pushRiverNet(out: RiverNetLine[], run: RiverNetLine, tol: number): void {
+  if (run.x.length < 2) return;
+  const keep = rdpKeep(run.x, run.y, tol);
+  if (keep.length < 2) return;
+  const x: number[] = [];
+  const y: number[] = [];
+  const f: number[] = [];
+  const m: number[] = [];
+  for (const i of keep) {
+    x.push(round2(run.x[i]!));
+    y.push(round2(run.y[i]!));
+    f.push(round2(run.f[i]!));
+    m.push(round2(run.m[i]!));
+  }
+  out.push({ x, y, f, m });
+}
+
+/** 生成矢量层:海岸线、近岸波纹、地形符号、冰缘墨线、河流、河网、林块。墨线类都抽稀过,总量约 2.6 MB 级。 */
+/** 可见度曲线的 smoothstep(和主站 util 的 smoothstep 同义) */
+function veinSmooth(a: number, b: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * 逐像素汇流细沟(vein)的描线数据,只给卫星画风用(realistic MATERIALS.detail 的 veinK = 0.6)。
+ *
+ * 为什么需要它:卫星底图上"一条条沟"是 raster 的细沟明暗(逐像素汇流),而河 / 溪矢量线来自
+ * 地块级的流量门槛 —— 两者不同源、不同门槛,所以底图上有大量"看得出是沟、却没有河线"的地方。
+ * 这里按主站同一套可见性曲线(集水面积对数插值 × 海拔淡出)把细沟算成折线 + 强度,
+ * 前端高倍时用极淡的线描一遍,做到"底图看到什么就有什么线"。
+ *
+ * 卫星画风打开时按需拉取,每个世界算一次(1 倍栅格带 gully ≈ 2.5s),WeakMap 缓存。
+ */
+export function renderVeinOverlay(world: World): VeinOverlay {
+  const hit = veinOverlays.get(world);
+  if (hit) return hit;
+  const r = rasterize(world, 1, true);
+  const lines: VeinLine[] = [];
+  const vl = r.veinLines;
+  if (vl) {
+    const W = r.w;
+    const H = r.h;
+    const elev = r.elev;
+    const L0 = Math.log(VEIN_A0);
+    const L1 = Math.log(VEIN_A1);
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const ss: number[] = [];
+    for (let i = 0; i + 1 < vl.off.length; i++) {
+      const a0 = vl.off[i]!;
+      const a1 = vl.off[i + 1]!;
+      if (a1 - a0 < 2) continue;
+      xs.length = 0;
+      ys.length = 0;
+      ss.length = 0;
+      let best = 0;
+      for (let j = a0; j < a1; j++) {
+        const px = vl.x[j]!;
+        const py = vl.y[j]!;
+        const wxn = ((Math.round(px) % W) + W) % W;
+        const wy = Math.min(H - 1, Math.max(0, Math.round(py)));
+        const vn = (Math.log(Math.max(1, vl.a[j]!)) - L0) / (L1 - L0);
+        const fade = 1 - veinSmooth(VEIN_E0, VEIN_E1, elev[wy * W + wxn]!);
+        const st = veinSmooth(VEIN_C0, VEIN_C1, vn) * fade;
+        if (st > best) best = st;
+        xs.push(px);
+        ys.push(py);
+        ss.push(st);
+      }
+      if (best < VEIN_MIN_STRENGTH) continue;
+      const keep = rdpKeep(xs, ys, VEIN_RDP_TOL);
+      const p: number[] = [];
+      for (const k of keep) p.push(round1(xs[k]!), round1(ys[k]!), round2(ss[k]!));
+      if (p.length >= 6) lines.push({ p });
+    }
+  }
+  const out: VeinOverlay = { lines };
+  veinOverlays.set(world, out);
+  return out;
+}
+
+
 export function renderVectors(world: World): VectorData {
   const ctx = ctxOf(world);
   if (ctx.vectors) return ctx.vectors;
@@ -118,18 +535,61 @@ export function renderVectors(world: World): VectorData {
   const lines = fantasyCoastLines(ctx.whole);
   const flat = (arr: Float32Array[], tol: number): number[][] =>
     arr.map((p) => Array.from(simplifyLine(p, tol)));
+  // 写实系岸线的坐标再量化到 0.1 地图像素:低倍下远不到 1 屏幕像素,JSON 却便宜一大截
+  // (林块坐标也是这么处理,注释见下面 forest 那段)
+  const flatQuant = (arr: Float32Array[], tol: number): number[][] =>
+    flat(arr, tol).map((p) => {
+      for (let i = 0; i < p.length; i++) p[i] = Math.round(p[i] * 10) / 10;
+      return p;
+    });
   const groups = seaRippleLines(ctx.whole, fp.sea.dist, fp.sea.fade);
-  const glyphs: Glyph[] = planGlyphs(world).glyphs;
+  // planGlyphs 一次算出两样:地形符号和林块(主站 render/fantasy.ts 的 Plan),这里都复用
+  const plan = planGlyphs(world);
+  const glyphs: Glyph[] = plan.glyphs;
+  // 林块:每格是什么林(0 = 无 / 1 阔叶 / 2 针叶 / 3 雨林)主站已经按生物群系 + 低频噪声算好了,
+  // 这里只补两个标记 —— 林块边界(有邻格不是同种林 → 画成扇贝边)和临水(圆更小)。
+  // 前端只有一张扁平表,没有邻接关系,所以这两样必须在这算;树冠的随机数仍按地块序号 i 现算。
+  const mesh = world.mesh;
+  const forestKind = plan.forest;
+  const forest: number[] = [];
+  for (let i = 0; i < mesh.n; i++) {
+    const kind = forestKind[i];
+    if (!kind) continue;
+    let flags = 0;
+    for (let e = mesh.adjStart[i], e1 = mesh.adjStart[i + 1]; e < e1; e++) {
+      const j = mesh.adj[e];
+      if (forestKind[j] !== kind) flags |= 1;
+      if (world.water[j] !== 0) flags |= 2;
+      if (flags === 3) break;
+    }
+    // 坐标取到 0.01 世界单位:659% 时这不到 0.06 屏幕像素,肉眼无差;JSON 却能省一截
+    forest.push(Math.round(mesh.x[i] * 100) / 100, Math.round(mesh.y[i] * 100) / 100, kind, flags, i);
+  }
+  // 冰缘墨线:只追一次线,再抽稀成粗 / 细两份给不同倍率用
+  const iceRuns = iceInkRuns(ctx.whole);
   // 低倍率用抽稀版(线少、画得快),放大后换精细版 —— 否则 1 整图像素 = 十几屏幕像素,
   // 抽稀留下的折角会变成明显的多边形,就不像矢量线了
   ctx.vectors = {
     coast: flat(lines.sea, 0.9),
     lake: flat(lines.lake, 0.9),
+    // 写实系的岸线 / 湖岸墨线:同一套追线,单档抽稀(tol 0.9)+ 坐标量化 0.1。写实系与手绘风
+    // 共用这份几何,只是各自用不同的墨色 / 线宽画;再下发一份精细档要多 510KB,所以写实系只给粗档。
+    coastReal: flatQuant(lines.sea, 0.9),
+    lakeReal: flatQuant(lines.lake, 0.9),
     ripple: groups.map((group) => flat(group, 1.4)),
     coastFine: flat(lines.sea, 0.12),
     lakeFine: flat(lines.lake, 0.12),
     rippleFine: groups.map((group) => flat(group, 0.25)),
     glyphs: glyphs.map((g) => [g.x, g.y, g.kind, g.s, g.v, g.a, g.c, g.z]),
+    ice: flat(iceRuns, 0.9),
+    iceFine: flat(iceRuns, 0.12),
+    riverThreshold: world.riverThreshold,
+    // 河网几何:所有画风共用这一份,前端按 f/m 现算线宽(裁陆 + RDP 抽稀在这一步做)
+    riverNet: riverNetOf(world, ctx),
+    riverNetCreek: riverNetCreekOf(world, ctx),
+    forest,
+    forestSpacing: mesh.spacing,
+    forestSeed: subSeed(world.params.seed, 'glyphs'),
   };
   return ctx.vectors;
 }
@@ -285,8 +745,10 @@ export function renderTile(
       const fp = fantasyFullPixels(world, r);
       cleanInk(fp.px, fp.patch);   // 墨线 / 波纹交给前端矢量层,位图只留地形
       px = fp.px;
+    } else if (style === 'white') {
+      px = whitePixels(r);
     } else {
-      px = realisticWindowPixels(r, grids, LOOK[style as 'satellite' | 'geo'] ?? 'detail');
+      px = realisticWindowPixels(r, grids, LOOK[style as 'satellite' | 'geo' | 'classic'] ?? 'detail');
     }
 
     for (let t = 0; t < segH; t++) {

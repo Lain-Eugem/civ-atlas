@@ -182,6 +182,60 @@ describe('世界用到的插件和本机装没装', () => {
   });
 });
 
+describe('只复制插件内容(copyPluginRevision)', () => {
+  it('源世界没有插件记录、数据、图层:返回 none,不建副本', async () => {
+    await commitWorld(request());
+    expect(await vaultOps.copyPluginRevision(sample.id, 'copy-none', '复制的')).toBe('none');
+    expect(await readRevision('copy-none', undefined, [])).toBeNull();
+  });
+
+  it('源世界读不到、清单读不懂:返回 corrupt,不能当成没有插件', async () => {
+    expect(await vaultOps.copyPluginRevision('nothing', 'copy-x', undefined)).toBe('corrupt');
+  });
+
+  it('有插件:原样复制成第一份修订,数据、图层都能从副本读回', async () => {
+    await commitWorld(request());
+    const sim: WorldPlugin = { id: 'magic-sim', version: '1.0.0', sum: 'c'.repeat(64), role: 'sim' };
+    await changePluginData(sample.id, sim, { schema: 1, value: 'x' });
+    await changePluginData(sample.id, tool, { schema: 2, value: { route: [3, 9] } });
+    const cells = sample.map.mesh.n;
+    await changePluginLayer(sample.id, tool, 'dist', { title: '距离', unit: 'cell', values: new Float32Array(cells).fill(1), classes: [{ value: 1, color: '#2b83ba', label: '近' }], legend: '', opacity: 0.7 });
+    const from = await latest();
+
+    expect(await vaultOps.copyPluginRevision(sample.id, 'copy-p', '复制的')).toBe('ok');
+    const copy = (await readRevision('copy-p', undefined, []))!;
+    expect(copy.head.n).toBe(1);
+    expect(copy.manifest.plugins).toEqual(from.plugins);
+    expect(copy.manifest.parts).toEqual(from.parts);
+    expect(await readPluginData('copy-p', tool.id)).toMatchObject({ schema: 2, value: { route: [3, 9] } });
+    expect((await readPluginLayers('copy-p', cells)).map((l) => l.layer)).toEqual(['dist']);
+  });
+
+  it('副本已经被后台转存抢先写了第一份:再补一份插件版修订,不覆盖(只有这一份时)', async () => {
+    await commitWorld(request());
+    await changePluginData(sample.id, tool, { schema: 2, value: { route: [3, 9] } });
+    // 模拟后台转存:副本先有了一份不带插件的自动修订
+    await commitWorld(request({ id: 'copy-race' }));
+    const before = (await readRevision('copy-race', undefined, []))!.head;
+    expect(before.n).toBe(1);
+
+    expect(await vaultOps.copyPluginRevision(sample.id, 'copy-race', '复制的')).toBe('ok');
+    const copy = (await readRevision('copy-race', undefined, []))!;
+    expect(copy.head.n).toBe(2);
+    expect(copy.manifest.plugins).toEqual((await latest()).plugins);
+    expect(await readPluginData('copy-race', tool.id)).toMatchObject({ schema: 2, value: { route: [3, 9] } });
+  });
+
+  it('副本已经有两份以上修订(用户动过):不再覆盖,返回 conflict', async () => {
+    await commitWorld(request());
+    await changePluginData(sample.id, tool, { schema: 2, value: { route: [3, 9] } });
+    await commitWorld(request({ id: 'copy-busy' }));
+    await commitWorld(request({ id: 'copy-busy', recipe: { ...sample.recipe, title: '第二份' } }));
+    expect(await vaultOps.copyPluginRevision(sample.id, 'copy-busy', '复制的')).toBe('conflict');
+    expect((await readRevision('copy-busy', undefined, []))!.head.n).toBe(2);
+  });
+});
+
 describe('复制世界(copyRevision)', () => {
   it('最新的修订原样成为新世界的第一份:插件记录、数据、图层、块都在,配方换成新名字', async () => {
     await commitWorld(request());

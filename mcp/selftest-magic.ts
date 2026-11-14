@@ -57,7 +57,7 @@ async function main(): Promise<void> {
   const zeroView = magicView(zero);
   ok(!!zeroView && zeroView.strength === 0, '强度 0 时 magicView.strength = 0');
   ok(!!zeroView && zeroView.layers.length === 1, '强度 0 时仍记 1 个魔力图层');
-  ok(!!zeroView && zeroView.layers[0].years.length >= 20, `强度 0 时图层帧数 ≥ 20(实际 ${zeroView?.layers[0].years.length})`);
+  ok(!!zeroView && zeroView.layers[0].years.length >= 10, `强度 0 时图层帧数 ≥ 10(实际 ${zeroView?.layers[0].years.length})`);
 
   // 3) 强度 1.5:指纹不同;同配置两次会话一致
   const strong = openSession({ ...base, magicField: 1.5 }).session;
@@ -74,15 +74,16 @@ async function main(): Promise<void> {
   ok(!!layer, '有 1 个魔力图层');
   if (layer) {
     eq(layer.id, MAGIC_LAYER.id, '图层 id = magic');
-    eq(layer.unit, 'region', '图层单位 = 州');
+    eq(layer.unit, 'tile', '图层单位 = 地块');
     eq(layer.keep, MAGIC_LAYER.keep, `keep = ${MAGIC_LAYER.keep}`);
     ok(layer.title.includes('魔力'), `图层标题含「魔力」(${layer.title})`);
-    ok(layer.years.length >= 20, `图层帧数 ≥ 20(实际 ${layer.years.length})`);
+    ok(layer.years.length >= 10, `图层帧数 ≥ 10(实际 ${layer.years.length})`);
     ok(layer.years.every((y, i) => i === 0 || y > layer.years[i - 1]), '图层年份严格升序');
     const rawLayer = (strong.civ.simLayers ?? []).find((L) => L.by === 'magic');
     ok(!!rawLayer, '引擎原始 simLayers 里有 magic 层');
     if (rawLayer) {
-      eq(rawLayer.values.length, rawLayer.years.length * strong.civ.regions.count, '值长度 = 州数 × 帧数');
+      eq(rawLayer.unit, 'tile', '原始图层 memory 单位 = 地块');
+      eq(rawLayer.values.length, rawLayer.years.length * rec.world.mesh.n, '值长度 = 地块数 × 帧数');
     }
     ok(!!layer.stats && layer.stats.max > layer.stats.min, `最后一帧统计有效(max ${layer.stats?.max.toFixed?.(2)})`);
     eq(layer.frameYear, layer.years[layer.years.length - 1], 'frameYear = 最后一帧年份');

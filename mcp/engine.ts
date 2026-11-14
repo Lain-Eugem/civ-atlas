@@ -22,13 +22,16 @@ import { polityAlive, capitalAt, polityName } from '../src/gen/civ/growth';
 import { rulerAt } from '../src/gen/civ/story/peopleInfo';
 import { buildChronicle, entryInvolves, type ChronicleEntry } from '../src/gen/civ/story/chronicle';
 import { cleanOrders, ORDER_KINDS, KEY_HELP, type CleanedOrders } from './orders';
+import { drainPlayerCommands, newPlayerCommandState, playerCommandView, type PlayerCommandState } from './player-commands';
+import { riverReport, riverSummary, type RiverSummary } from './rivers-data';
 import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
 import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
 import { cleanFieldSpec, fieldPlugin, type FieldSpec } from '../src/gen/civ/fieldPlugin';
 import type { TuningValues } from '../src/gen/civ/tuning';
-import type { MonarchCard } from '../src/gen/civ/monarchCard';
+import type { MonarchCard, MonarchCompetence, MonarchTraits } from '../src/gen/civ/monarchCard';
 import type { MemoryBook } from '../src/gen/civ/monarchMemory';
 import type { IntelKnowledge } from '../src/gen/civ/monarchIntel';
+import type { StartSetupInput, StartSetupState } from './monarch-start';
 
 /* ------------------------------------------------------------------ *
  * 世界注册表
@@ -82,10 +85,72 @@ export function getWorldRecord(id: string): WorldRecord {
 
 export type SessionMode = 'auto' | 'monarch';
 
+/**
+ * 一个国家的控制方式:
+ * - 'ai'     = 外部君主(LLM / mock)接管,每回合出一张角色卡 + 命令;
+ * - 'program'= 引擎按内置规则自动推演(与 mode='auto' 时一样)。
+ *
+ * 缺省按会话 mode:monarch 会话默认 'ai',auto 会话默认 'program'。
+ * 开局设置(applyStartSetup)可以按国覆盖;下一回合生效。
+ */
+export type NationControl = 'ai' | 'program';
+
+/** 君主后代(P5):培养出来的继承人,继位时用它的姓名/生年/性格建新卡 */
+export interface MonarchHeir {
+  name: string;
+  born: number;
+  traits: MonarchTraits;
+  competence: MonarchCompetence;
+  /** 培养程度(每培养一次 +1;继承时原样带进新卡备注) */
+  growth: number;
+  /** 培养出来的年份 */
+  createdAt: number;
+}
+
+/** 一条动作的 AP 记账(P5):成功/失败都记 ok 与 reason,超支的写 reason 拒绝 */
+export interface MonarchActionLog {
+  action: string;
+  cost: number;
+  ok: boolean;
+  reason?: string;
+  /** 目标(州名 / 国家名 / 编号),只用于展示 */
+  target?: string;
+}
+
+/** 一回合的行动点账本(P5):回合开始重算 apTotal,提交时把 apSpent/log 写定 */
+export interface MonarchRoundAp {
+  year: number;
+  apTotal: number;
+  apSpent: number;
+  log: MonarchActionLog[];
+}
+
+/** 单个君主国家的 P5 运行期状态(位置 / 后代 / 本回合 AP / 日志) */
+export interface MonarchPolityState {
+  /** 君主所在州(初始 = 国都州;亲征/安抚都按它判距离) */
+  location?: { regionId: number } | null;
+  /** 培养出来的后代(按培养先后;继位时取第一个) */
+  heirs?: MonarchHeir[];
+  /** 本回合 AP 账本(plan 阶段算,commit 后保留到下一回合) */
+  roundAp?: MonarchRoundAp;
+  /** 给编年史/报告用的事件小记(引擎没有可写的自定义史事,先记在会话里) */
+  journal?: { year: number; kind: string; text: string }[];
+  /** 角色卡被继位钉住(不按引擎推演出来的君主重建) */
+  pinned?: boolean;
+  /** 君主的卒年(自然死亡 / 亲征阵亡) */
+  died?: number;
+  /** 被俘到哪一年(这段时间不能亲征) */
+  capturedUntil?: number;
+}
+
 /** 君主模式在会话上的状态(配置 + 每回合日志;具体结构由 mcp/monarch.ts 解释) */
 export interface MonarchState {
   config: Record<string, unknown>;
   rounds: Record<string, unknown>[];
+  /** 这一局君主的寿命(岁):默认 90;开局角色卡启用种族系统时按卡上的 lifespan 写回 */
+  lifespan?: number;
+  /** P5:按国家编号的君主运行期状态(位置 / 后代 / AP / 日志) */
+  byPolity?: Record<string, MonarchPolityState>;
 }
 
 /** DM 小决策在会话上的状态(配置 + 每回合日志;具体结构由 mcp/dm.ts 解释) */
@@ -100,6 +165,26 @@ export interface PettyState {
   /** 运行期配置(可能含 Key,只在当前进程内存;对外展示请用 mcp/petty.ts 的 pettyStatus) */
   config: Record<string, unknown>;
   rounds: Record<string, unknown>[];
+}
+
+/**
+ * 开局定制的一次性状态(由 mcp/monarch-start.ts 在第一回合前写入)。
+ * 推演引擎本身不读它;stateGet / sessionSummary 会原样带出,方便查看器回显。
+ * 角色卡被钉住时,mcp/monarch.ts 的 ensureCards 不会按引擎君主重建它。
+ */
+export interface CustomStartState {
+  /** 定制后的国家编号(新建国家 = 原来 civ.polities.length) */
+  polityId: number;
+  /** 是不是这次新建的国家 */
+  created: boolean;
+  /** 角色卡被钉住(下一轮不按引擎君主重建) */
+  pinnedCard: boolean;
+  /** 应用时的游戏年 */
+  appliedYear: number;
+  /** 这次定制实际拿到 / 放弃的州数 */
+  regions: number;
+  /** 需要让人知道的问题(州不够、颜色会变、君主名只影响角色卡等) */
+  warnings: string[];
 }
 
 export interface SessionOpenInput {
@@ -151,6 +236,11 @@ export interface SessionOpenInput {
   /** 上面这些插件的 id 与 dispose(会话结束时由调用方决定何时卸) */
   pluginIds?: readonly string[];
   pluginDispose?: () => void;
+  /**
+   * 开局国家设置(可选):建会话时先记下,等第一回合前由 applyStartSetup 应用。
+   * 不传 = 用引擎生成的原样国家;传了但一直不应用 = turnStep 会拒绝推演。
+   */
+  setup?: StartSetupInput;
 }
 
 export interface Session {
@@ -197,6 +287,21 @@ export interface Session {
   dm?: DmState;
   /** 小事件裁决层的状态(先用 civ_petty_setup 配置;需要 v2 petty 干预生效) */
   petty?: PettyState;
+  /** 开局定制(第一回合前的君主/疆域定制;没定制 = 没有) */
+  customStart?: CustomStartState;
+  /** 历史遗留:开局面板最近选中的国家编号(仅用于面板聚焦;不表示"玩家国家",m05242 修正) */
+  playerPolityId?: number;
+  /** DM 硬命令队列(上帝视角,命令里显式点名国家;下一回合开始时执行) */
+  playerCommands?: PlayerCommandState;
+  /**
+   * 每国控制方式(只记显式覆盖;没列出的按 mode 默认,见 nationControlOf)。
+   * 由 applyStartSetup 写入;mcp/monarch.ts 只给 'ai' 国出君主卡。
+   */
+  nationControl: Map<number, NationControl>;
+  /** openSession 带进来、还没应用的开局国家设置(应用后清空) */
+  pendingStartSetup?: StartSetupInput;
+  /** 已经应用过的开局国家设置(一次性;没设置过 = 没有) */
+  startSetup?: StartSetupState;
 }
 
 const sessions = new Map<string, Session>();
@@ -215,6 +320,10 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
   const endYear = input.endYear === undefined ? undefined : Math.round(clampNum(input.endYear, startYear + 1, 65535, 'endYear'));
   const mode: SessionMode = input.mode ?? 'auto';
   if (mode !== 'auto' && mode !== 'monarch') throw new Error(`mode 只能是 "auto"(内置规则自动推演) 或 "monarch"(外部君主接管),收到 ${String(mode)}`);
+  const setup = input.setup;
+  if (setup !== undefined && (!setup || typeof setup !== 'object' || Array.isArray(setup))) {
+    throw new Error('setup 要是 { count?, nations?, remove?, removeRegions?, controls?, force? } 对象');
+  }
 
   const started = Date.now();
   const play0: PlayState = { year: startYear, commands: [] };
@@ -288,6 +397,9 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     queue: [],
     logDir,
     createdAt: started,
+    playerCommands: newPlayerCommandState(),
+    nationControl: new Map(),
+    ...(setup ? { pendingStartSetup: setup } : {}),
   };
   sessions.set(id, session);
   writeFileSync(
@@ -305,6 +417,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
         magicField,
         fields,
         plugins: input.pluginIds ?? [],
+        setup: setup ?? null,
         startYear,
         stepYears,
         maxRounds,
@@ -372,6 +485,8 @@ export interface SessionSummary {
   finished: boolean;
   world: { worldId: string; seed: number; cells: number };
   polities: number;
+  /** 河流对地块的影响落在哪:河道条数/地块数/沾河州/沿河承载力占比(见 rivers-data.ts) */
+  rivers: RiverSummary;
   fingerprint: string;
   logDir: string;
   /** 本局玩家自定义场(没开 = 不给这个字段) */
@@ -380,6 +495,14 @@ export interface SessionSummary {
   plugins?: string[];
   /** 本局内置魔力场强度(没开 = 不给) */
   magicField?: number;
+  /** 开局定制(没定制 = 不给) */
+  customStart?: CustomStartState;
+  /** 在世国家的控制方式(国家编号 → 'ai' | 'program');AI = 外部君主接管 */
+  nationControl: Record<string, NationControl>;
+  /** 已经应用的开局国家设置(没应用过 = 不给) */
+  startSetup?: StartSetupState;
+  /** openSession 带了 setup 但还没应用(有 = true;推演前必须先应用) */
+  pendingStartSetup?: boolean;
 }
 
 export function sessionSummary(s: Session): SessionSummary {
@@ -397,11 +520,26 @@ export function sessionSummary(s: Session): SessionSummary {
     finished: isFinished(s),
     world: { worldId: worldIdOf(s.worldParams), seed: s.worldParams.seed, cells: s.worldParams.cells },
     polities: aliveCount(s.civ, s.play.year),
+    rivers: riverSummary(s.world, s.civ),
     fingerprint: civHash(s.civ),
     logDir: s.logDir,
     ...(s.fields?.length ? { fields: s.fields.map((f) => f.id) } : {}),
     ...(s.plugins?.length ? { plugins: s.plugins.map((p) => p.id) } : {}),
     ...(s.magicField ? { magicField: s.magicField.strength } : {}),
+    ...(s.customStart ? { customStart: { ...s.customStart, warnings: [...s.customStart.warnings] } } : {}),
+    nationControl: nationControlView(s),
+    ...(s.startSetup
+      ? {
+          startSetup: {
+            ...s.startSetup,
+            controls: { ...s.startSetup.controls },
+            removed: [...s.startSetup.removed],
+            added: [...s.startSetup.added],
+            warnings: [...s.startSetup.warnings],
+          },
+        }
+      : {}),
+    ...(s.pendingStartSetup ? { pendingStartSetup: true } : {}),
   };
 }
 
@@ -419,6 +557,23 @@ export function sizesNow(civ: Civ): Map<number, number> {
     if (id >= 0) m.set(id, (m.get(id) ?? 0) + 1);
   }
   return m;
+}
+
+/** 某国当前的控制方式:显式覆盖优先,否则按会话 mode 默认(monarch → ai,auto → program) */
+export function nationControlOf(s: Session, polityId: number): NationControl {
+  return s.nationControl?.get(polityId) ?? (s.mode === 'monarch' ? 'ai' : 'program');
+}
+
+/** 在世国家的控制方式(国家编号 → 'ai' | 'program');给 stateGet / 查看器 / 开局面板回显用 */
+export function nationControlView(s: Session): Record<string, NationControl> {
+  const year = s.play.year;
+  const size = sizesNow(s.civ);
+  const out: Record<string, NationControl> = {};
+  for (const p of s.civ.polities) {
+    if (!polityAlive(p, year) || (size.get(p.id) ?? 0) <= 0) continue;
+    out[String(p.id)] = nationControlOf(s, p.id);
+  }
+  return out;
 }
 
 function aliveCount(civ: Civ, year: number): number {
@@ -457,7 +612,7 @@ function eventView(e: ChronicleEntry): EventView {
 export interface MagicLayerView {
   id: string;
   title: string;
-  unit: 'region';
+  unit: 'region' | 'tile';
   keep: number;
   legend: string;
   years: number[];
@@ -479,12 +634,17 @@ export function magicView(s: Session): MagicView | null {
     if (L.by !== 'magic') continue;
     const n = L.years.length ? Math.floor(L.values.length / L.years.length) : 0;
     const last = n ? L.values.subarray(L.values.length - n) : undefined;
+    const unit: 'region' | 'tile' = L.unit === 'tile' ? 'tile' : 'region';
+    const of = s.civ.regions.of;
     let min = Infinity;
     let max = -Infinity;
     let sum = 0;
     let k = 0;
     if (last) {
-      for (const v of last) {
+      for (let i = 0; i < last.length; i++) {
+        // 按地块的层只统计陆地地块(海水那部分不算魔力)
+        if (unit === 'tile' && of[i]! < 0) continue;
+        const v = last[i]!;
         if (!Number.isFinite(v)) continue;
         min = Math.min(min, v);
         max = Math.max(max, v);
@@ -495,7 +655,7 @@ export function magicView(s: Session): MagicView | null {
     layers.push({
       id: L.id,
       title: L.title,
-      unit: 'region',
+      unit,
       keep: MAGIC_LAYER.keep,
       legend: MAGIC_LAYER.legend,
       years: [...L.years],
@@ -587,6 +747,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     rounds: s.rounds,
     finished: isFinished(s),
     polities: alive,
+    rivers: riverReport(s.world, s.civ, year),
     commandQueue: s.queue.length,
     commands: s.play.commands.map((v) => ({ kind: v.kind, from: v.from, time: commandTime(v), ...restOf(v) })),
     fingerprint: civHash(s.civ),
@@ -597,6 +758,14 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     ...(s.memory?.size ? { memory: [...s.memory.values()].map((b) => ({ polityId: b.polityId, revision: b.revision, entries: b.entries })) } : {}),
     ...(s.intel ? { intel: s.intel } : {}),
     ...(s.pendingPlan ? { pendingPlan: true } : {}),
+    ...(s.customStart ? { customStart: s.customStart } : {}),
+    nationControl: nationControlView(s),
+    startSetup: s.startSetup ?? null,
+    pendingStartSetup: s.pendingStartSetup ?? null,
+    ...(s.monarch ? { monarchLifespan: s.monarch.lifespan ?? null, monarchByPolity: s.monarch.byPolity ?? {} } : {}),
+    playerCommands: playerCommandView(s),
+    // 历史遗留字段:仅为兼容旧前端保留,UI 不再展示"你/扮演";没有玩家国家(m05242)
+    playerPolityId: s.playerPolityId ?? null,
     ...(chronicle ? { chronicle } : {}),
   };
 }
@@ -641,6 +810,15 @@ export interface TurnResult {
 /** 把队列里的命令交给引擎,再推 stepYears 年 */
 export function turnStep(s: Session, opts: { years?: number; orders?: readonly unknown[] } = {}): TurnResult {
   if (isFinished(s)) throw new Error(`会话 ${s.id} 已经结束(第 ${s.play.year} 年,${s.rounds}/${s.maxRounds} 回合)`);
+  if (s.pendingStartSetup) {
+    throw new Error('开局国家设置还没应用:先调用 applyStartSetup(或 POST /api/session/start-setup)再推演');
+  }
+  // DM 对话框里直接下的硬命令(上帝视角,命令里已显式点名国家):回合开始时先入队(最多 5 条),与其它命令一起交给引擎
+  const playerCmds = drainPlayerCommands(s);
+  if (playerCmds.length) {
+    const cleanedPlayer = cleanOrders(s.play, playerCmds);
+    s.queue.push(...cleanedPlayer.commands);
+  }
   if (opts.orders && opts.orders.length) {
     const cleaned = cleanOrders(s.play, opts.orders);
     s.queue.push(...cleaned.commands);

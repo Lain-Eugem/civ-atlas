@@ -48,6 +48,9 @@ export interface SimLayer extends SimLayerLook {
  */
 export const LAYER_LIMITS = { layers: 4, keep: 1000, bytes: 6e6 } as const;
 
+/** 按地块记的图层格数固定(世界地块数),字节上限可以贴着世界文件一块 8 MB 给 */
+export const TILE_LAYER_BYTES = 7.8e6;
+
 /** 一个图层推着推着存下的几份 */
 export class LayerRun {
   readonly keep: number;
@@ -87,7 +90,9 @@ export class LayerRun {
   /** 存一份:data = 那张表此刻的值(格 × 栏);超出单精度能存的压到最大最小,不变成无穷大 */
   keepFrame(year: number, data: Float64Array): void {
     const n = data.length / this.cols;
-    if ((this.years.length + 1) * n * 4 > LAYER_LIMITS.bytes) throw new Error(`图层 ${this.spec.id} 存的太多(每 ${this.spec.keep} 年一份、${n} 格),把 keep 调大`);
+    // 地块图层的格数是固定的,可以用满世界文件一块的上限;州图层留出地形大事后州变多的余量
+    const limit = this.unit === 'tile' ? TILE_LAYER_BYTES : LAYER_LIMITS.bytes;
+    if ((this.years.length + 1) * n * 4 > limit) throw new Error(`图层 ${this.spec.id} 存的太多(每 ${this.spec.keep} 年一份、${n} 格),把 keep 调大`);
     const f = new Float32Array(n);
     for (let r = 0; r < n; r++) f[r] = Math.max(-F32_MAX, Math.min(F32_MAX, data[r * this.cols + this.col]));
     this.years.push(year);

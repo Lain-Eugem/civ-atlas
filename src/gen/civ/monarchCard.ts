@@ -47,9 +47,26 @@ export interface MonarchCard {
   traits: MonarchTraits;
   preferences: MonarchPreferences;
   competence: MonarchCompetence;
+  /** 君主生平(玩家填的自由文本,≤600 字;从生平推断性格的原始材料) */
+  biography?: string;
+  /** 种族(自由文本占位;启用种族系统时才与寿命联动) */
+  race?: string;
+  /** 是否启用种族系统(关闭时寿命一律 90) */
+  raceSystem?: boolean;
+  /** 寿命(岁,20–200;默认 90) */
+  lifespan: number;
   /** 建卡时的年份 */
   createdAt: number;
 }
+
+/** 默认寿命(岁):不启用种族系统 / 没填种族时一律按它 */
+export const CARD_LIFESPAN_DEFAULT = 90;
+/** 寿命合法区间(岁) */
+export const CARD_LIFESPAN_MIN = 20;
+export const CARD_LIFESPAN_MAX = 200;
+/** 生平 / 种族文本上限(与查看器面板一致) */
+export const CARD_BIOGRAPHY_MAX = 600;
+export const CARD_RACE_MAX = 40;
 
 const clamp100 = (v: number): number => Math.max(0, Math.min(100, Math.round(v)));
 
@@ -107,6 +124,7 @@ export function monarchCard(civ: Civ, polityId: number, year: number): MonarchCa
     traits,
     preferences,
     competence,
+    lifespan: CARD_LIFESPAN_DEFAULT,
     createdAt: Math.floor(year),
   };
   card.persona = personaOf(card);
@@ -136,11 +154,27 @@ export function cardIsCurrent(civ: Civ, card: MonarchCard, year: number): boolea
 
 const COMPETENCE_KEYS = ['war', 'economy', 'intrigue', 'admin'] as const;
 
-/** 玩家/DM 改卡:只接受文案、性格、偏好、能力;数值夹回合法区间 */
+/** 玩家/DM 改卡:只接受文案、性格、偏好、能力、生平/种族/寿命;数值夹回合法区间 */
 export function cleanCardInput(raw: unknown, base: MonarchCard): MonarchCard {
   const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const out: MonarchCard = { ...base, traits: { ...base.traits }, preferences: { ...base.preferences }, competence: { ...base.competence } };
   if (typeof o.persona === 'string' && o.persona.trim()) out.persona = o.persona.trim().slice(0, 200);
+  if (typeof o.biography === 'string') {
+    const biography = o.biography.trim().slice(0, CARD_BIOGRAPHY_MAX);
+    if (biography) out.biography = biography;
+    else delete out.biography;
+  }
+  if (typeof o.race === 'string') {
+    const race = o.race.trim().slice(0, CARD_RACE_MAX);
+    if (race) out.race = race;
+    else delete out.race;
+  }
+  if (typeof o.raceSystem === 'boolean') out.raceSystem = o.raceSystem;
+  const lifeRaw = typeof o.lifespan === 'number' && Number.isFinite(o.lifespan) ? Math.round(o.lifespan) : out.lifespan;
+  // 种族系统关掉时寿命固定 90;开着才允许 20–200 的自定义寿命
+  out.lifespan = out.raceSystem
+    ? Math.max(CARD_LIFESPAN_MIN, Math.min(CARD_LIFESPAN_MAX, lifeRaw))
+    : CARD_LIFESPAN_DEFAULT;
   const t = (o.traits ?? {}) as Record<string, unknown>;
   for (const k of ['caution', 'ambition', 'honor', 'greed'] as const) {
     const v = t[k];
@@ -175,6 +209,8 @@ export function cardSystemText(card: MonarchCard): string {
     `- 性格:谨慎 ${t.caution}、野心 ${t.ambition}、荣誉感 ${t.honor}、贪欲 ${t.greed}(0–100)。`,
     `- 策略偏好:战争 = ${WAR_TEXT[card.preferences.war]};经济 = ${card.preferences.economy === 'trade' ? '重商' : '重农与建设'};外交 = ${card.preferences.diplomacy === 'honor' ? '守信' : '务实'}。`,
     `- 能力:用兵${COMPETENCE_TEXT[c.war]},理财${COMPETENCE_TEXT[c.economy]},密谋${COMPETENCE_TEXT[c.intrigue]},理政${COMPETENCE_TEXT[c.admin]}。`,
+    ...(card.race ? [`- 种族:${card.race}${card.raceSystem ? `(这个种族自然寿命约 ${card.lifespan} 岁)` : ''}。`] : []),
+    `- 寿命:你按凡人的寿命活着,预计能活到 ${card.lifespan} 岁左右。`,
     `- 你是一个人,不是国家本身:只能做"这个人想得到、办得到"的决定;超出能力的事不要写进命令。`,
   ].join('\n');
 }

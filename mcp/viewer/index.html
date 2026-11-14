@@ -26,7 +26,7 @@
 
   <div class="map-loading hidden" id="mapLoading"><span class="spinner"></span><span id="mapLoadingText">地图生成中…</span></div>
   <div class="map-tip">东西相连、越过极点接到另一侧 · 拖动可无限平移 · 滚轮 / 双击缩放(自动提高清晰度)· 点击国家</div>
-  <div class="field-tip hidden" id="fieldTip"></div>
+  <div class="map-tip-card hidden" id="mapTip"></div>
 
   <!-- 顶栏 -->
   <header class="topbar">
@@ -50,6 +50,7 @@
           <option value="fantasy">手绘羊皮纸</option>
           <option value="satellite">卫星写实</option>
           <option value="geo">地理图</option>
+          <option value="white">白模(灰白)</option>
           <option value="classic">原沙盒地形</option>
         </select>
       </label>
@@ -62,6 +63,7 @@
   <nav class="dock" id="dock" aria-label="对局操作">
     <button id="btnWorld" class="dock-btn cta" type="button"><b>①</b> 创建世界</button>
     <button id="btnSession" class="dock-btn" type="button" disabled><b>②</b> 开始会话</button>
+    <button id="btnStartCfg" class="dock-btn" type="button" disabled><b>✦</b> 开局设置</button>
     <button id="btnRound" class="dock-btn hot" type="button" disabled><b>③</b> 跑一回合</button>
     <button id="btnAuto" class="dock-btn" type="button" disabled>自动播放</button>
     <span class="dock-sep" aria-hidden="true"></span>
@@ -225,18 +227,33 @@
           </details>
 
           <details class="llm-row" id="magicRow">
-            <summary>本局动态层 · 魔力 <span class="muted">(逐年演化:灵脉渗出 → 邻州扩散 → 人口耗散;每 50 年存一帧,真影响城上限)</span></summary>
+            <summary>本局动态层 · 魔力 <span class="muted">(每地块逐年演化:灵脉渗出 → 邻块扩散 → 自然消退;每 100 年存一帧,真影响城上限)</span></summary>
             <div class="control-row">
               <label class="field check"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
               <label class="field"><span>图层年份</span><select id="magicYearPick"></select></label>
               <button id="btnMagicNow" class="btn" type="button">回到本回合</button>
               <span class="hint grow" id="magicStatusLine">开一个带「魔力场」的会话后,这里会出现逐年图层。</span>
             </div>
+            <div class="control-row">
+              <label class="field"><span>色带</span><select id="magicPalette" aria-label="魔力色带">
+                <option value="">默认(紫)</option>
+                <option value="ember">余烬</option>
+                <option value="verdant">青翠</option>
+                <option value="frost">冰蓝</option>
+                <option value="mono">灰阶</option>
+                <option value="custom">自定义</option>
+              </select></label>
+              <label class="field color" title="低值颜色"><span>低</span><input id="magicColor0" type="color" value="#1b1036" aria-label="魔力低值颜色"></label>
+              <label class="field color" title="中间值颜色"><span>中</span><input id="magicColor1" type="color" value="#5b2a9e" aria-label="魔力中间值颜色"></label>
+              <label class="field color" title="高值颜色"><span>高</span><input id="magicColor2" type="color" value="#f2e6ff" aria-label="魔力高值颜色"></label>
+              <button id="btnMagicColorsReset" class="btn quiet" type="button">默认色</button>
+              <span class="hint grow">白模画法下看魔力颜色最清楚;色带只改显示,不改数值。</span>
+            </div>
             <div class="field-legend-wrap hidden" id="magicLegendWrap">
               <div class="field-legend-head"><span id="magicLegendName">魔力浓度</span><span class="field-legend-hash" id="magicLegendHash"></span></div>
               <div class="field-legend-bar" id="magicLegendBar"></div>
               <div class="field-legend-ticks" id="magicLegendTicks"></div>
-              <div class="field-legend-unit">按州记的浓度(0–100;图层色带 0–60)· 每像素取所属州的值 · hover 看精确值</div>
+              <div class="field-legend-unit">按地块记录的浓度(0–100)· 每像素取所在州的值 · hover 看精确值</div>
             </div>
           </details>
         </div>
@@ -268,6 +285,8 @@
     <div class="panel-head log-head">
       <nav class="tabs" id="tabs">
         <button class="tab active" type="button" data-tab="decisions">AI 决策</button>
+        <button class="tab" type="button" data-tab="dm">DM 对话</button>
+        <button class="tab" type="button" data-tab="jev">Jev 裁决</button>
         <button class="tab" type="button" data-tab="crown">君主</button>
         <button class="tab" type="button" data-tab="chronicle">编年史</button>
         <button class="tab" type="button" data-tab="rounds">回合日志</button>
@@ -348,8 +367,25 @@
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="prewarm" id="prewarm" hidden>
+  <div class="prewarm-card">
+    <div class="prewarm-title">正在预渲染地图</div>
+    <div class="prewarm-sub">把每个放大倍率的地形先算好，之后拖动、放大都是现成的</div>
+    <div class="prewarm-bar"><div class="prewarm-fill" id="prewarmFill"></div></div>
+    <div class="prewarm-text" id="prewarmText">准备中…</div>
+  </div>
+</div>
 <div class="busy" id="busy"><div class="busy-card"><span class="spinner big"></span><div><div class="busy-title" id="busyTitle">AI 君主思考中…</div><div class="busy-sub" id="busySub"></div></div></div></div>
 
+<script src="./vec-draw.js"></script>
+<script src="./labels.js"></script>
+  <script src="./regions.js"></script>
+  <script src="./dialogue.js"></script>
+  <script src="./start-custom.js"></script>
+<script src="./region-atlas.js"></script>
+<script src="./region-picker.js"></script>
+<script src="./tooltip.js"></script>
+<script src="./dm-chat.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>
