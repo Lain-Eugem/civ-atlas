@@ -1269,3 +1269,39 @@ details.advanced > summary { font-weight: 500; }
 .prewarm-bar { margin-top: 16px; height: 6px; border-radius: 3px; background: #e4dccb; overflow: hidden; }
 .prewarm-fill { height: 100%; width: 0%; border-radius: 3px; background: #8a7350; transition: width 0.25s ease; }
 .prewarm-text { margin-top: 9px; font-size: 12px; color: #6b6252; font-variant-numeric: tabular-nums; }
+
+/* ---------------- 地区悬停小窗 ---------------- */
+
+.region-tip {
+  position: absolute;
+  z-index: 45;
+  pointer-events: none;
+  min-width: 190px;
+  max-width: 300px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: var(--shadow-float);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--ink);
+}
+@media (prefers-color-scheme: dark) {
+  .region-tip { background: rgba(30, 30, 33, 0.95); }
+}
+.region-tip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 4px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--line-2, rgba(0, 0, 0, 0.08));
+  font-size: 12.5px;
+}
+.region-tip-no { font-size: 10px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.region-tip-row { display: flex; gap: 8px; }
+.region-tip-k { flex: 0 0 46px; color: var(--ink-3); }
+.region-tip-v { flex: 1 1 auto; }
+.region-tip-polity { font-weight: 600; }
+.region-tip .muted { color: var(--ink-3); }

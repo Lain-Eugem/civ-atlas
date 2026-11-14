@@ -27,6 +27,7 @@
   <div class="map-loading hidden" id="mapLoading"><span class="spinner"></span><span id="mapLoadingText">地图生成中…</span></div>
   <div class="map-tip">东西相连、越过极点接到另一侧 · 拖动可无限平移 · 滚轮 / 双击缩放(自动提高清晰度)· 点击国家</div>
   <div class="field-tip hidden" id="fieldTip"></div>
+  <div class="region-tip hidden" id="regionTip"></div>
 
   <!-- 顶栏 -->
   <header class="topbar">
@@ -63,6 +64,7 @@
   <nav class="dock" id="dock" aria-label="对局操作">
     <button id="btnWorld" class="dock-btn cta" type="button"><b>①</b> 创建世界</button>
     <button id="btnSession" class="dock-btn" type="button" disabled><b>②</b> 开始会话</button>
+    <button id="btnStartCfg" class="dock-btn" type="button" disabled><b>✦</b> 开局设置</button>
     <button id="btnRound" class="dock-btn hot" type="button" disabled><b>③</b> 跑一回合</button>
     <button id="btnAuto" class="dock-btn" type="button" disabled>自动播放</button>
     <span class="dock-sep" aria-hidden="true"></span>
@@ -284,6 +286,8 @@
     <div class="panel-head log-head">
       <nav class="tabs" id="tabs">
         <button class="tab active" type="button" data-tab="decisions">AI 决策</button>
+        <button class="tab" type="button" data-tab="dm">DM 对话</button>
+        <button class="tab" type="button" data-tab="jev">Jev 裁决</button>
         <button class="tab" type="button" data-tab="crown">君主</button>
         <button class="tab" type="button" data-tab="chronicle">编年史</button>
         <button class="tab" type="button" data-tab="rounds">回合日志</button>
@@ -376,6 +380,9 @@
 
 <script src="./vec-draw.js"></script>
 <script src="./labels.js"></script>
+  <script src="./regions.js"></script>
+  <script src="./dialogue.js"></script>
+  <script src="./start-custom.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>

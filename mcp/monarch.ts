@@ -263,13 +263,23 @@ function jevFor(s: Session): JevSettings | null {
   return pettyRuntime(s.id)?.config.client ?? null;
 }
 
+/**
+ * 开局定制钉住的角色卡: 玩家在开局设置里亲手定了君主姓名/性格时,
+ * 不按引擎推演出来的君主重建这张卡(否则第一回合就会被覆盖)。
+ * 只钉定制的那个国家;其它国家照旧。
+ */
+function pinnedCard(s: Session, id: number): boolean {
+  const cs = s.customStart;
+  return !!cs && cs.pinnedCard && cs.polityId === id;
+}
+
 /** 建卡/换卡:君主换人时重建角色卡,旧君主的记忆保留并记一笔"继位" */
 function ensureCards(s: Session, ids: readonly number[], year: number): void {
   s.cards ??= new Map();
   s.memory ??= new Map();
   for (const id of ids) {
     const prev = s.cards.get(id);
-    if (!prev || !cardIsCurrent(s.civ, prev, year)) {
+    if (!(prev && pinnedCard(s, id)) && (!prev || !cardIsCurrent(s.civ, prev, year))) {
       const card = monarchCard(s.civ, id, year);
       if (card) {
         s.cards.set(id, card);

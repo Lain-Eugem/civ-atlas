@@ -15,7 +15,8 @@ import type { Raster } from '../src/gen/raster';
 import { Layer, type Civ } from '../src/gen/civ/types';
 import type { CivDrawParams } from '../src/render/civ/overlay';
 import { pixelRegions, washPixels } from '../src/render/civ/territory';
-import { borderLines } from '../src/render/civ/borders';
+import { borderLines, mergeChains, regionChains } from '../src/render/civ/borders';
+import { chaikin } from '../src/render/civ/lines';
 import { rasterizeWindow, sphereCoverWindow, zoomSource, type ZoomSource } from '../src/gen/rasterWindow';
 import { worldRaster } from './terrain';
 
@@ -26,6 +27,8 @@ export interface OwnerPixels {
   rgba: Uint8ClampedArray;
   /** 国界线:每条是扁平的 [x0,y0,x1,y1,…],主图像素坐标(已平滑;跨 180° 的线会落到 [0,W] 之外,前端按 shift 再画一份) */
   borders: number[][];
+  /** 州界线:同上格式(已 Chaikin 平滑 + RDP 抽稀);国界线之外的第二层细线,同样会落到 [0,W] 之外 */
+  regions: number[][];
 }
 
 /** 找不到国家颜色时的兜底灰(查看器其它图层的无主色也用这个) */
@@ -45,7 +48,13 @@ export function renderOwnerPixels(world: World, civ: Civ): OwnerPixels {
     { w, h, f: 1, pixRegion, owner: civ.polity, colors: polityColors(civ), style: 'fantasy', polity: true },
     out,
   );
-  return { width: w, height: h, rgba: out, borders: ownerBorderLines(world, raster, civ) };
+  return {
+    width: w,
+    height: h,
+    rgba: out,
+    borders: ownerBorderLines(world, raster, civ),
+    regions: regionBorderLines(world, raster, civ),
+  };
 }
 
 /** 国家 id → RGB:colors[id×3 .. id×3+2](id 不保证连续,长度按最大 id 算) */
@@ -88,6 +97,96 @@ function ownerBorderLines(world: World, raster: Raster, civ: Civ): number[][] {
     .map((l) => Array.from(l.pts, (v) => Math.round(v * 100) / 100));
 }
 
+/* ------------------------------------------------------------------ *
+ * 州界线:每个州自己的边界(国界之外的第二层细线)
+ * ------------------------------------------------------------------ */
+
+/** 州界线平滑几轮:1 轮把网格折角抹圆就够;2 轮点数翻 4 倍,还要多抽一次,划不来 */
+const REGION_SMOOTH_ROUNDS = 1;
+/** 抽稀容差(主图像素):虚线只有 0.7px 宽,0.9px 的偏差看不出来,JSON 却能小一半以上 */
+const REGION_SIMPLIFY_TOL = 0.9;
+
+/** 州界线按州缓存:州不随年份变,换了历史但州没换就直接复用(和国界的 chainCache 同一个道理) */
+const regionLineCache = new WeakMap<Civ['regions'], { mesh: World['mesh']; lines: number[][] }>();
+
+/**
+ * 州界线:每个州自己的边界(不含海岸线 —— 链只存在于两个陆地块之间)。
+ * 做法和国界同一条链:regionChains() 里是所有「两个州之间」的网格边,给 mergeChains() 传一份
+ * identity 归属表(owner[i] = i),它只跳过左右归属相同的链,于是每个州的边界都留下来,
+ * 并在只有两条线相接的交汇处接成长线;再 Chaikin 平滑 + RDP 抽稀(虚线只要看得出形状),
+ * 坐标 round 2 位。
+ * 坐标 = 世界坐标(= 主图像素);跨 180° 的线会落到 [0,W] 之外,前端按 wrap shift 再画一份。
+ */
+export function regionBorderLines(world: World, raster: Raster, civ: Civ): number[][] {
+  void raster; // 坐标本来就是主图像素(raster.scale = 1);参数和 ownerBorderLines 对齐,以后换倍率时再用
+  const hit = regionLineCache.get(civ.regions);
+  if (hit && hit.mesh === world.mesh) return hit.lines;
+  const rc = regionChains(world.mesh, civ);
+  const owner = new Int32Array(civ.regions.count);
+  for (let i = 0; i < owner.length; i++) owner[i] = i;
+  const lines: number[][] = [];
+  for (const merged of mergeChains(rc, owner)) {
+    if (merged.pts.length < 4) continue;
+    const smooth = chaikin(merged, REGION_SMOOTH_ROUNDS);
+    const pts = simplifyLine(smooth.pts, REGION_SIMPLIFY_TOL);
+    if (pts.length >= 4) lines.push(pts);
+  }
+  regionLineCache.set(civ.regions, { mesh: world.mesh, lines });
+  return lines;
+}
+
+/**
+ * Douglas–Peucker 抽稀:pts 是扁平 [x,y,x,y,…],返回保留点的扁平坐标(round 2 位)。
+ * 首尾必留:开放的州界在交汇处不能断,环的首尾原本就差一整圈,也照样留。
+ */
+function simplifyLine(pts: Float32Array, tol: number): number[] {
+  const m = pts.length >> 1;
+  if (m < 2) return [];
+  const round2 = (v: number): number => Math.round(v * 100) / 100;
+  if (m === 2) return [round2(pts[0]), round2(pts[1]), round2(pts[2]), round2(pts[3])];
+  const keep = new Uint8Array(m);
+  keep[0] = 1;
+  keep[m - 1] = 1;
+  const tol2 = tol * tol;
+  const stack: number[] = [0, m - 1];
+  while (stack.length) {
+    const b = stack.pop()!;
+    const a = stack.pop()!;
+    if (b - a < 2) continue;
+    const ax = pts[a * 2];
+    const ay = pts[a * 2 + 1];
+    const mx = pts[b * 2] - ax;
+    const my = pts[b * 2 + 1] - ay;
+    const len2 = mx * mx + my * my;
+    let far = -1;
+    let farD = -1;
+    for (let i = a + 1; i < b; i++) {
+      let ex = pts[i * 2] - ax;
+      let ey = pts[i * 2 + 1] - ay;
+      if (len2 > 0) {
+        let t = (ex * mx + ey * my) / len2;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        ex -= t * mx;
+        ey -= t * my;
+      }
+      const d2 = ex * ex + ey * ey;
+      if (d2 > farD) {
+        farD = d2;
+        far = i;
+      }
+    }
+    if (far >= 0 && farD > tol2) {
+      keep[far] = 1;
+      stack.push(a, far, far, b);
+    }
+  }
+  const out: number[] = [];
+  for (let i = 0; i < m; i++) {
+    if (!keep[i]) continue;
+    out.push(round2(pts[i * 2]), round2(pts[i * 2 + 1]));
+  }
+  return out;
+}
 /* ------------------------------------------------------------------ *
  * 疆域高清瓦片:放大后按当前倍率现算一块(和地形瓦片同一套坐标)
  *
@@ -183,7 +282,7 @@ export function renderOwnerTilePixels(
     }
     py = end;
   }
-  return { width: size, height: size, rgba: out, borders: [] };
+  return { width: size, height: size, rgba: out, borders: [], regions: [] };
 }
 
 /**

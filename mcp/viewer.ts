@@ -42,6 +42,7 @@ import {
   type Session,
 } from './engine';
 import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, setMonarchCard, verifySession } from './monarch';
+import { listStartNations, applyCustomStart } from './monarch-start';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
@@ -60,6 +61,8 @@ import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, ma
 import { isTerrainStyle, renderTile, renderVectors, renderVeinOverlay, renderWhole, type TerrainStyle } from './terrain';
 import { renderOwnerPixels, ownerCivData, renderOwnerTilePixels } from './owner-map';
 import { buildLabels } from './labels';
+import { regionInfoAt } from './region-info';
+import { dialogueView } from './dialogue';
 import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
@@ -399,6 +402,7 @@ interface OwnerMap extends MapImage {
   grid: { w: number; h: number; owner: number[] };
   colors: Record<string, string>;
   /** 国界线:扁平 [x0,y0,x1,y1,…],主图像素坐标(跨 180° 的线会超出 [0,W],前端按 shift 再画一份) */
+  regions: number[][];
   borders: number[][];
   fingerprint: string;
 }
@@ -438,6 +442,7 @@ function renderOwnerMap(s: Session): OwnerMap {
     grid: { w: gw, h: gh, owner: Array.from(ownerGrid) },
     colors,
     borders: pixels.borders,
+    regions: pixels.regions,
     fingerprint: '',
   };
 }
@@ -561,6 +566,8 @@ function stateView(s: Session): Record<string, unknown> {
     memory: s.memory ? [...s.memory.values()] : [],
     intel: s.intel ?? {},
     pendingPlan: !!s.pendingPlan,
+    // 开局定制(角色卡/起始疆域);没定制 = null
+    customStart: s.customStart ? { ...s.customStart, warnings: [...s.customStart.warnings] } : null,
   };
 }
 
@@ -592,6 +599,7 @@ const magicTilePngs = new Map<string, Buffer>();
 const ownerTilePngs = new Map<string, Buffer>();
 /** 标签层缓存:键 = sessionId|年份(世界 / 文明状态不变时只生成一次) */
 const labelsCache = new Map<string, string>();
+const dialogueCache = new Map<string, string>();
 const veinCache = new Map<string, string>();
 
 /** 会话状态变了:整张疆域图和它的疆域瓦片都作废(瓦片按 session 前缀清) */
@@ -816,6 +824,7 @@ function getOwnerMap(s: Session): {
   png: Buffer;
   grid: { w: number; h: number; owner: number[] };
   colors: Record<string, string>;
+  regions: number[][];
   borders: number[][];
   fingerprint: string;
   width: number;
@@ -829,6 +838,7 @@ function getOwnerMap(s: Session): {
       grid: { w: number; h: number; owner: number[] };
       colors: Record<string, string>;
       borders: number[][];
+      regions: number[][];
       width: number;
       height: number;
     };
@@ -841,6 +851,7 @@ function getOwnerMap(s: Session): {
     grid: map.grid,
     colors: map.colors,
     borders: map.borders,
+    regions: map.regions,
     width: map.width,
     height: map.height,
   };
@@ -850,6 +861,7 @@ function getOwnerMap(s: Session): {
     grid: map.grid,
     colors: map.colors,
     borders: map.borders,
+    regions: map.regions,
     width: map.width,
     height: map.height,
     fingerprint,
@@ -1051,6 +1063,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       width: m.width,
       height: m.height,
       borders: m.borders,
+      regions: m.regions,
       fingerprint: m.fingerprint,
     });
     return true;
@@ -1100,6 +1113,44 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (ownerTilePngs.size > 512) ownerTilePngs.clear();
     ownerTilePngs.set(key, png);
     sendPng(res, png);
+    return true;
+  }
+
+  // 州信息:鼠标悬停时按世界像素查这一州的归属 / 群落 / 河流(像素→州 的索引服务端按世界缓存)
+  if (method === 'GET' && pathname === '/api/map/region-info') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    const s = getSession(sid);
+    const info = regionInfoAt(s.world, s.civ, x, y);
+    sendJson(res, 200, { info });
+    return true;
+  }
+
+  // DM 对话 / Jev 裁决:从会话日志里整理出“每回合说了什么、裁了什么”,日志页签直接渲染
+  if (method === 'GET' && pathname === '/api/dialogue') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const rawLimit = q.get('limit');
+    const limit = rawLimit === null || rawLimit === '' ? 80 : Number(rawLimit);
+    if (!Number.isFinite(limit)) { fail(res, 400, 'limit 必须是数字'); return true; }
+    const kindRaw = q.get('kind');
+    const kind = kindRaw === 'dm' || kindRaw === 'jev' || kindRaw === 'monarch' ? kindRaw : undefined;
+    const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
+    const key = `${s.id}|${fingerprint}|${limit}|${kind ?? ''}`;
+    let json = dialogueCache.get(key);
+    if (!json) {
+      json = JSON.stringify(dialogueView(s, { limit, kind }));
+      dialogueCache.set(key, json);
+      if (dialogueCache.size > 16) dialogueCache.clear();
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
     return true;
   }
 
@@ -1256,6 +1307,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     return true;
   }
 
+  if (method === 'GET' && pathname === '/api/start/nations') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    sendJson(res, 200, { nations: listStartNations(s) });
+    return true;
+  }
+
   if (method === 'GET' && pathname === '/api/state') {
     const sid = url.searchParams.get('sessionId') ?? '';
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
@@ -1327,6 +1386,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       invalidateOwnerCache(session.id);
       chronCache.delete(session.id);
       sendJson(res, 200, { session: summary, state: stateView(session) });
+      return true;
+    }
+
+    // 开局定制:君主角色卡 + 起始疆域大小/位置(只允许第一回合前)
+    if (pathname === '/api/session/custom-start') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const atRaw = args.at as Record<string, unknown> | undefined;
+      const input: Record<string, unknown> = {};
+      if (args.polityId !== undefined && args.polityId !== null && args.polityId !== '') input.polityId = Number(args.polityId);
+      if (atRaw && typeof atRaw === 'object' && Number.isFinite(Number(atRaw.x)) && Number.isFinite(Number(atRaw.y))) {
+        input.at = { x: Number(atRaw.x), y: Number(atRaw.y) };
+      }
+      if (args.size !== undefined && args.size !== null && args.size !== '') input.size = Number(args.size);
+      if (args.card && typeof args.card === 'object') input.card = args.card as Record<string, unknown>;
+      if (args.autoCard === true) input.autoCard = true;
+      const result = applyCustomStart(s, input);
+      invalidateOwnerCache(s.id);
+      chronCache.delete(s.id);
+      sendJson(res, 200, { state: stateView(s), result });
       return true;
     }
 

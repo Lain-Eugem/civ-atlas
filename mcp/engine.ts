@@ -103,6 +103,26 @@ export interface PettyState {
   rounds: Record<string, unknown>[];
 }
 
+/**
+ * 开局定制的一次性状态(由 mcp/monarch-start.ts 在第一回合前写入)。
+ * 推演引擎本身不读它;stateGet / sessionSummary 会原样带出,方便查看器回显。
+ * 角色卡被钉住时,mcp/monarch.ts 的 ensureCards 不会按引擎君主重建它。
+ */
+export interface CustomStartState {
+  /** 定制后的国家编号(新建国家 = 原来 civ.polities.length) */
+  polityId: number;
+  /** 是不是这次新建的国家 */
+  created: boolean;
+  /** 角色卡被钉住(下一轮不按引擎君主重建) */
+  pinnedCard: boolean;
+  /** 应用时的游戏年 */
+  appliedYear: number;
+  /** 这次定制实际拿到 / 放弃的州数 */
+  regions: number;
+  /** 需要让人知道的问题(州不够、颜色会变、君主名只影响角色卡等) */
+  warnings: string[];
+}
+
 export interface SessionOpenInput {
   worldId: string;
   /** 起始年(必填;第一轮从这个年份年初开始) */
@@ -198,6 +218,8 @@ export interface Session {
   dm?: DmState;
   /** 小事件裁决层的状态(先用 civ_petty_setup 配置;需要 v2 petty 干预生效) */
   petty?: PettyState;
+  /** 开局定制(第一回合前的君主/疆域定制;没定制 = 没有) */
+  customStart?: CustomStartState;
 }
 
 const sessions = new Map<string, Session>();
@@ -383,6 +405,8 @@ export interface SessionSummary {
   plugins?: string[];
   /** 本局内置魔力场强度(没开 = 不给) */
   magicField?: number;
+  /** 开局定制(没定制 = 不给) */
+  customStart?: CustomStartState;
 }
 
 export function sessionSummary(s: Session): SessionSummary {
@@ -406,6 +430,7 @@ export function sessionSummary(s: Session): SessionSummary {
     ...(s.fields?.length ? { fields: s.fields.map((f) => f.id) } : {}),
     ...(s.plugins?.length ? { plugins: s.plugins.map((p) => p.id) } : {}),
     ...(s.magicField ? { magicField: s.magicField.strength } : {}),
+    ...(s.customStart ? { customStart: { ...s.customStart, warnings: [...s.customStart.warnings] } } : {}),
   };
 }
 
@@ -607,6 +632,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     ...(s.memory?.size ? { memory: [...s.memory.values()].map((b) => ({ polityId: b.polityId, revision: b.revision, entries: b.entries })) } : {}),
     ...(s.intel ? { intel: s.intel } : {}),
     ...(s.pendingPlan ? { pendingPlan: true } : {}),
+    ...(s.customStart ? { customStart: s.customStart } : {}),
     ...(chronicle ? { chronicle } : {}),
   };
 }

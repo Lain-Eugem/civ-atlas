@@ -82,6 +82,13 @@
     labels: null,
     labelsSession: null,
     labelsYear: null,
+    /** 地区线(州界):随 /api/map/owners 一起下发;只在手绘画风画 */
+    regionLines: null,
+    /** DM 对话 / Jev 裁决(服务端 /api/dialogue) */
+    dialogue: null,
+    dialogueSession: null,
+    /** 开局设置里“在地图上点选位置”的回调:非空时下一次点击变成选点 */
+    pickMode: null,
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -117,6 +124,7 @@
     pettyMax: $('#pettyMax'),
     pettyKey: $('#pettyKey'),
     btnPettyConnect: $('#btnPettyConnect'),
+    btnStartCfg: $('#btnStartCfg'),
     pettyStatusLine: $('#pettyStatusLine'),
     fieldEnable: $('#fieldEnable'),
     fieldKind: $('#fieldKind'),
@@ -603,6 +611,13 @@
       window.CivVecDraw.drawVeinLines(ctx, {
         veins: S.veins, rects, k, P, H,
         mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, relK: S.view.k,
+      });
+    }
+    // 地区线(州界):比国界线更细更淡,画在国界线下面;只手绘画风有
+    if (S.regionLines && S.regionLines.length && window.CivRegions && window.CivRegions.drawRegionLines) {
+      window.CivRegions.drawRegionLines(ctx, {
+        lines: S.regionLines, rects, k, P, H,
+        mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, relK: S.view.k, style: S.style,
       });
     }
     drawOwnerBorders(rects);
@@ -1656,6 +1671,28 @@
 
   // 浮窗的开关:参数抽屉、面板收起、缩放按钮
   function bindChrome() {
+    // 开局设置:君主角色卡 / 起始疆域大小与位置
+    if (el.btnStartCfg) {
+      el.btnStartCfg.addEventListener('click', () => {
+        if (!S.sessionId || !window.CivStart) return;
+        window.CivStart.open({
+          sessionId: S.sessionId,
+          state: S.state,
+          api,
+          pick: (cb) => {
+            S.pickMode = cb;
+            el.map.classList.add("picking");
+            toast("在地图上点选君主的起始位置");
+          },
+          onApplied: async (d) => {
+            if (d && d.state) await applyState(d.state);
+            else await loadOwners();
+            toast("开局设置已应用");
+          },
+        });
+      });
+    }
+
     const setParams = (on) => {
       if (!el.paramsPanel) return;
       el.paramsPanel.hidden = !on;
@@ -1718,6 +1755,16 @@
       const moved = drag.moved;
       drag = null;
       el.map.classList.remove('dragging');
+      // 开局设置里“在地图上点选位置”:非拖动的一次点击交给选点回调,不触发选国
+      if (moved < 4 && S.pickMode) {
+        const r = el.map.getBoundingClientRect();
+        const p = mapPointAt(e.clientX - r.left, e.clientY - r.top);
+        const cb = S.pickMode;
+        S.pickMode = null;
+        el.map.classList.remove("picking");
+        if (p && cb) cb({ x: p.mx, y: p.my });
+        return;
+      }
       if (moved < 4) selectPolity(pickPolity(e.clientX, e.clientY));
     });
     el.map.addEventListener('pointercancel', () => {
@@ -1736,6 +1783,18 @@
       const rect = el.map.getBoundingClientRect();
       zoomAt(Math.exp(-e.deltaY * 0.0012), e.clientX - rect.left, e.clientY - rect.top);
     }, { passive: false });
+    // 地区悬停小窗:regions.js 自己绑 pointermove / pointerleave,这里只给它坐标换算和会话 id
+    if (window.CivRegions && window.CivRegions.initHover) {
+      window.CivRegions.initHover({
+        api,
+        el: document.getElementById('regionTip'),
+        worldOf: (cx, cy) => {
+          const p = mapPointAt(cx, cy);
+          return p ? { x: p.mx, y: p.my } : null;
+        },
+        sessionId: () => S.sessionId,
+      });
+    }
   }
 
   /* 换世界时底图缓存必须丢;同一个世界的其它画法由 schedulePreloadMaps 在后台慢慢补 */
@@ -1851,6 +1910,7 @@
       S.mapW = d.width || S.mapW;
       S.mapH = d.height || S.mapH;
       S.ownerBorders = (d.borders || []).map(withBox);
+      S.regionLines = d.regions || [];
       // 状态指纹变了(新国家 / 换色 / 政体变化):上一批疆域瓦片全部作废
       const fingerprint = d.fingerprint || '';
       if (S.ownerFingerprint !== fingerprint) {
@@ -1859,6 +1919,7 @@
       }
       S.ownersImg = await loadImage(`data:image/png;base64,${d.png}`);
       await loadLabels();
+      if (window.CivRegions && window.CivRegions.setLines) window.CivRegions.setLines(S.regionLines);
       draw();
     } catch (e) {
       toast(`疆域图生成失败:${e instanceof Error ? e.message : String(e)}`, true);
@@ -1879,6 +1940,22 @@
     } catch (e) {
       S.labels = null;
       console.warn('标签层生成失败', e);
+    }
+  }
+
+  /**
+   * DM 对话 / Jev 裁决:服务端把每回合“DM 说了什么、Jev 裁了什么”整理成串;
+   * 日志页签的 dm / jev 两个页签直接用,跑回合后随 applyState 一起刷新。
+   */
+  async function loadDialogue() {
+    if (!S.sessionId) { S.dialogue = null; S.dialogueSession = null; return; }
+    try {
+      const d = await api(`/api/dialogue?sessionId=${encodeURIComponent(S.sessionId)}&limit=80`);
+      S.dialogue = d;
+      S.dialogueSession = S.sessionId;
+    } catch (e) {
+      S.dialogue = null;
+      console.warn('对话层加载失败', e);
     }
   }
 
@@ -2013,10 +2090,9 @@
       }
       const blob = await pngRes.blob();
       const dataRaw = await api(`/api/field/data?${q}`);
-      if (S.field.img && S.field.img.close) {
-        try { S.field.img.close(); } catch (_) { /* ImageBitmap.close 在部分环境不存在 */ }
-      }
+      const oldField = S.field.img;
       S.field.img = await createImageBitmap(blob);
+      if (oldField && oldField.close) { try { oldField.close(); } catch (_) { /* ignore */ } }
       S.field.data = decodeFieldData(dataRaw);
       S.field.legend = dataRaw.legend;
       S.field.kind = kind;
@@ -2218,10 +2294,9 @@
       }
       const blob = await pngRes.blob();
       const dataRaw = await api(`/api/magic/data?${q}`);
-      if (S.magic.img && S.magic.img.close) {
-        try { S.magic.img.close(); } catch (_) { /* ignore */ }
-      }
+      const oldMagic = S.magic.img;
       S.magic.img = await createImageBitmap(blob);
+      if (oldMagic && oldMagic.close) { try { oldMagic.close(); } catch (_) { /* ignore */ } }
       S.magic.data = decodeMagicData(dataRaw);
       S.magic.legend = dataRaw.legend;
       S.magic.year = pick;
@@ -2406,6 +2481,19 @@
 
   function renderTabBody() {
     if (!S.state || !el.tabBody) return;
+    if (S.tab === 'dm' || S.tab === 'jev') {
+      if (window.CivDialogue && S.dialogue) {
+        if (window.CivDialogue.renderInto) window.CivDialogue.renderInto(el.tabBody, S.dialogue, S.tab);
+        else if (window.CivDialogue.renderHtml) el.tabBody.innerHTML = window.CivDialogue.renderHtml(S.dialogue, S.tab);
+        const rounds = S.dialogue.rounds || [];
+        const n = rounds.filter((r) => (S.tab === 'dm' ? r.kind === 'dm' : r.kind !== 'dm')).length;
+        el.tabNote.textContent = `${n} 条记录 · 第 ${S.state.rounds} / ${S.state.maxRounds} 回合`;
+      } else {
+        el.tabBody.innerHTML = '<div class="side-empty">还没有对话记录;跑一回合后再看。</div>';
+        el.tabNote.textContent = '';
+      }
+      return;
+    }
     if (S.tab === 'crown') {
       el.tabBody.innerHTML = renderCrown();
       const card = (S.state.cards || []).find((c) => c.polityId === S.sel);
@@ -2607,6 +2695,7 @@
 
   function refreshButtons() {
     const hasWorld = !!S.worldId;
+    if (el.btnStartCfg) el.btnStartCfg.disabled = !S.sessionId || S.busy || !window.CivStart;
     const hasSession = !!S.sessionId;
     const finished = !!(S.state && S.state.finished);
     el.btnSession.disabled = !hasWorld || S.busy || S.autoOn || !!S.plan;
@@ -2803,6 +2892,7 @@
     if (!exists) S.sel = state.polities && state.polities.length ? state.polities[0].id : null;
     renderAll();
     await loadOwners();
+    await loadDialogue();
     if (state.magic) void refreshMagic();
   }
 
