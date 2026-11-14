@@ -1208,6 +1208,8 @@
   let vecWorkerBusy = false;
   let vecWorkerBroken = false;
   let vecWorkerWorldId = null;
+  /** 拖动中重烘矢量缓存的节流时间戳(ms) */
+  let lastVecBuildAt = 0;
   let vecWorkerPending = null;
 
   function vecWorkerAvailable() {
@@ -1311,8 +1313,8 @@
     const pad = Math.round(clamp(Math.min(S.cw, S.ch) * 0.3, VEC_PAD_MIN, VEC_PAD_MAX));
     const w = S.cw + pad * 2;
     const h = S.ch + pad * 2;
-    const x0 = oxAbs - pad;
-    const y0 = oyAbs - pad;
+    const x0 = -pad;
+    const y0 = -pad;
     const cover = S.tileCover.map((t) => ({ x: t.x - x0, y: t.y - y0, w: t.w, h: t.h }));
     if (!vecWorkerBroken && vecWorkerAvailable()) {
       requestVecBuildWorker({
@@ -1371,8 +1373,30 @@
         && s >= 0.82 && s <= 1.22
         && dx <= mx && dy <= my && right >= S.cw - mx && bottom >= S.ch - my;
     }
+    // 交互中 / 缓存没盖住视口:旧缓存内容在世界坐标里仍然是对的,直接平移贴上去
+    // (一次 drawImage,几毫秒),不要在主线程重新描林块 / 符号这些上千个子路径 ——
+    // 手绘画风那样做每帧要把这些路径重新光栅化一遍,实测掉到 10fps(75~100ms/帧)。
+    // 缺口交给 worker 在后台重烘一张新的补上;拖动中节流到 400ms 一次,停手后 120ms 一次,
+    // 不跟主线程抢 GPU。worker 不可用 / 缓存根本不是当前这一层时才退回同步描线。
+    const dragging = performance.now() - lastInputAt < 200;
+    if (c) {
+      const sFast = k / c.k;
+      const sameLayer = c.style === S.style && c.vecWorldId === S.vecWorldId
+        && c.cw === S.cw && c.ch === S.ch && c.rdpr === rdpr;
+      if (sameLayer && sFast >= 0.6 && sFast <= 1.8 && !vecWorkerBroken) {
+        const dxFast = oxAbs + sFast * (c.x0 - c.ox);
+        const dyFast = oyAbs + sFast * (c.y0 - c.oy);
+        ctx.drawImage(c.canvas, dxFast, dyFast, c.w * sFast, c.h * sFast);
+        const gap = dragging ? 400 : 120;
+        if (performance.now() - lastVecBuildAt > gap) {
+          lastVecBuildAt = performance.now();
+          buildVecCache();
+        }
+        return;
+      }
+    }
     if (!reuse) {
-      // 缓存没盖住当前视口(或根本没有):先同步补这一帧,再在后台重烘下一张。
+      // 没有缓存(或缓存是别的层):老老实实同步补这一帧,再在后台重烘下一张。
       const rects = visibleRectsFor(k, P, H, oxAbs, oyAbs, S.cw, S.ch);
       drawVectorsIntoShared(ctx, { vec: S.vec, rects, k, P, H, mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, style: S.style, relK: S.view.k, tileFull: S.tileFull, tileCover: S.tileCover });
       if (performance.now() - lastInputAt >= 200) buildVecCache();
