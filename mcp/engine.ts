@@ -99,6 +99,8 @@ export type NationControl = 'ai' | 'program';
 export interface MonarchState {
   config: Record<string, unknown>;
   rounds: Record<string, unknown>[];
+  /** 这一局君主的寿命(岁):默认 90;开局角色卡启用种族系统时按卡上的 lifespan 写回 */
+  lifespan?: number;
 }
 
 /** DM 小决策在会话上的状态(配置 + 每回合日志;具体结构由 mcp/dm.ts 解释) */

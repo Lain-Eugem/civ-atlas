@@ -134,6 +134,8 @@
       '#startCustomPanel .start-section-head{display:flex;align-items:baseline;gap:8px;font-size:12px;font-weight:600;color:var(--ink-2,#5c544a)}',
       '#startCustomPanel .start-section-head .hint{font-weight:400;font-size:11px;color:var(--ink-3,#857b6d);flex:1 1 auto;text-align:right}',
       '#startCustomPanel .start-hint{font-size:11px;line-height:1.5;color:var(--ink-3,#857b6d);white-space:pre-wrap}',
+      '#startCustomPanel .start-kit{display:flex;gap:8px;flex-wrap:wrap}',
+      '#startCustomPanel .start-kit .btn{flex:1 1 0}',
       '#startCustomPanel .start-nations{display:flex;flex-direction:column;gap:3px;max-height:210px;overflow:auto;padding-right:2px}',
       '#startCustomPanel .start-nation-row{display:flex;align-items:center;gap:6px;border:1px solid var(--line-soft,#e6ded0);border-radius:6px;padding:3px 6px;background:var(--field,#f6f1e7);font-size:12px;min-width:0}',
       '#startCustomPanel .start-nation-row .swatch{flex:0 0 auto;width:10px;height:10px;border-radius:2px;border:1px solid rgba(0,0,0,.15)}',
@@ -224,6 +226,7 @@
       '  </div>',
       '  <fieldset id="startCardFields" class="start-card-fields" disabled>',
       '    <label class="field"><span>君主名(留空 = 自动)</span><input id="startName" type="text" maxlength="16" placeholder="例如:萧景桓"></label>',
+      '    <label class="field"><span>君主生平(≤600 字,可留空)</span><textarea id="startBiography" maxlength="600" placeholder="例如:少年从军、极好战,崇尚武力,梦想征服四方…(可点「从生平推断性格」)"></textarea></label>',
       '    <div class="row">',
       '      <label class="field"><span>谨慎 <b class="start-trait-val" id="startCautionVal">50</b></span><input id="startCaution" type="range" min="0" max="100" value="50"></label>',
       '      <label class="field"><span>野心 <b class="start-trait-val" id="startAmbitionVal">50</b></span><input id="startAmbition" type="range" min="0" max="100" value="50"></label>',
@@ -246,7 +249,18 @@
       '    </div>',
       '    <label class="field"><span>外交偏好</span><select id="startPrefDiplomacy"><option value="honor">重信义</option><option value="pragmatic">讲实利</option></select></label>',
       '    <label class="field"><span>人物小传(可留空)</span><textarea id="startPersona" maxlength="200" placeholder="这个君主是什么样的人…"></textarea></label>',
-      '    <div><button class="btn ghost" id="startRandom" type="button">🎲 随机性格</button></div>',
+      '    <div class="row">',
+      '      <label class="field"><span>种族(自由文本,占位)</span><input id="startRace" type="text" maxlength="40" placeholder="例如:人类 / 精灵 / 矮人"></label>',
+      '      <label class="field check"><input id="startRaceSystem" type="checkbox"><span>启用种族系统</span></label>',
+      '    </div>',
+      '    <div class="row">',
+      '      <label class="field"><span>寿命(岁)</span><input id="startLifespan" type="number" min="20" max="200" step="1" value="90" disabled></label>',
+      '      <div class="start-hint" id="startRaceHint">种族系统未启用:寿命一律 90 岁</div>',
+      '    </div>',
+      '    <div class="start-kit">',
+      '      <button class="btn ghost" id="startInfer" type="button">🔮 从生平推断性格</button>',
+      '      <button class="btn ghost" id="startRandom" type="button">🎲 随机性格</button>',
+      '    </div>',
       '  </fieldset>',
       '  <div class="start-msg" id="startMsg"></div>',
       '</div>',
@@ -265,6 +279,12 @@
     el('startRegionClear').addEventListener('click', clearRegionSelection);
     el('startRegionChips').addEventListener('click', onRegionChipsClick);
     el('startRandom').addEventListener('click', randomizeCard);
+    el('startInfer').addEventListener('click', inferFromBiography);
+    el('startRaceSystem').addEventListener('change', function () {
+      syncRaceFields();
+      customDirty = true;
+    });
+    el('startRace').addEventListener('input', updateRaceHint);
     el('startNation').addEventListener('change', function () {
       customDirty = true;
       onNationChanged();
@@ -805,6 +825,7 @@
     var st = cfg && cfg.state;
     var applied = st && st.customStart;
     box.textContent = applied ? '已定制:' + applied.polityId : '';
+    if (applied) fillCardFromState();
   }
 
   // ── 角色卡 ────────────────────────────────────────────────────────────────
@@ -813,9 +834,15 @@
   }
 
   function collectCard() {
+    var raceSystem = el('startRaceSystem').checked;
+    var life = Math.round(Number(el('startLifespan').value) || 90);
     return {
       name: el('startName').value.trim(),
       persona: el('startPersona').value.trim(),
+      biography: el('startBiography').value.trim(),
+      race: el('startRace').value.trim(),
+      raceSystem: raceSystem,
+      lifespan: raceSystem ? Math.max(20, Math.min(200, life)) : 90,
       traits: {
         caution: num('startCaution'),
         ambition: num('startAmbition'),
@@ -877,6 +904,99 @@
     el('startPrefWar').value = ['avoid', 'opportunist', 'seek'][rnd(0, 2)];
     el('startPrefEconomy').value = rnd(0, 1) ? 'trade' : 'develop';
     el('startPrefDiplomacy').value = rnd(0, 1) ? 'honor' : 'pragmatic';
+  }
+
+  /** 种族/寿命提示:未启用种族系统或种族为空时,寿命一律按 90 岁 */
+  function updateRaceHint() {
+    var box = $('startRaceHint');
+    if (!box) return;
+    var race = el('startRace') ? el('startRace').value.trim() : '';
+    if (!el('startRaceSystem').checked) {
+      box.textContent = '种族系统未启用:寿命一律 90 岁';
+    } else if (!race) {
+      box.textContent = '未填写种族，将按默认寿命 90 岁';
+    } else {
+      box.textContent = '种族「' + race + '」:寿命按下面填的岁数';
+    }
+  }
+
+  /** 启用种族系统才允许改寿命;关掉时固定回 90 */
+  function syncRaceFields() {
+    var on = el('startRaceSystem').checked;
+    el('startLifespan').disabled = !on;
+    if (!on) el('startLifespan').value = '90';
+    updateRaceHint();
+  }
+
+  /** 把推断结果填进 sliders / selects(仍是可手改的本地预览) */
+  function fillCardFields(r) {
+    var traits = r && r.traits ? r.traits : {};
+    var comp = r && r.competence ? r.competence : {};
+    var prefs = r && r.preferences ? r.preferences : {};
+    el('startAutoCard').checked = false;
+    el('startCardFields').disabled = false;
+    [['startCaution', 'caution'], ['startAmbition', 'ambition'], ['startHonor', 'honor'], ['startGreed', 'greed']].forEach(function (pair) {
+      if (typeof traits[pair[1]] === 'number') {
+        el(pair[0]).value = String(Math.max(0, Math.min(100, Math.round(traits[pair[1]]))));
+        el(pair[0]).dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    });
+    [['startWar', 'war'], ['startEconomy', 'economy'], ['startIntrigue', 'intrigue'], ['startAdmin', 'admin']].forEach(function (pair) {
+      if (typeof comp[pair[1]] === 'number') el(pair[0]).value = String(Math.max(0, Math.min(2, Math.round(comp[pair[1]]))));
+    });
+    if (prefs.war) el('startPrefWar').value = prefs.war;
+    if (prefs.economy) el('startPrefEconomy').value = prefs.economy;
+    if (prefs.diplomacy) el('startPrefDiplomacy').value = prefs.diplomacy;
+  }
+
+  /** 「从生平推断性格」:走 /api/start/infer-card(LLM 可用走 LLM,否则规则) */
+  function inferFromBiography() {
+    if (busy) return;
+    var biography = el('startBiography').value.trim();
+    if (!biography) {
+      toastMsg('先在「君主生平」里写一两句,再点推断', true);
+      return;
+    }
+    busy = true;
+    setBtnBusy(true);
+    apiCall('/api/start/infer-card', { sessionId: cfg.sessionId, biography: biography }).then(function (data) {
+      var r = data && data.result ? data.result : data;
+      if (!r || !r.traits) throw new Error('推断结果不完整');
+      fillCardFields(r);
+      customDirty = true;
+      var src = r.source === 'llm' ? 'LLM' : '关键词规则';
+      var warn = r.warnings && r.warnings.length ? '(' + r.warnings[0] + ')' : '';
+      toastMsg('已按生平推断性格(' + src + ')' + warn);
+    }).catch(function (err) {
+      toastMsg('推断失败:' + (err && err.message ? err.message : String(err)), true);
+    }).then(function () {
+      busy = false;
+      setBtnBusy(false);
+    });
+  }
+
+  /** 应用后从 state.cards 把这张卡回填到面板(姓名/生平/种族/寿命/数值) */
+  function fillCardFromState() {
+    var st = cfg && cfg.state;
+    if (!st || !Array.isArray(st.cards)) return;
+    var applied = st.customStart;
+    var pid = applied && typeof applied.polityId === 'number' ? applied.polityId : st.playerPolityId;
+    if (typeof pid !== 'number') return;
+    var card = null;
+    for (var i = 0; i < st.cards.length; i++) {
+      if (st.cards[i] && st.cards[i].polityId === pid) { card = st.cards[i]; break; }
+    }
+    if (!card) return;
+    el('startAutoCard').checked = false;
+    el('startCardFields').disabled = false;
+    if (typeof card.name === 'string') el('startName').value = card.name;
+    if (typeof card.persona === 'string') el('startPersona').value = card.persona;
+    if (typeof card.biography === 'string') el('startBiography').value = card.biography;
+    if (typeof card.race === 'string') el('startRace').value = card.race;
+    el('startRaceSystem').checked = card.raceSystem === true;
+    el('startLifespan').value = String(typeof card.lifespan === 'number' ? card.lifespan : 90);
+    syncRaceFields();
+    fillCardFields(card);
   }
 
   // ── 应用 ──────────────────────────────────────────────────────────────────
@@ -1052,6 +1172,12 @@
     el('startCardFields').disabled = true;
     el('startName').value = '';
     el('startPersona').value = '';
+    el('startBiography').value = '';
+    el('startRace').value = '';
+    el('startRaceSystem').checked = false;
+    el('startLifespan').value = '90';
+    el('startLifespan').disabled = true;
+    updateRaceHint();
     renderRegionBox();
     renderPickButton();
     el(PANEL_ID).hidden = false;

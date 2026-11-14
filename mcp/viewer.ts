@@ -44,7 +44,8 @@ import {
   type Session,
 } from './engine';
 import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, setMonarchCard, verifySession } from './monarch';
-import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, type StartSetupInput } from './monarch-start';
+import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, inferCardFromBiography, type StartSetupInput } from './monarch-start';
+import { CARD_LIFESPAN_DEFAULT } from '../src/gen/civ/monarchCard';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
@@ -568,6 +569,8 @@ function stateView(s: Session): Record<string, unknown> {
     features: s.features,
     review: s.review,
     cards: s.cards ? [...s.cards.values()] : [],
+    // 本局君主寿命(岁):默认 90;开局角色卡启用种族系统时按卡上的 lifespan
+    monarchLifespan: s.monarch?.lifespan ?? CARD_LIFESPAN_DEFAULT,
     memory: s.memory ? [...s.memory.values()] : [],
     intel: s.intel ?? {},
     pendingPlan: !!s.pendingPlan,
@@ -1458,6 +1461,23 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       invalidateOwnerCache(session.id);
       chronCache.delete(session.id);
       sendJson(res, 200, { session: summary, state: stateView(session), ...(startSetup ? { startSetup } : {}) });
+      return true;
+    }
+
+    // 角色卡:从生平推断性格(LLM 可用且 DM 非 mock 时走 LLM,否则关键词规则;离线也有结果)
+    if (pathname === '/api/start/infer-card') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const biography = typeof args.biography === 'string' ? args.biography : '';
+      let result: unknown;
+      try {
+        result = await inferCardFromBiography(s, biography, { llm: args.llm !== false });
+      } catch (e) {
+        fail(res, 400, e instanceof Error ? e.message : String(e));
+        return true;
+      }
+      sendJson(res, 200, { ok: true, result });
       return true;
     }
 

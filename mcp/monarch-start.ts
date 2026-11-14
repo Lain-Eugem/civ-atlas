@@ -14,7 +14,19 @@ import type { Annal, Civ, Polity, Settlement } from '../src/gen/civ/types';
 import { capitalAt, polityAlive, polityName } from '../src/gen/civ/growth';
 import { POLITY_PALETTE } from '../src/gen/civ/polities';
 import { namePolities } from '../src/gen/civ/naming';
-import { cardIsCurrent, cleanCardInput, monarchCard, personaOf, type MonarchCard } from '../src/gen/civ/monarchCard';
+import {
+  cardIsCurrent,
+  CARD_BIOGRAPHY_MAX,
+  CARD_LIFESPAN_DEFAULT,
+  cleanCardInput,
+  monarchCard,
+  personaOf,
+  type MonarchCard,
+  type MonarchCompetence,
+  type MonarchPreferences,
+  type MonarchTraits,
+} from '../src/gen/civ/monarchCard';
+import { askLlm, type LlmProviderSettings } from './llm';
 import { createPersonNamer } from '../src/gen/names/persons';
 
 /** 初始疆域最小州数(再小就守不住国都) */
@@ -63,7 +75,7 @@ export interface CustomStartInput {
    * 给了 regionIds 就忽略 size 与 at。
    */
   regionIds?: number[];
-  /** 角色卡字段:{ name?, persona?, traits?, preferences?, competence? } */
+  /** 角色卡字段:{ name?, persona?, traits?, preferences?, competence?, biography?, race?, raceSystem?, lifespan? } */
   card?: Record<string, unknown>;
   /** true = 不读 card,按引擎的 monarchCard 自动生成(新国用随机人名占位) */
   autoCard?: boolean;
@@ -203,6 +215,8 @@ export function applyCustomStart(s: Session, input: CustomStartInput = {}): Cust
   const card = buildCard(s, polityId, created, input, warnings);
   s.cards ??= new Map();
   s.cards.set(polityId, card);
+  // 寿命:启用种族系统才按卡上的 lifespan;关掉时一律 90。写回 Session.monarch 供后续回合引用。
+  if (s.monarch) s.monarch.lifespan = card.raceSystem ? card.lifespan : CARD_LIFESPAN_DEFAULT;
 
   const pinnedCard = created || !cardIsCurrent(s.civ, card, year);
   const p = s.civ.polities[polityId];
@@ -756,6 +770,331 @@ function defaultMonarchName(s: Session, polityId: number): string {
   const given = namer.given(polityId, year);
   const name = namer.surnamed ? `${surname}${given}` : given;
   return (name || surname || `${polityId} 号君主`).slice(0, 16);
+}
+
+// ── 角色卡:从生平推断性格(种族/寿命另由卡字段与 Session.monarch 承接) ──────────
+
+/** 规则推断出来的三块性格(UI 可先预览,再手改;服务端 cleanCardInput 会再夹一遍区间) */
+export interface CardInference {
+  traits: MonarchTraits;
+  preferences: MonarchPreferences;
+  competence: MonarchCompetence;
+}
+
+/** inferCardFromBiography 的返回:性格 + 截断后的生平 + 用了哪条路径 */
+export interface CardInferenceResult extends CardInference {
+  biography: string;
+  source: 'rules' | 'llm';
+  warnings: string[];
+}
+
+/** 一条"关键词 → 某个维度加减分"的信号 */
+interface WordSignal {
+  word: string;
+  delta: number;
+}
+
+const INFER_BASELINE = 50;
+
+/** 性格关键词表:同一个词可以同时命中性情与能力(各表独立累加) */
+const TRAIT_SIGNALS: Record<keyof MonarchTraits, WordSignal[]> = {
+  caution: [
+    { word: '谨慎', delta: 14 }, { word: '多疑', delta: 10 }, { word: '小心', delta: 8 },
+    { word: '稳重', delta: 8 }, { word: '保守', delta: 8 }, { word: '三思', delta: 10 },
+    { word: '持重', delta: 8 }, { word: '隐忍', delta: 6 }, { word: '谋定后动', delta: 10 },
+    { word: '鲁莽', delta: -14 }, { word: '冲动', delta: -10 }, { word: '冒进', delta: -10 },
+    { word: '轻敌', delta: -8 }, { word: '大意', delta: -8 }, { word: '狂妄', delta: -8 },
+    { word: '好战', delta: -10 }, { word: '冒险', delta: -8 },
+  ],
+  ambition: [
+    { word: '野心', delta: 14 }, { word: '征服', delta: 12 }, { word: '扩张', delta: 10 },
+    { word: '好战', delta: 12 }, { word: '尚武', delta: 10 }, { word: '战功', delta: 8 },
+    { word: '雄图', delta: 10 }, { word: '功业', delta: 8 }, { word: '进取', delta: 8 },
+    { word: '守成', delta: -14 }, { word: '无为', delta: -12 }, { word: '苟安', delta: -12 },
+    { word: '知足', delta: -8 }, { word: '安于', delta: -6 },
+  ],
+  honor: [
+    { word: '重信', delta: 14 }, { word: '守信', delta: 12 }, { word: '信义', delta: 10 },
+    { word: '忠厚', delta: 10 }, { word: '仁厚', delta: 8 }, { word: '正直', delta: 10 },
+    { word: '磊落', delta: 8 },
+    { word: '背信', delta: -16 }, { word: '无信', delta: -14 }, { word: '狡诈', delta: -12 },
+    { word: '阴险', delta: -10 }, { word: '见利忘义', delta: -18 }, { word: '背盟', delta: -12 },
+  ],
+  greed: [
+    { word: '贪婪', delta: 16 }, { word: '贪财', delta: 14 }, { word: '贪欲', delta: 16 },
+    { word: '钱财', delta: 8 }, { word: '敛财', delta: 12 }, { word: '逐利', delta: 10 },
+    { word: '见利忘义', delta: 8 },
+    { word: '清廉', delta: -14 }, { word: '大方', delta: -8 }, { word: '慷慨', delta: -8 },
+    { word: '视钱财如粪土', delta: -12 }, { word: '散财', delta: -10 },
+  ],
+};
+
+/** 战争偏好:seek 与 avoid 分开累计,差值决定档位 */
+const WAR_SEEK_SIGNALS: WordSignal[] = [
+  { word: '好战', delta: 14 }, { word: '尚武', delta: 10 }, { word: '崇尚武力', delta: 12 },
+  { word: '征服', delta: 10 }, { word: '从军', delta: 8 }, { word: '战功', delta: 8 },
+  { word: '渴望战功', delta: 10 }, { word: '主动求战', delta: 16 }, { word: '渴望开战', delta: 16 },
+  { word: '开疆拓土', delta: 10 }, { word: '以战立国', delta: 14 },
+];
+const WAR_AVOID_SIGNALS: WordSignal[] = [
+  { word: '不喜战事', delta: 18 }, { word: '厌恶战争', delta: 18 }, { word: '厌恶打仗', delta: 16 },
+  { word: '厌战', delta: 16 }, { word: '避战', delta: 14 }, { word: '反战', delta: 16 },
+  { word: '不好战', delta: 16 }, { word: '能不打就不打', delta: 14 },
+];
+
+/** 经济偏好:重商 vs 重农 */
+const TRADE_SIGNALS: WordSignal[] = [
+  { word: '通商', delta: 12 }, { word: '商贸', delta: 12 }, { word: '商人', delta: 8 },
+  { word: '市税', delta: 8 }, { word: '贸易', delta: 12 }, { word: '重商', delta: 14 },
+  { word: '经商', delta: 10 }, { word: '精明', delta: 8 }, { word: '逐利', delta: 8 },
+];
+const DEVELOP_SIGNALS: WordSignal[] = [
+  { word: '农桑', delta: 10 }, { word: '农耕', delta: 10 }, { word: '重农', delta: 14 },
+  { word: '建设', delta: 8 }, { word: '城池', delta: 6 }, { word: '治水', delta: 8 },
+  { word: '兴修', delta: 8 }, { word: '劝农', delta: 10 }, { word: '发展', delta: 6 },
+  { word: '轻农', delta: -10 },
+];
+
+/** 外交偏好:重信义 vs 讲实利 */
+const HONOR_DIPLO_SIGNALS: WordSignal[] = [
+  { word: '重信', delta: 14 }, { word: '守信', delta: 12 }, { word: '信义', delta: 10 },
+  { word: '忠厚', delta: 10 }, { word: '正直', delta: 8 },
+];
+const PRAGMATIC_DIPLO_SIGNALS: WordSignal[] = [
+  { word: '权谋', delta: 12 }, { word: '务实', delta: 8 }, { word: '狡诈', delta: 12 },
+  { word: '阴险', delta: 10 }, { word: '见利忘义', delta: 16 }, { word: '背盟', delta: 12 },
+  { word: '不择手段', delta: 14 },
+];
+
+/** 能力关键词表:每维单独累计(0 = 想不到这一层,1 = 寻常,2 = 老练) */
+const COMPETENCE_SIGNALS: Record<keyof MonarchCompetence, WordSignal[]> = {
+  war: [
+    { word: '用兵', delta: 14 }, { word: '征战', delta: 10 }, { word: '军事', delta: 10 },
+    { word: '统帅', delta: 12 }, { word: '善战', delta: 14 }, { word: '将才', delta: 14 },
+    { word: '兵法', delta: 10 }, { word: '战阵', delta: 10 }, { word: '从军', delta: 8 },
+    { word: '尚武', delta: 6 },
+  ],
+  economy: [
+    { word: '理财', delta: 14 }, { word: '经商', delta: 10 }, { word: '商贸', delta: 8 },
+    { word: '通商', delta: 10 }, { word: '农政', delta: 10 }, { word: '赋税', delta: 8 },
+    { word: '经济', delta: 8 }, { word: '集市', delta: 6 },
+  ],
+  intrigue: [
+    { word: '权谋', delta: 14 }, { word: '密谋', delta: 14 }, { word: '阴谋', delta: 12 },
+    { word: '暗杀', delta: 12 }, { word: '谋略', delta: 10 }, { word: '诡计', delta: 10 },
+    { word: '心机', delta: 10 }, { word: '算计', delta: 8 }, { word: '精明', delta: 6 },
+  ],
+  admin: [
+    { word: '治理', delta: 14 }, { word: '善政', delta: 12 }, { word: '理政', delta: 10 },
+    { word: '律法', delta: 10 }, { word: '吏治', delta: 10 }, { word: '治水', delta: 8 },
+    { word: '安民', delta: 8 }, { word: '城防', delta: 8 },
+  ],
+};
+
+/** 程度词:同一从句里紧挨在关键词前的修饰词决定权重 */
+const DEGREE_WORDS: [string, number][] = [
+  ['极其', 1.7], ['极', 1.7], ['最为', 1.6], ['最', 1.6], ['非常', 1.5], ['十分', 1.5],
+  ['尤其', 1.5], ['酷', 1.4], ['很', 1.35], ['颇', 1.3], ['深', 1.2],
+  ['略', 0.55], ['稍', 0.5], ['有些', 0.5], ['有点', 0.5], ['略微', 0.5],
+];
+
+/** 否定词:关键词前 4 个字内出现就把这条信号反号 */
+const NEGATION_CHARS = ['不', '没', '未', '无', '厌', '恶', '反', '拒', '免'];
+const CLAUSE_PUNCT = new Set(['。', '，', ',', ';', '；', '!', '！', '?', '？', '、', '\n']);
+
+/** 从句起点:往回最多看 10 个字,遇到标点即停 */
+function clauseStartOf(text: string, index: number): number {
+  const floor = Math.max(0, index - 10);
+  for (let i = index - 1; i >= floor; i--) {
+    if (CLAUSE_PUNCT.has(text.charAt(i))) return i + 1;
+  }
+  return floor;
+}
+
+/** 关键词前的程度权重(1 = 没有程度词) */
+function weightAt(text: string, index: number): number {
+  const before = text.slice(clauseStartOf(text, index), index);
+  let best = 1;
+  let bestAt = -1;
+  for (const [word, weight] of DEGREE_WORDS) {
+    const at = before.lastIndexOf(word);
+    if (at < 0) continue;
+    // 只认紧挨着关键词的程度词(中间最多隔 1 个字)
+    if (before.length - (at + word.length) > 1) continue;
+    if (at > bestAt) { bestAt = at; best = weight; }
+  }
+  return best;
+}
+
+/** 关键词前 4 个字内有没有否定词 */
+function negatedAt(text: string, index: number): boolean {
+  const from = Math.max(clauseStartOf(text, index), index - 4);
+  const before = text.slice(from, index);
+  return NEGATION_CHARS.some((c) => before.includes(c));
+}
+
+/** 把一张信号表按"出现次数 × 程度词 × 否定"累加成总分 */
+function sumSignals(text: string, table: WordSignal[]): number {
+  let total = 0;
+  for (const { word, delta } of table) {
+    let from = 0;
+    for (;;) {
+      const at = text.indexOf(word, from);
+      if (at < 0) break;
+      total += delta * weightAt(text, at) * (negatedAt(text, at) ? -1 : 1);
+      from = at + word.length;
+    }
+  }
+  return total;
+}
+
+const clampTrait = (v: number): number => Math.max(0, Math.min(100, Math.round(v)));
+
+/** 能力分档:>=24 老练(2);>=8 寻常偏上(1);<=-10 想不到(0);其余 1 */
+function competenceTier(score: number): 0 | 1 | 2 {
+  if (score >= 24) return 2;
+  if (score >= 8) return 1;
+  if (score <= -10) return 0;
+  return 1;
+}
+
+/**
+ * 关键词规则表推断(离线可用,不联网):把生平里出现的信号累加到 baseline 50 上。
+ * 只返回性格三块;姓名/生平/种族/寿命由调用方另行合并。
+ */
+export function inferCardRules(text: string): CardInference {
+  const source = typeof text === 'string' ? text : String(text ?? '');
+  const traits: MonarchTraits = {
+    caution: clampTrait(INFER_BASELINE + sumSignals(source, TRAIT_SIGNALS.caution)),
+    ambition: clampTrait(INFER_BASELINE + sumSignals(source, TRAIT_SIGNALS.ambition)),
+    honor: clampTrait(INFER_BASELINE + sumSignals(source, TRAIT_SIGNALS.honor)),
+    greed: clampTrait(INFER_BASELINE + sumSignals(source, TRAIT_SIGNALS.greed)),
+  };
+  const seek = sumSignals(source, WAR_SEEK_SIGNALS);
+  const avoid = sumSignals(source, WAR_AVOID_SIGNALS);
+  const warBalance = seek - avoid;
+  const trade = sumSignals(source, TRADE_SIGNALS);
+  const develop = sumSignals(source, DEVELOP_SIGNALS);
+  const honorDiplo = sumSignals(source, HONOR_DIPLO_SIGNALS);
+  const pragmatic = sumSignals(source, PRAGMATIC_DIPLO_SIGNALS);
+  const preferences: MonarchPreferences = {
+    war: warBalance >= 20 ? 'seek' : warBalance <= -15 ? 'avoid' : 'opportunist',
+    economy: trade - develop >= 10 ? 'trade' : 'develop',
+    diplomacy:
+      honorDiplo - pragmatic >= 10 ? 'honor' : pragmatic - honorDiplo >= 10 ? 'pragmatic' : traits.honor >= 60 ? 'honor' : 'pragmatic',
+  };
+  const competence: MonarchCompetence = {
+    war: competenceTier(sumSignals(source, COMPETENCE_SIGNALS.war)),
+    economy: competenceTier(sumSignals(source, COMPETENCE_SIGNALS.economy)),
+    intrigue: competenceTier(sumSignals(source, COMPETENCE_SIGNALS.intrigue)),
+    admin: competenceTier(sumSignals(source, COMPETENCE_SIGNALS.admin)),
+  };
+  return { traits, preferences, competence };
+}
+
+/** LLM 推断的系统提示:只要严格 JSON(与 cleanCardInput 的口径一致) */
+const INFER_SYSTEM_PROMPT = `你在给一个文明推演沙盒的君主角色卡做"从生平推断性格"。
+你只输出一个 JSON 对象,不要解释、不要 markdown 代码块:
+{"traits":{"caution":0到100的整数,"ambition":0到100的整数,"honor":0到100的整数,"greed":0到100的整数},"preferences":{"war":"avoid|opportunist|seek","economy":"develop|trade","diplomacy":"honor|pragmatic"},"competence":{"war":0|1|2,"economy":0|1|2,"intrigue":0|1|2,"admin":0|1|2}}
+含义:caution=谨慎、ambition=野心、honor=荣誉感、greed=贪欲(越高越强);war 偏好=避战/见机行事/主动求战;economy=重农(develop)或重商(trade);diplomacy=重信义(honor)或讲实利(pragmatic);competence 0=想不到这一层、1=寻常、2=老练。
+数值必须能从生平里找到依据,拿不准就写 50 / 1。`;
+
+/** 解析并严格校验 LLM 返回的 JSON;任何字段不合法都抛错(调用方重试/回落规则) */
+function parseInferenceJson(raw: string): CardInference {
+  const stripped = String(raw ?? '').replace(/```(?:json)?/gi, '').trim();
+  const start = stripped.indexOf('{');
+  const end = stripped.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('没找到 JSON 对象');
+  const obj = JSON.parse(stripped.slice(start, end + 1)) as Record<string, unknown>;
+  const traitsRaw = obj.traits as Record<string, unknown> | undefined;
+  if (!traitsRaw || typeof traitsRaw !== 'object') throw new Error('缺 traits');
+  const traits: MonarchTraits = { caution: 50, ambition: 50, honor: 50, greed: 50 };
+  for (const k of ['caution', 'ambition', 'honor', 'greed'] as const) {
+    const v = traitsRaw[k];
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`traits.${k} 不是数字`);
+    traits[k] = clampTrait(v);
+  }
+  const prefsRaw = obj.preferences as Record<string, unknown> | undefined;
+  if (!prefsRaw || typeof prefsRaw !== 'object') throw new Error('缺 preferences');
+  const war = prefsRaw.war;
+  const economy = prefsRaw.economy;
+  const diplomacy = prefsRaw.diplomacy;
+  if (war !== 'avoid' && war !== 'opportunist' && war !== 'seek') throw new Error('preferences.war 不合法');
+  if (economy !== 'develop' && economy !== 'trade') throw new Error('preferences.economy 不合法');
+  if (diplomacy !== 'honor' && diplomacy !== 'pragmatic') throw new Error('preferences.diplomacy 不合法');
+  const compRaw = obj.competence as Record<string, unknown> | undefined;
+  if (!compRaw || typeof compRaw !== 'object') throw new Error('缺 competence');
+  const competence: MonarchCompetence = { war: 1, economy: 1, intrigue: 1, admin: 1 };
+  for (const k of ['war', 'economy', 'intrigue', 'admin'] as const) {
+    const v = compRaw[k];
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`competence.${k} 不是数字`);
+    const rounded = Math.round(v);
+    if (rounded < 0 || rounded > 2) throw new Error(`competence.${k} 超出 0–2`);
+    competence[k] = rounded as 0 | 1 | 2;
+  }
+  return { traits, preferences: { war, economy, diplomacy }, competence };
+}
+
+/**
+ * 取本会话可用的非 mock LLM provider(plan §P3:features.llm && LLM 可用时才走 LLM 推断)。
+ * 优先君主模式那套 provider(与 monarchNew 回合共用),其次 DM 的 provider。
+ */
+function inferProvider(s: Session): LlmProviderSettings | null {
+  const candidates: unknown[] = [s.monarch?.config?.provider, s.dm?.config?.provider];
+  for (const raw of candidates) {
+    const provider = raw as Partial<LlmProviderSettings> | undefined;
+    if (!provider || typeof provider !== 'object') continue;
+    if (typeof provider.baseUrl !== 'string' || !provider.baseUrl) continue;
+    if (typeof provider.model !== 'string' || !provider.model) continue;
+    return provider as LlmProviderSettings;
+  }
+  return null;
+}
+
+/** 本会话是否是 mock 推理(monarch 配置或 DM 配置任一标了 mock 就不打真 LLM) */
+function isMockInference(s: Session): boolean {
+  const m = s.monarch?.config as { mock?: unknown } | undefined;
+  if (m && m.mock === true) return true;
+  const d = s.dm?.config as { mock?: unknown } | undefined;
+  if (d && d.mock === true) return true;
+  return false;
+}
+
+/**
+ * 从生平推断性格。
+ * - features.llm 打开且本局配了非 mock 的 LLM provider(君主/DM 两套之一) → 先问 LLM 要严格 JSON,校验失败重试 1 次;
+ * - 否则 / 两次都失败 → 回落关键词规则表(离线 mock 环境也一定有结果)。
+ * 只做推断,不写会话;调用方把结果合并进 card 再经 applyCustomStart 应用。
+ */
+export async function inferCardFromBiography(
+  s: Session,
+  text: string,
+  opts: { llm?: boolean } = {},
+): Promise<CardInferenceResult> {
+  const biography = String(text ?? '').trim().slice(0, CARD_BIOGRAPHY_MAX);
+  if (!biography) throw new Error('生平是空的:先写一两句这个君主是什么样的人');
+  const warnings: string[] = [];
+  const provider = opts.llm !== false && s.features.llm && !isMockInference(s) ? inferProvider(s) : null;
+  if (provider) {
+    let lastError = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const reply = await askLlm(
+          [
+            { role: 'system', content: INFER_SYSTEM_PROMPT },
+            { role: 'user', content: `君主生平:\n${biography}` },
+          ],
+          provider,
+        );
+        const inference = parseInferenceJson(reply.text);
+        return { ...inference, biography, source: 'llm', warnings };
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    warnings.push(`LLM 推断失败,已回落到关键词规则:${lastError}`);
+  }
+  return { ...inferCardRules(biography), biography, source: 'rules', warnings };
 }
 
 // ── 坐标 / 邻接 / 杂项 ──────────────────────────────────────────────────────
