@@ -147,7 +147,7 @@
     fieldLegendHash: $('#fieldLegendHash'),
     fieldLegendBar: $('#fieldLegendBar'),
     fieldLegendTicks: $('#fieldLegendTicks'),
-    fieldTip: $('#fieldTip'),
+    mapTip: $('#mapTip'),
     magicEnable: $('#magicEnable'),
     magicYearPick: $('#magicYearPick'),
     btnMagicNow: $('#btnMagicNow'),
@@ -1736,11 +1736,8 @@
       el.map.classList.add('dragging');
     });
     el.map.addEventListener('pointermove', (e) => {
-      if (!drag) {
-        showFieldTip(e);
-        return;
-      }
-      setFieldTipVisible(false);
+      if (!drag) return;
+      hideMapTip();
       const dx = e.clientX - drag.x;
       const dy = e.clientY - drag.y;
       drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
@@ -1771,7 +1768,6 @@
       drag = null;
       el.map.classList.remove('dragging');
     });
-    el.map.addEventListener('pointerleave', () => setFieldTipVisible(false));
     el.map.addEventListener('dblclick', (e) => {
       if (!S.baseImg) return;
       const rect = el.map.getBoundingClientRect();
@@ -1783,16 +1779,18 @@
       const rect = el.map.getBoundingClientRect();
       zoomAt(Math.exp(-e.deltaY * 0.0012), e.clientX - rect.left, e.clientY - rect.top);
     }, { passive: false });
-    // 地区悬停小窗:regions.js 自己绑 pointermove / pointerleave,这里只给它坐标换算和会话 id
-    if (window.CivRegions && window.CivRegions.initHover) {
-      window.CivRegions.initHover({
-        api,
-        el: document.getElementById('regionTip'),
-        worldOf: (cx, cy) => {
-          const p = mapPointAt(cx, cy);
-          return p ? { x: p.mx, y: p.my } : null;
+    // 统一浮窗(地区 / 地块 / 魔力浓度):tooltip.js 自己绑 pointermove / pointerleave,
+    // 这里只给坐标换算和"画什么内容";拖动时由它自己隐藏,不再每帧算浮窗
+    if (window.CivTooltip && window.CivTooltip.init) {
+      window.CivTooltip.init({
+        map: el.map,
+        tip: el.mapTip,
+        getHtml: (cx, cy) => mapTooltipHtml(cx, cy),
+        avoidRight: () => {
+          const side = document.getElementById('sidePanel');
+          if (!side || side.classList.contains('folded')) return 0;
+          return side.offsetWidth + 10;
         },
-        sessionId: () => S.sessionId,
       });
     }
   }
@@ -2000,55 +1998,97 @@
     };
   }
 
-  function setFieldTipVisible(on) {
-    if (!el.fieldTip) return;
-    el.fieldTip.classList.toggle('hidden', !on);
-    if (!on) el.fieldTip.textContent = '';
+  function hideMapTip() {
+    if (window.CivTooltip) window.CivTooltip.hide();
   }
 
-  function showFieldTip(e) {
+  let atlasKey = '';
+
+  /** 服务端地区栅格:每个会话状态只拉一次(约 1MB 压到 ~200KB),之后悬停全在本地查表 */
+  async function loadRegionAtlas(state) {
+    const atlas = window.CivRegionAtlas;
+    if (!atlas || !atlas.load) return;
+    if (!S.sessionId) return;
+    const fp = state && state.fingerprint ? String(state.fingerprint) : '';
+    const key = `${S.sessionId}|${fp}`;
+    if (key === atlasKey) return;
+    try {
+      const ok = await atlas.load((url) => api(url), S.sessionId, { scale: 2 });
+      atlasKey = ok ? key : '';
+      if (ok && window.CivTooltip) window.CivTooltip.update();
+    } catch (e) {
+      atlasKey = '';
+      console.warn('region atlas load failed', e);
+    }
+  }
+
+  function tooltipPolityHtml(polity) {
+    if (!polity) return '<span class="mt-muted">无主之地</span>';
+    const color = polity.color || '#999';
+    return `<span class="mt-pol" style="--pc:${esc(color)}"></span>${esc(polity.name)}`;
+  }
+
+  function regionTipHtml(m, lon, lat) {
+    const river = m.river
+      ? `${fmtInt(m.river.cells)} 地块(大河 ${fmtInt(m.river.majorCells)}) · ${fmtInt(Math.round(m.river.lengthKm))} 公里`
+      : '<span class="mt-muted">无</span>';
+    const seat = m.seatName ? esc(m.seatName) : `<span class="mt-muted">地块 #${fmtInt(m.seatCell)}</span>`;
+    const rows = [
+      ['所属国', tooltipPolityHtml(m.polity)],
+      ['群落', esc(m.biomeName)],
+      ['面积', `${fmtInt(m.area)}<span class="mt-muted"> / 人口上限 ${fmtInt(m.capacity)}</span>`],
+      ['海拔', `${fmtInt(m.elevation)} 米`],
+      ['河流', river],
+      ['治所', seat],
+      ['地块', fmtInt(m.cells)],
+    ].map(([k, v]) => `<div class="mt-row"><span class="mt-k">${k}</span><span class="mt-v">${v}</span></div>`);
+    return `<div class="mt-sec"><div class="mt-head"><b>${esc(m.name)}</b><span class="mt-no">#${m.region + 1}</span></div>${rows.join('')}<div class="mt-muted">${lon}°E, ${lat}°N</div></div>`;
+  }
+
+  function fieldTipHtml(mx, my) {
     const field = S.field.on && S.field.data ? S.field.data : null;
+    if (!field) return '';
+    const gx = Math.min(field.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * field.gridW)));
+    const gy = Math.min(field.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * field.gridH)));
+    const cell = field.grid[gy * field.gridW + gx];
+    if (typeof cell !== 'number' || cell < 0 || cell >= field.values.length) return '';
+    return `<div class="mt-sec"><div class="mt-head"><b>${esc(field.label)}</b><span class="mt-val">${field.values[cell].toFixed(6)}</span></div><div class="mt-muted">地块 #${fmtInt(cell)} · hash ${short(field.hash, 10)}</div></div>`;
+  }
+
+  function magicTipHtml(mx, my) {
     const magic = S.magic.on && S.magic.data ? S.magic.data : null;
-    if ((!field && !magic) || !el.map) return setFieldTipVisible(false);
-    const rect = el.map.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const p = mapPointAt(x, y);
-    if (!p) return setFieldTipVisible(false);
+    if (!magic) return '';
+    const gx = Math.min(magic.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * magic.gridW)));
+    const gy = Math.min(magic.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * magic.gridH)));
+    const idx = magic.grid[gy * magic.gridW + gx];
+    if (typeof idx !== 'number' || idx < 0 || idx >= magic.values.length) return '';
+    const where = magic.unit === 'tile' ? `地块 #${fmtInt(idx)}` : `州 #${fmtInt(idx)}`;
+    return `<div class="mt-sec"><div class="mt-head"><b>魔力浓度</b><span class="mt-val">${magic.values[idx].toFixed(4)}</span></div><div class="mt-muted">第 ${fmtInt(magic.frameYear)} 年图层(取不晚于本回合的帧)· ${where}</div></div>`;
+  }
+
+  /** 统一浮窗内容:地区 / 地块场 / 魔力浓度 三节,任一为空则不显示 */
+  function mapTooltipHtml(cx, cy) {
+    if (!S.baseImg) return null;
+    const p = mapPointAt(cx, cy);
+    if (!p) return null;
     const { mx, my } = p;
     const lon = ((mx / S.mapW) * 360 - 180).toFixed(1);
     const lat = (90 - (my / S.mapH) * 180).toFixed(1);
-    const lines = [];
-    if (field) {
-      const gx = Math.min(field.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * field.gridW)));
-      const gy = Math.min(field.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * field.gridH)));
-      const cell = field.grid[gy * field.gridW + gx];
-      if (typeof cell !== 'number' || cell < 0 || cell >= field.values.length) {
-        if (!magic) return setFieldTipVisible(false);
-      } else {
-        lines.push(`<b>${esc(field.label)}</b> <span class="field-tip-value">${field.values[cell].toFixed(6)}</span>`);
-        lines.push(`<span class="muted">地块 #${cell} · ${lon}°E, ${lat}°N · hash ${short(field.hash, 10)}</span>`);
+    const parts = [];
+    const atlas = window.CivRegionAtlas;
+    if (atlas && atlas.ready && atlas.ready()) {
+      const rid = atlas.lookup(mx, my, S.mapW, S.mapH);
+      if (rid !== null && rid !== undefined) {
+        const meta = atlas.meta(rid);
+        if (meta) parts.push(regionTipHtml(meta, lon, lat));
       }
     }
-    if (magic) {
-      const gx = Math.min(magic.gridW - 1, Math.max(0, Math.floor((mx / S.mapW) * magic.gridW)));
-      const gy = Math.min(magic.gridH - 1, Math.max(0, Math.floor((my / S.mapH) * magic.gridH)));
-      const idx = magic.grid[gy * magic.gridW + gx];
-      if (typeof idx === 'number' && idx >= 0 && idx < magic.values.length) {
-        if (lines.length) lines.push('<span class="muted">——</span>');
-        const where = magic.unit === 'tile' ? `地块 #${idx}` : `州 #${idx}`;
-        lines.push(`<b>魔力浓度</b> <span class="field-tip-value">${magic.values[idx].toFixed(4)}</span>`);
-        lines.push(`<span class="muted">第 ${fmtInt(magic.frameYear)} 年图层(取不晚于本回合的帧)· ${where} · ${lon}°E, ${lat}°N</span>`);
-      } else if (!lines.length) {
-        return setFieldTipVisible(false);
-      }
-    }
-    el.fieldTip.innerHTML = lines.join('<br>');
-    el.fieldTip.classList.remove('hidden');
-    const bx = Math.min(S.cw - 250, Math.max(6, x + 14));
-    const by = Math.max(6, y - 54);
-    el.fieldTip.style.left = `${bx}px`;
-    el.fieldTip.style.top = `${by}px`;
+    const fieldHtml = fieldTipHtml(mx, my);
+    if (fieldHtml) parts.push(fieldHtml);
+    const magicHtml = magicTipHtml(mx, my);
+    if (magicHtml) parts.push(magicHtml);
+    if (!parts.length) return null;
+    return parts.join('<div class="mt-sep"></div>');
   }
 
   function renderFieldLegend() {
@@ -2113,7 +2153,7 @@
   function hideField() {
     S.field.on = false;
     if (el.fieldEnable) el.fieldEnable.checked = false;
-    setFieldTipVisible(false);
+    hideMapTip();
     draw();
     refreshButtons();
   }
@@ -2314,7 +2354,7 @@
   function hideMagic() {
     S.magic.on = false;
     if (el.magicEnable) el.magicEnable.checked = false;
-    setFieldTipVisible(false);
+    hideMapTip();
     draw();
   }
 
@@ -2786,11 +2826,13 @@
       S.veins = null;
       S.veinsWorldId = null;
       S.autoOn = false;
+      atlasKey = '';
+      if (window.CivRegionAtlas && window.CivRegionAtlas.clear) window.CivRegionAtlas.clear();
       S.field = { on: false, img: null, data: null, legend: null, kind: 'magic' };
       if (el.fieldEnable) el.fieldEnable.checked = false;
       if (el.fieldLegendWrap) el.fieldLegendWrap.classList.add('hidden');
       resetMagic(true);
-      setFieldTipVisible(false);
+      hideMapTip();
       updateFieldStatus();
       el.polityList.innerHTML = '';
       el.polityDetail.innerHTML = '<div class="side-empty">世界建好了,点「开始会话」让 AI 君主接管。</div>';
@@ -2893,6 +2935,7 @@
     renderAll();
     await loadOwners();
     await loadDialogue();
+    await loadRegionAtlas(state);
     if (state.magic) void refreshMagic();
   }
 

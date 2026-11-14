@@ -106,17 +106,9 @@ function hexOf(c: readonly number[]): string {
  * x 折回 [0, W)(地图东西相连),y 夹在 [0, H-1](底边那一个像素算最后一格)。
  * 想按客户端坐标查的,先用查看器自己的 mapPointAt() 换成世界像素再进来。
  */
-export function regionInfoAt(world: World, civ: Civ, x: number, y: number): RegionInfo | null {
-  const { raster, pix } = regionPixelIndex(world, civ);
-  const w = raster.w;
-  const h = raster.h;
-  const wx = Math.floor(x);
-  const px = ((wx % w) + w) % w;
-  const py = Math.min(h - 1, Math.floor(y));
-  if (!(py >= 0)) return null;
-  const region = pix[py * w + px];
+/** 单个州的状态(不查像素,直接按州号算);州号越界 = null。 */
+export function regionMeta(world: World, civ: Civ, region: number): RegionInfo | null {
   if (!(region >= 0) || region >= civ.regions.count) return null;
-
   const regions = civ.regions;
   const polities = civ.polities;
   const pid = civ.polity[region];
@@ -153,6 +145,96 @@ export function regionInfoAt(world: World, civ: Civ, x: number, y: number): Regi
         : null,
   };
 }
+
+/** Single region lookup by world pixel (x, y); water / outside = null. */
+export function regionInfoAt(world: World, civ: Civ, x: number, y: number): RegionInfo | null {
+  const { raster, pix } = regionPixelIndex(world, civ);
+  const w = raster.w;
+  const h = raster.h;
+  const wx = Math.floor(x);
+  const px = ((wx % w) + w) % w;
+  const py = Math.min(h - 1, Math.floor(y));
+  if (!(py >= 0)) return null;
+  return regionMeta(world, civ, pix[py * w + px]);
+}
+
+const ATLAS_WATER = 0xffff;
+
+/** 地区栅格:降采样的"像素 → 州"表(w*h 的 Uint16,ATLAS_WATER = 水)+ 全部州的状态 */
+export interface RegionAtlas {
+  /** 栅格宽 */
+  w: number;
+  /** 栅格高 */
+  h: number;
+  /** 降采样倍数(原图 2048×1024 → scale=2 时 1024×512) */
+  scale: number;
+  /** 州号栅格,水 = ATLAS_WATER */
+  data: Uint16Array;
+  /** 州状态,下标 = 州号 */
+  regions: RegionInfo[];
+}
+
+const atlasCache = new WeakMap<World, { raster: Raster; byRegions: WeakMap<Civ['regions'], Map<number, RegionAtlas>> }>();
+
+/**
+ * 建(或取缓存的)地区栅格:悬停只查本地表,不再每次请求服务端。
+ * 每个像素取 scale×scale 源像素里出现最多的州(平票取先出现且计数最大的),全水 = ATLAS_WATER。
+ */
+export function regionAtlas(world: World, civ: Civ, scale = 2): RegionAtlas {
+  const s = Math.max(1, Math.min(8, Math.round(scale) || 2));
+  const raster = worldRaster(world);
+  let hit = atlasCache.get(world);
+  if (!hit || hit.raster !== raster) {
+    hit = { raster, byRegions: new WeakMap() };
+    atlasCache.set(world, hit);
+  }
+  let per = hit.byRegions.get(civ.regions);
+  if (!per) {
+    per = new Map();
+    hit.byRegions.set(civ.regions, per);
+  }
+  const cached = per.get(s);
+  if (cached) return cached;
+
+  const { pix } = regionPixelIndex(world, civ);
+  const W = raster.w;
+  const H = raster.h;
+  const w = Math.ceil(W / s);
+  const h = Math.ceil(H / s);
+  const data = new Uint16Array(w * h);
+  const counts = new Map<number, number>();
+  for (let ay = 0; ay < h; ay++) {
+    const sy0 = ay * s;
+    for (let ax = 0; ax < w; ax++) {
+      const sx0 = ax * s;
+      counts.clear();
+      let best = ATLAS_WATER;
+      let bestN = 0;
+      for (let dy = 0; dy < s && sy0 + dy < H; dy++) {
+        const row = (sy0 + dy) * W;
+        for (let dx = 0; dx < s && sx0 + dx < W; dx++) {
+          const r = pix[row + sx0 + dx];
+          if (r < 0) continue;
+          const n = (counts.get(r) ?? 0) + 1;
+          counts.set(r, n);
+          if (n > bestN) { bestN = n; best = r; }
+        }
+      }
+      data[ay * w + ax] = best;
+    }
+  }
+  const regions: RegionInfo[] = [];
+  for (let r = 0; r < civ.regions.count; r++) {
+    const m = regionMeta(world, civ, r);
+    if (m) regions.push(m);
+  }
+  const out: RegionAtlas = { w, h, scale: s, data, regions };
+  per.set(s, out);
+  return out;
+}
+
+/** 栅格里的水/图外 = ATLAS_WATER;mapPointAt 出的世界像素 → 州号(用于悬停) */
+export { ATLAS_WATER };
 
 export interface RegionIndexStats {
   /** 州数 */

@@ -20,7 +20,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
-import { deflateSync } from 'node:zlib';
+import { deflateSync, gzipSync } from 'node:zlib';
 import { constants as osConstants, setPriority } from 'node:os';
 
 import {
@@ -61,7 +61,7 @@ import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, ma
 import { isTerrainStyle, renderTile, renderVectors, renderVeinOverlay, renderWhole, type TerrainStyle } from './terrain';
 import { renderOwnerPixels, ownerCivData, renderOwnerTilePixels } from './owner-map';
 import { buildLabels } from './labels';
-import { regionInfoAt } from './region-info';
+import { regionAtlas, regionInfoAt } from './region-info';
 import { dialogueView } from './dialogue';
 import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
@@ -601,12 +601,15 @@ const ownerTilePngs = new Map<string, Buffer>();
 const labelsCache = new Map<string, string>();
 const dialogueCache = new Map<string, string>();
 const veinCache = new Map<string, string>();
+/** Region atlas cache: key = sessionId|fingerprint|scale */
+const atlasCache = new Map<string, string>();
 
 /** 会话状态变了:整张疆域图和它的疆域瓦片都作废(瓦片按 session 前缀清) */
 function invalidateOwnerCache(sid: string): void {
   ownerCache.delete(sid);
   const prefix = `${sid}|`;
   for (const key of ownerTilePngs.keys()) if (key.startsWith(prefix)) ownerTilePngs.delete(key);
+  for (const key of atlasCache.keys()) if (key.startsWith(prefix)) atlasCache.delete(key);
 }
 
 function optNum(v: string | null): number | undefined {
@@ -1127,6 +1130,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const s = getSession(sid);
     const info = regionInfoAt(s.world, s.civ, x, y);
     sendJson(res, 200, { info });
+    return true;
+  }
+
+  // Region atlas: downsampled pixel->region grid (gzip base64) + all region metadata.
+  // The client keeps it locally so hover needs zero requests; built once per session state.
+  if (method === 'GET' && pathname === '/api/map/region-atlas') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, 'missing sessionId'); return true; }
+    const scale = Math.max(1, Math.min(8, Math.round(Number(q.get('scale') ?? 2)) || 2));
+    const s = getSession(sid);
+    const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
+    const key = `${s.id}|${fingerprint}|${scale}`;
+    let json = atlasCache.get(key);
+    if (!json) {
+      const at = regionAtlas(s.world, s.civ, scale);
+      const buf = Buffer.from(at.data.buffer, at.data.byteOffset, at.data.byteLength);
+      const gz = gzipSync(buf, { level: 6 });
+      json = JSON.stringify({ w: at.w, h: at.h, scale: at.scale, regions: at.regions, dataGzB64: gz.toString('base64') });
+      atlasCache.set(key, json);
+      if (atlasCache.size > 6) atlasCache.clear();
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
     return true;
   }
 

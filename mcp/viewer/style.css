@@ -1305,3 +1305,37 @@ details.advanced > summary { font-weight: 500; }
 .region-tip-v { flex: 1 1 auto; }
 .region-tip-polity { font-weight: 600; }
 .region-tip .muted { color: var(--ink-3); }
+
+/* ---------------- 统一浮窗:地区 / 地块场 / 魔力浓度 ---------------- */
+.map-tip-card {
+  position: absolute;
+  z-index: 44;
+  pointer-events: none;
+  left: 0;
+  top: 0;
+  max-width: 300px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: var(--shadow-float);
+  color: var(--ink-2, #3c3a33);
+  font-size: 11px;
+  line-height: 1.55;
+  will-change: transform;
+}
+.map-tip-card.hidden { display: none; }
+.mt-sec + .mt-sec { margin-top: 0; }
+.mt-sep { height: 1px; margin: 6px 0; background: rgba(120, 100, 70, 0.18); }
+.mt-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 2px; }
+.mt-head b { font-size: 12px; color: var(--ink, #1f1d18); }
+.mt-no { font-size: 10px; color: var(--ink-3, #8a857a); font-variant-numeric: tabular-nums; }
+.mt-row { display: flex; gap: 8px; }
+.mt-k { flex: 0 0 46px; color: var(--ink-3, #8a857a); }
+.mt-v { flex: 1; color: var(--ink-2, #3c3a33); }
+.mt-muted { color: var(--ink-3, #8a857a); }
+.mt-val { font-weight: 600; color: var(--accent, #2f6fb3); font-variant-numeric: tabular-nums; }
+.mt-pol { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; background: var(--pc, #999); }
+@media (prefers-color-scheme: dark) {
+  .map-tip-card { background: rgba(30, 30, 33, 0.95); }
+  .mt-sep { background: rgba(255, 255, 255, 0.12); }
+}
