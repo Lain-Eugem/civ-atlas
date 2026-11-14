@@ -588,7 +588,7 @@ function stateView(s: Session): Record<string, unknown> {
     nationControl: nationControlView(s),
     startSetup: s.startSetup ?? null,
     pendingStartSetup: s.pendingStartSetup ?? null,
-    // 玩家硬命令(DM 对话框):队列 + 自己的国家
+    // DM 硬命令(上帝视角):不依赖任何"玩家国家";playerPolityId 只是历史遗留的面板聚焦字段
     playerPolityId: s.playerPolityId ?? null,
     playerPolityName: s.playerPolityId != null ? polityName(civ.polities[s.playerPolityId], year) : null,
     playerCommands: playerCommandView(s),
@@ -1512,6 +1512,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       else if (args.add !== undefined) setup.nations = args.add;
       if (args.force === true) setup.force = true;
       if (args.names !== undefined) setup.names = args.names;
+      // 历史遗留兼容:旧面板会带 playerPolityId,现在界面不再发送,也不表示"玩家国家"。
       if (args.playerPolityId !== undefined) setup.playerPolityId = args.playerPolityId === null ? null : Number(args.playerPolityId);
       if (args.cleanExclaves !== undefined) setup.cleanExclaves = args.cleanExclaves;
       if (args.allowExclaves === true) setup.allowExclaves = true;
@@ -1555,7 +1556,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (args.autoCard === true) input.autoCard = true;
       if (args.allowExclaves === true) input.allowExclaves = true;
       const result = applyCustomStart(s, input);
-      if (result && typeof result.polityId === 'number') s.playerPolityId = result.polityId;
+      // m05242 修正:custom-start 的 polityId 只表示"要改哪一国的君主卡/疆域",不再写入 playerPolityId(没有玩家国家)。
       invalidateOwnerCache(s.id);
       chronCache.delete(s.id);
       sendJson(res, 200, { state: stateView(s), result });
@@ -1671,7 +1672,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       return true;
     }
 
-    // 推演中的 DM 对话框:玩家直接下硬命令(解析 → 引擎校验 → 排队,下一回合开始执行)
+    // 推演中的 DM 对话框:上帝视角直接对任意国家下硬命令(解析 → 引擎校验 → 排队,下一回合开始执行)
+    // 修正(m05242):这里没有"玩家国家",命令必须显式点名国家;不再读取 playerPolityId。
     if (pathname === '/api/dm/chat') {
       const sid = String(args.sessionId ?? '');
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
@@ -1679,8 +1681,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const text = String(args.text ?? '').trim();
       const polities = (stateGet(s, { chronicle: false }).polities as { id: number; name: string; key: string }[])
         .map((p) => ({ id: p.id, name: p.name, key: p.key }));
-      const mine = s.playerPolityId != null ? polities.find((p) => p.id === s.playerPolityId) ?? null : null;
-      const parsed = parsePlayerCommand(text, { player: mine, polities });
+      const parsed = parsePlayerCommand(text, { polities });
       let reply: Record<string, unknown> = { ...parsed };
       if (parsed.ok) {
         const cleaned = cleanOrders(s.play, parsed.commands);

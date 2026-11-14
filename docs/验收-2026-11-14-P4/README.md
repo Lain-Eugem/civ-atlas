@@ -1,12 +1,14 @@
 # 验收：P4 推演中 DM 对话框（玩家硬命令）
 
+> m05242 修正：这个游戏里不存在「玩家国家」概念；DM 硬命令是上帝视角，必须显式点名国家（不再有"自己的国家/先选国家"）。
+
 对应 plan.md §P4（用户 m04171 第 ⑦ 项"DM 的对话与 Jev 的决策需要有展示的地方"之后新增的硬命令能力，用户 m04210 决策②允许玩家直接下硬命令）。
 
 ## 做了什么
 
 ### 服务端
 - 新文件 `mcp/player-commands.ts`（10,144 B）：规则解析器 + 待执行队列。
-  - `parsePlayerCommand(text, ctx)`：支持 对/向/跟 X 宣战|开战、宣战 X、与 X 结盟、灭掉/征服/吞并 X、渗透/刺探 X、停战|议和|休战|停火、扩张、防守|停止扩张|休养生息、通商|贸易、发展|繁荣、坚持打、禁止分裂、保住王室、中立；国名支持 `P<编号>` 与模糊名（去后缀匹配）。
+  - `parsePlayerCommand(text, ctx)`：支持 让 A 对 B 宣战|开战、让 A 与 B 结盟、让 A 渗透 B、灭掉 X（散成无主）、让 A 灭掉 X（并入 A）、让 A 停止扩张|扩张|通商|发展|坚持打|中立 等；国名支持全名、去后缀简称与 `P<编号>`。（m05242 后命令必须显式点名国家，旧的"自己的国家"参数已废弃，见顶部修正说明）
   - `queuePlayerCommand` / `cancelPlayerCommand` / `drainPlayerCommands(max=5)`（每回合最多执行 5 条）/ `playerCommandView`。
   - 与引擎命令目录（`mcp/orders.ts` 的 `cleanOrders`）二次校验，非法命令直接拒绝并给出可用示例。
 - `mcp/engine.ts`：`Session.playerPolityId` / `playerCommands`；`turnStep` 在推演前把待执行命令并入本回合命令队列。

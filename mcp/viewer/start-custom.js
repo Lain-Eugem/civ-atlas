@@ -12,13 +12,14 @@
  * 第一回合前可以反复改;底部「完成」只关闭面板(改动早已即时保存)。
  *
  * 后端路由:
- *   GET  /api/start/config?sessionId=     -> 国家名单(含 regionIds/control/capital 世界像素)、playerPolityId、canSetup...
+ *   GET  /api/start/config?sessionId=     -> 国家名单(含 regionIds/control/capital 世界像素)、canSetup...
  *   GET  /api/start/auto-name?sessionId= -> { name } 中文随机国名(不撞现有名)
  *   GET  /api/start/nations?sessionId=   -> { nations: StartNation[] }(保留兼容)
  *   POST /api/session/start-setup        -> { ok, result, state }
- *        body: { sessionId, remove?, removeRegions?, controls?, nations?, names?, cleanExclaves?, playerPolityId?, allowExclaves?, force? }
+ *        body: { sessionId, remove?, removeRegions?, controls?, nations?, names?, cleanExclaves?, allowExclaves?, force? }
+ *        (历史遗留:playerPolityId 旧前端会带,服务端仍兼容,但界面不再发送、也不表示"玩家国家")
  *        409 = 删到最后一州需要确认,body = { error, needConfirm:[...] },确认后带 force:true 重提
- *   POST /api/session/custom-start       -> { state, result }(玩家角色卡 + 连续点选疆域)
+ *   POST /api/session/custom-start       -> { state, result }(编辑该国的角色卡 + 连续点选疆域; polityId = 要改哪一国,m05242 起无"玩家国家")
  *        body: { sessionId, polityId, regionIds?, allowExclaves?, card?, autoCard? }
  */
 (function () {
@@ -34,7 +35,7 @@
   var setupInfo = null;
   /** 国家名单(GET /api/start/config 的 nations,含 regionIds/control/capital) */
   var nations = [];
-  /** 当前选中/扮演的国家编号 */
+  /** 当前选中的国家编号(用于编辑该国的君主卡/疆域) */
   var selectedPid = null;
   /** 新建国家的地图落点(世界像素) */
   var newAt = null;
@@ -66,7 +67,7 @@
 
   /** 累积的 start-setup 增量 */
   function emptyPending() {
-    return { remove: [], removeRegions: [], controls: {}, names: {}, nations: [], cleanExclaves: [], playerPolityId: undefined };
+    return { remove: [], removeRegions: [], controls: {}, names: {}, nations: [], cleanExclaves: [] };
   }
   var pending = emptyPending();
 
@@ -142,7 +143,7 @@
       '#startCustomPanel .start-nation-row.selected{border-left-color:var(--accent,#2f6fdf);background:rgba(47,111,223,.1);font-weight:600}',
       '#startCustomPanel .start-nation-row .swatch{flex:0 0 auto;width:10px;height:10px;border-radius:2px;border:1px solid rgba(0,0,0,.15)}',
       '#startCustomPanel .start-nation-row .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '#startCustomPanel .start-nation-row.selected .nm::after{content:" · 你";color:var(--accent,#2f6fdf);font-size:11px}',
+      '#startCustomPanel .start-nation-row.selected .nm::after{content:" · 已选";color:var(--accent,#2f6fdf);font-size:11px}',
       '#startCustomPanel .start-nation-row .meta{flex:0 0 auto;color:var(--ink-3,#857b6d);font-variant-numeric:tabular-nums;font-weight:400}',
       '#startCustomPanel .start-nation-row select{flex:0 0 auto;width:auto;padding:1px 4px;font-size:11px}',
       '#startCustomPanel .start-nation-row .row-btn{flex:0 0 auto;border:0;background:transparent;cursor:pointer;font-size:12px;padding:1px 3px;border-radius:4px;color:var(--ink-2,#5c544a)}',
@@ -196,7 +197,7 @@
       '</div>',
       '<div class="params-body start-panel-body">',
       '  <div class="start-section">',
-      '    <div class="start-section-head"><span>① 国家</span><span class="hint">点一行 = 扮演该国:高亮并飞首都</span></div>',
+      '    <div class="start-section-head"><span>① 国家</span><span class="hint">点一行 = 选中该国(用于编辑君主/疆域),并高亮+飞首都</span></div>',
       '    <div class="start-stats" id="startStats"></div>',
       '    <div class="start-nations" id="startNationRows"></div>',
       '    <div class="start-confirm" id="startConfirm" hidden>',
@@ -224,8 +225,8 @@
       '    </div>',
       '  </div>',
       '  <div class="start-section">',
-      '    <div class="start-section-head"><span>② 君主</span><span class="hint" id="startCustomState"></span></div>',
-      '    <div class="start-player" id="startPlayerLine">当前扮演:<b>未选择</b>(点 ① 里的国家)</div>',
+      '    <div class="start-section-head"><span>② 君主定制</span><span class="hint" id="startCustomState"></span></div>',
+      '    <div class="start-player" id="startPlayerLine">所选国家:<b>未选择</b>(点 ① 里的国家)</div>',
       '    <div class="coord" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">',
       '      <button class="btn" id="startPick" type="button">🗺 在地图上选疆域</button>',
       '      <span class="hint" id="startAtLabel" style="font-size:11px;color:var(--ink-3,#857b6d);flex:1 1 140px">点州选中/取消;Esc 退出</span>',
@@ -364,7 +365,6 @@
         setupInfo = data;
         nations = data.nations;
         if (selectedPid != null && !nationOf(selectedPid)) selectedPid = null;
-        if (selectedPid == null && typeof data.playerPolityId === 'number') selectedPid = data.playerPolityId;
         el('startSub').textContent = data.canSetup === false ? '第一回合已开始:开局设置已锁定' : '第一回合推演前,改动即时保存';
         renderAll();
         if (opts && opts.fillCard) fillCardFromState(selectedPid);
@@ -403,7 +403,7 @@
   function renderStats() {
     var ai = 0, pro = 0;
     nations.forEach(function (n) { if (n.control === 'program') pro++; else ai++; });
-    el('startStats').textContent = '共 ' + nations.length + ' 国 · AI ' + ai + ' · 程序 ' + pro + ' · 你 ' + (selectedPid != null ? 1 : 0);
+    el('startStats').textContent = '共 ' + nations.length + ' 国 · AI ' + ai + ' · 程序 ' + pro;
   }
 
   function renderRows() {
@@ -445,9 +445,9 @@
   function renderPlayerLine() {
     var n = selectedPid != null ? nationOf(selectedPid) : null;
     el('startPlayerLine').innerHTML = n
-      ? '当前扮演:<b>' + esc(n.name) + '</b> · ' + (n.regions || 0) + ' 州' + (n.seatName ? ' · 国都 ' + esc(n.seatName) : '')
-      : '当前扮演:<b>未选择</b>(点 ① 里的国家)';
-    el('startCustomState').textContent = '';
+      ? '所选国家:<b>' + esc(n.name) + '</b> · ' + (n.regions || 0) + ' 州' + (n.seatName ? ' · 国都 ' + esc(n.seatName) : '')
+      : '所选国家:<b>未选择</b>(点 ① 里的国家)';
+    el('startCustomState').textContent = n ? '（所选国家：' + n.name + '）' : '';
   }
 
   function renderRegionBox() {
@@ -498,7 +498,6 @@
   function selectPolity(pid, fly) {
     if (!nationOf(pid)) return;
     selectedPid = pid;
-    pending.playerPolityId = pid;
     renderAll();
     fillCardFromState(pid);
     if (fly) flyToCapital(pid);
@@ -683,7 +682,7 @@
         regionSel = (sel || []).slice();
         if (hlPid != null && hlPid !== selectedPid && nationOf(hlPid)) {
           syncing = true;
-          try { selectedPid = hlPid; pending.playerPolityId = hlPid; } finally { syncing = false; }
+          try { selectedPid = hlPid; } finally { syncing = false; }
           renderAll();
           fillCardFromState(hlPid);
         }
@@ -695,8 +694,7 @@
         if (pid == null || !nationOf(pid)) return;
         if (pid !== selectedPid) {
           selectedPid = pid;
-          pending.playerPolityId = pid;
-          renderAll();
+                renderAll();
           fillCardFromState(pid);
         }
       },
@@ -919,7 +917,6 @@
     if (Object.keys(pending.names).length) { body.names = pending.names; dirty = true; }
     if (pending.nations.length) { body.nations = pending.nations.slice(); dirty = true; }
     if (pending.cleanExclaves.length) { body.cleanExclaves = pending.cleanExclaves.slice(); dirty = true; }
-    if (pending.playerPolityId !== undefined) { body.playerPolityId = pending.playerPolityId; dirty = true; }
     if (allowExclaves) body.allowExclaves = true;
     return dirty ? body : null;
   }

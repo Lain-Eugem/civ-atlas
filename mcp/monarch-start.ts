@@ -1230,7 +1230,7 @@ function hexOf(color: readonly number[]): string {
  * - 删到首都州(还有别的州):从保留的州里挑一个作为新国都,capitals 里追加一条;
  * - 删到最后一州:没传 force 就抛错让人确认;force = true 才把整个国家删掉。
  * 删国同时清:进行中的战争(补 peace 史事)、进行中的条约(补 expire 史事)、
- * 角色卡 / 君主记忆 / 渗透情报 / 控制方式 / 玩家席位 / 开局定制记录 / 君主配置名单。
+ * 角色卡 / 君主记忆 / 渗透情报 / 控制方式 / 面板选中(历史 playerPolityId) / 开局定制记录 / 君主配置名单。
  */
 export interface StartNationSpec {
   /** 现有国家 id;省略 = 按 at(或不给落点)新建一个国家 */
@@ -1269,7 +1269,7 @@ export interface StartSetupInput {
   force?: boolean;
   /** 改名:{"国家编号":"新国名"}(P1.5 行内改名) */
   names?: Record<string, string>;
-  /** 玩家国家编号(P1.5 名单行选中);null = 清空玩家席位 */
+  /** 历史遗留:面板最近选中的国家编号(P1.5 名单行选中,m05242 后不表示玩家国家);null = 清空 */
   playerPolityId?: number | null;
   /** 清理飞地:这些国家删掉非最大连通块的州(变无主) */
   cleanExclaves?: number[];
@@ -1284,7 +1284,7 @@ export interface StartSetupState {
   count: number;
   /** 用户要求的目标国家数(没给 = null) */
   targetCount: number | null;
-  /** 应用后的玩家国家编号(没有 = null) */
+  /** 应用后的面板选中编号(历史遗留,不表示玩家国家;没有 = null) */
   playerPolityId: number | null;
   /** 显式覆盖的名字(P1.5 行内改名/自定义新建名);名单显示用,第一回合后仍会被引擎重算 */
   names: Record<string, string>;
@@ -1632,7 +1632,7 @@ export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSet
     ctx.warnings.push(`「${polityName(p, year)}」清理了 ${clip.dropped.length} 个不连通的州(已变无主)`);
   }
 
-  /* ---- 5.7 玩家国家(P1.5 名单行选中) ---- */
+  /* ---- 5.7 面板选中(历史遗留 playerPolityId;不表示玩家国家) ---- */
   if (setup.playerPolityId !== undefined) {
     const raw = setup.playerPolityId;
     const pid = raw === null ? null : Number(raw);
@@ -1643,7 +1643,7 @@ export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSet
       if (p && polityAlive(p, year) && (sizesNow(s.civ).get(pid) ?? 0) > 0) s.playerPolityId = pid;
       else {
         s.playerPolityId = undefined;
-        ctx.warnings.push(`playerPolityId P${pid} 已经不在世,玩家席位已清空`);
+        ctx.warnings.push(`playerPolityId P${pid} 已经不在世,面板选中已清空`);
       }
     }
   }
@@ -1651,7 +1651,7 @@ export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSet
     const p = s.civ.polities[s.playerPolityId];
     if (!p || !polityAlive(p, year) || (sizesNow(s.civ).get(s.playerPolityId) ?? 0) <= 0) {
       s.playerPolityId = undefined;
-      ctx.warnings.push('玩家国家已经不在世,玩家席位已清空');
+      ctx.warnings.push('之前选中的国家已经不在世,面板选中已清空');
     }
   }
 
@@ -2091,7 +2091,7 @@ function endNation(s: Session, polityId: number, ctx: SetupContext, reason: 'rem
   s.nationControl.delete(polityId);
   if (s.playerPolityId === polityId) {
     s.playerPolityId = undefined;
-    ctx.warnings.push('删掉的国家原来是玩家国家:玩家席位已清空');
+    ctx.warnings.push('删掉的国家是面板选中的国家:选中已清空');
   }
   if (s.customStart && s.customStart.polityId === polityId) {
     s.customStart = undefined;

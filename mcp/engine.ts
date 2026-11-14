@@ -289,9 +289,9 @@ export interface Session {
   petty?: PettyState;
   /** 开局定制(第一回合前的君主/疆域定制;没定制 = 没有) */
   customStart?: CustomStartState;
-  /** 玩家自己的国家编号(开局设置里选的;没选 = 没有) */
+  /** 历史遗留:开局面板最近选中的国家编号(仅用于面板聚焦;不表示"玩家国家",m05242 修正) */
   playerPolityId?: number;
-  /** 推演中玩家直接下的硬命令队列(下一回合开始时执行) */
+  /** DM 硬命令队列(上帝视角,命令里显式点名国家;下一回合开始时执行) */
   playerCommands?: PlayerCommandState;
   /**
    * 每国控制方式(只记显式覆盖;没列出的按 mode 默认,见 nationControlOf)。
@@ -764,6 +764,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     pendingStartSetup: s.pendingStartSetup ?? null,
     ...(s.monarch ? { monarchLifespan: s.monarch.lifespan ?? null, monarchByPolity: s.monarch.byPolity ?? {} } : {}),
     playerCommands: playerCommandView(s),
+    // 历史遗留字段:仅为兼容旧前端保留,UI 不再展示"你/扮演";没有玩家国家(m05242)
     playerPolityId: s.playerPolityId ?? null,
     ...(chronicle ? { chronicle } : {}),
   };
@@ -812,7 +813,7 @@ export function turnStep(s: Session, opts: { years?: number; orders?: readonly u
   if (s.pendingStartSetup) {
     throw new Error('开局国家设置还没应用:先调用 applyStartSetup(或 POST /api/session/start-setup)再推演');
   }
-  // 玩家在 DM 对话框里直接下的硬命令:回合开始时先入队(最多 5 条),与其它命令一起交给引擎
+  // DM 对话框里直接下的硬命令(上帝视角,命令里已显式点名国家):回合开始时先入队(最多 5 条),与其它命令一起交给引擎
   const playerCmds = drainPlayerCommands(s);
   if (playerCmds.length) {
     const cleanedPlayer = cleanOrders(s.play, playerCmds);

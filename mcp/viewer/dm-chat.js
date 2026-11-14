@@ -1,10 +1,11 @@
-/* 文明与地图 · 多 Agent 沙盒 —— DM 对话框（玩家硬命令）渲染模块
+/* 文明与地图 · 多 Agent 沙盒 —— DM 对话框（上帝视角硬命令）渲染模块
  *
  * 独立文件，不依赖 app.js，不进打包器：
  *   <script src="./dm-chat.js"></script>
  *   然后 CivDmChat.renderInto(el, view, handlers)，view 来自 stateView：
- *   { ...state.playerCommands, playerPolityName: state.playerPolityName, stepYears: state.stepYears }
- *   即 { pending, recent, maxPending, perRound, playerPolityName, stepYears }。
+ *   { ...state.playerCommands, stepYears: state.stepYears }
+ *   即 { pending, recent, maxPending, perRound, stepYears }。
+ *   m05242 修正:不存在"玩家国家";命令必须显式点名国家(上帝视角)。
  *
  * 设计：
  *   - 只读 view、纯字符串拼接，所有动态文本都过 esc()，防注入；
@@ -37,16 +38,6 @@
     '.dmc-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;}',
     '.dmc-title{font-size:12px;font-weight:700;letter-spacing:.02em;color:var(--ink, #1f1d18);}',
     '.dmc-head-meta{font-size:11px;color:var(--ink-3, #8a857a);white-space:normal;}',
-
-    /* 没选国家时的提示 */
-    '.dmc-warn{',
-    '  font-size:11px;line-height:1.5;',
-    '  padding:5px 8px;',
-    '  border-left:2px solid #c98a2b;',
-    '  border-radius:4px;',
-    '  background:rgba(201,138,43,.09);',
-    '  color:var(--ink-2, #3c3a33);',
-    '}',
 
     /* 输入区 */
     '.dmc-input-row{display:flex;align-items:stretch;gap:6px;}',
@@ -141,7 +132,6 @@
     '  .dmc{color:var(--ink, #f2efe8);}',
     '  .dmc-input{background:#1c1c1e;color:var(--ink, #f2efe8);border-color:var(--line, #3a3a3e);}',
     '  .dmc-input:focus{box-shadow:0 0 0 2px rgba(64,156,255,.22);}',
-    '  .dmc-warn{background:rgba(201,138,43,.14);color:var(--ink-2, #d8d3c8);}',
     '  .dmc-p-item{background:rgba(255,255,255,.03);border-color:var(--line, #3a3a3e);}',
     '  .dmc-num{color:var(--ink-2, #d8d3c8);background:rgba(255,255,255,.1);}',
     '  .dmc-badge-applied{background:rgba(46,138,87,.24);color:#8fd6ab;}',
@@ -180,13 +170,11 @@
 
   function normView(view) {
     var v = view && typeof view === 'object' ? view : {};
-    var name = v.playerPolityName;
     return {
       pending: asList(v.pending),
       recent: asList(v.recent),
       maxPending: toInt(v.maxPending, 10),
       perRound: toInt(v.perRound, 5),
-      playerPolityName: name === null || name === undefined || name === '' ? null : String(name),
       stepYears: toInt(v.stepYears, 5)
     };
   }
@@ -235,22 +223,17 @@
     );
   }
 
-  function renderWarn(v) {
-    if (v.playerPolityName) return '';
-    return '<div class="dmc-warn">还没选自己的国家：先在「开局设置」里选国家，再下命令</div>';
-  }
-
   function renderInput() {
     return (
       '<div class="dmc-input-row">' +
       '<textarea id="dmc-input" class="dmc-input" rows="2" ' +
       'aria-label="DM 命令输入" ' +
-      'placeholder="直接下达硬命令，例：对 埃维罗尔王国 开战"></textarea>' +
+      'placeholder="直接下达硬命令，例：让 X 国 对 Y 国 开战"></textarea>' +
       '<button id="dmc-send" class="dmc-send" type="button">发送命令</button>' +
       '</div>' +
       '<details class="dmc-examples">' +
-      '<summary>支持的句式</summary>' +
-      '<div class="dmc-examples-body">示例：对 X 开战 / 与 X 结盟 / 停止扩张 / 发展 / 通商 / 灭掉 X / 渗透 X / 坚持打</div>' +
+      '<summary>支持的句式（上帝视角，请点名国家）</summary>' +
+      '<div class="dmc-examples-body">示例：让 A 对 B 开战 / 让 A 与 B 结盟 / 让 A 渗透 B / 灭掉 X（散成无主）/ 让 A 灭掉 X（并入 A）/ 让 A 停止扩张 / 让 A 扩张 / 让 A 通商 / 让 A 发展 / 让 A 坚持打 / 让 A 中立（A/B/X 换成国家名或 P&lt;编号&gt;）</div>' +
       '</details>'
     );
   }
@@ -328,7 +311,6 @@
     var v = normView(view);
     return (
       renderHead(v) +
-      renderWarn(v) +
       renderInput() +
       renderPending(v) +
       renderRecent(v)

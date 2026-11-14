@@ -2606,7 +2606,7 @@
         <div class="crown-grid">
           ${cell('用兵', c.war ?? 0)}${cell('理财', c.economy ?? 0)}${cell('密谋', c.intrigue ?? 0)}${cell('理政', c.admin ?? 0)}
         </div>
-        <div class="review-note">偏好:战争 ${esc(pref.war || '—')} · 经济 ${esc(pref.economy || '—')} · 外交 ${esc(pref.diplomacy || '—')}(玩家 / DM 可改下面的性格说明)</div>
+        <div class="review-note">偏好:战争 ${esc(pref.war || '—')} · 经济 ${esc(pref.economy || '—')} · 外交 ${esc(pref.diplomacy || '—')}(DM / 复核者可改下面的性格说明)</div>
         <textarea class="crown-persona" id="crownPersona" data-polity="${p.id}">${esc(card.persona || '')}</textarea>
         <div><button class="btn" id="btnCrownSave" type="button" data-polity="${p.id}">保存角色卡</button></div>
         ${cultivateBtn}
@@ -2632,7 +2632,6 @@
             recent: pc.recent || [],
             maxPending: pc.maxPending || 10,
             perRound: pc.perRound || 5,
-            playerPolityName: S.state.playerPolityName || '',
             stepYears: S.state.stepYears || 5,
           }, {
             send: async (text) => {
@@ -3193,7 +3192,7 @@
       })
       .join('');
     el.reviewBody.innerHTML =
-      `<div class="review-note">取消勾选 = 这条命令不执行(玩家/DM 否决)。Jev 只审高影响命令(宣战/坚持打);其余命令由你在这里决定。</div>` +
+      `<div class="review-note">取消勾选 = 这条命令不执行(DM/复核者否决)。Jev 只审高影响命令(宣战/坚持打);其余命令由你在这里决定。</div>` +
       blocks +
       `<div class="review-note">方案之外还会执行:小事件裁决产生的 ${(plan.pettyCommands || []).length} 条命令、DM 小决策产生的 ${(plan.dmCommands || []).length} 条命令。</div>`;
   }
