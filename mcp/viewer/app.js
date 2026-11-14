@@ -614,7 +614,7 @@
       });
     }
     // 地区线(州界):比国界线更细更淡,画在国界线下面;只手绘画风有
-    if (S.regionLines && S.regionLines.length && window.CivRegions && window.CivRegions.drawRegionLines) {
+    if (S.sessionId && S.regionLines && S.regionLines.length && window.CivRegions && window.CivRegions.drawRegionLines) {
       window.CivRegions.drawRegionLines(ctx, {
         lines: S.regionLines, rects, k, P, H,
         mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, relK: S.view.k, style: S.style,
@@ -2938,6 +2938,10 @@
       S.ownerFingerprint = null;
       S.labels = null;
       S.labelsYear = null;
+      S.regionLines = null;
+      if (window.CivRegions && window.CivRegions.setLines) window.CivRegions.setLines([]);
+      S.dialogue = null;
+      S.dialogueSession = null;
       clearOwnerTiles();
       S.grid = null;
       S.sel = null;
