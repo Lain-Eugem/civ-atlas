@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 文明与地图 · 多 Agent 沙盒监视台 —— 前端
  *
  * 只做三件事:
@@ -1290,6 +1290,7 @@
   function clearVecCache() {
     if (S.vecCache && S.vecCache.canvas && S.vecCache.canvas.close) S.vecCache.canvas.close();
     S.vecCache = null;
+    vecRoll = null;
   }
 
   const VEC_PAD_MIN = 180;
@@ -1344,6 +1345,100 @@
    * 矢量层:平稳时不重描,每帧只把离屏缓存贴到画布。
    * 缩放明显变化、拖动快把边距拖光、换画法 / 换世界 / 瓦片覆盖状态变化时才重画。
    */
+  // 交互期间的"滚动缓存":把矢量层画进一张和缓存同尺寸、世界锚定的 canvas。
+  // 视口移动时先把旧内容平移贴着,再只补画新露出的窄条(分块补画),每帧只贴一次图,
+  // 避免把上千个子路径整片重新光栅化(手绘风那样做 75~100ms/帧)。
+  let vecRoll = null;
+  const VEC_ROLL_STRIP = 96;
+
+  /** 视口减去滚动缓存覆盖的屏幕矩形,返回最多 4 条边带 [x0,y0,x1,y1](屏幕坐标) */
+  function vecRollBands(dx, dy, w, h) {
+    const out = [];
+    if (dx > 0) out.push([0, 0, Math.min(dx, S.cw), S.ch]);
+    if (dx + w < S.cw) out.push([Math.max(dx + w, 0), 0, S.cw, S.ch]);
+    const bx0 = Math.max(dx, 0), bx1 = Math.min(dx + w, S.cw);
+    if (dy > 0 && bx1 > bx0) out.push([bx0, 0, bx1, Math.min(dy, S.ch)]);
+    if (dy + h < S.ch && bx1 > bx0) out.push([bx0, Math.max(dy + h, 0), bx1, S.ch]);
+    return out.filter((b) => b[2] > b[0] && b[3] > b[1]);
+  }
+
+  /**
+   * 滚动缓存每帧入口:第一次从 worker 缓存位图初始化;之后随视口平移,
+   * 拖出画布留白时先把内容在 canvas 里挪回中间,再补画新露出的窄条。
+   * 返回当前贴图位置 {dx,dy}(屏幕坐标);缩放变了 / 拿不到 canvas 时返回 null 让调用方退回贴缓存。
+   */
+  function vecRollFrame(c, k, oxAbs, oyAbs, P, H) {
+    const s = k / c.k;
+    if (!(s > 0.999 && s < 1.001)) { vecRoll = null; return null; }
+    const rdpr2 = S.rdpr || S.dpr;
+    const w = c.w, h = c.h;
+    const dxC = oxAbs + s * (c.x0 - c.ox);
+    const dyC = oyAbs + s * (c.y0 - c.oy);
+    if (!vecRoll || vecRoll.src !== c.canvas || vecRoll.style !== S.style
+      || vecRoll.vecWorldId !== S.vecWorldId || vecRoll.tileFull !== S.tileFull
+      || vecRoll.cw !== S.cw || vecRoll.ch !== S.ch || vecRoll.rdpr !== rdpr2
+      || vecRoll.w !== w || vecRoll.h !== h) {
+      const cw2 = Math.max(1, Math.round(w * rdpr2));
+      const ch2 = Math.max(1, Math.round(h * rdpr2));
+      const cv = document.createElement("canvas");
+      cv.width = cw2; cv.height = ch2;
+      const spare = document.createElement("canvas");
+      spare.width = cw2; spare.height = ch2;
+      const g = cv.getContext("2d");
+      if (!g) return null;
+      g.setTransform(rdpr2, 0, 0, rdpr2, 0, 0);
+      g.drawImage(c.canvas, 0, 0, w, h);
+      vecRoll = {
+        canvas: cv, g, w, h, cw: S.cw, ch: S.ch, rdpr: rdpr2,
+        spare,
+        style: S.style, tileFull: S.tileFull, vecWorldId: S.vecWorldId, src: c.canvas,
+        dxBuild: dxC, dyBuild: dyC, oxBuild: oxAbs, oyBuild: oyAbs,
+      };
+    }
+    let dx = vecRoll.dxBuild + (oxAbs - vecRoll.oxBuild);
+    let dy = vecRoll.dyBuild + (oyAbs - vecRoll.oyBuild);
+    let widest = 0;
+    for (const b of vecRollBands(dx, dy, w, h)) widest = Math.max(widest, b[2] - b[0], b[3] - b[1]);
+    if (widest > VEC_ROLL_STRIP) {
+      const pad = Math.round((w - S.cw) / 2);
+      const shiftX = Math.round(dx + pad);
+      const shiftY = Math.round(dy + pad);
+      if (shiftX !== 0 || shiftY !== 0) {
+        // 把整张内容平移到备用画布(画布自绘在 Chrome 里可能要回读,慢;换画布很快)
+        const dst = vecRoll.spare;
+        const dg = dst.getContext("2d");
+        dg.setTransform(1, 0, 0, 1, 0, 0);
+        dg.globalCompositeOperation = "copy";
+        dg.drawImage(vecRoll.canvas, shiftX * rdpr2, shiftY * rdpr2);
+        vecRoll.spare = vecRoll.canvas;
+        vecRoll.canvas = dst;
+        vecRoll.g = dg;
+        dg.setTransform(rdpr2, 0, 0, rdpr2, 0, 0);
+        vecRoll.dxBuild -= shiftX;
+        vecRoll.dyBuild -= shiftY;
+        dx -= shiftX;
+        dy -= shiftY;
+      }
+    }
+    const need = vecRollBands(dx, dy, w, h);
+    if (need.length) {
+      const g = vecRoll.g;
+      const rects = visibleRectsFor(k, P, H, oxAbs, oyAbs, S.cw, S.ch);
+      g.save();
+      g.beginPath();
+      for (const b of need) g.rect(b[0] - dx, b[1] - dy, b[2] - b[0], b[3] - b[1]);
+      g.clip();
+      g.translate(-dx, -dy);
+      drawVectorsIntoShared(g, {
+        vec: S.vec, rects, k, P, H, mapW: S.mapW, mapH: S.mapH,
+        cw: S.cw, ch: S.ch, style: S.style, relK: S.view.k,
+        tileFull: S.tileFull, tileCover: S.tileCover,
+      });
+      g.restore();
+    }
+    return { dx, dy };
+  }
+
   function drawVectorsCached() {
     if (!S.vec || !vecStyleOn() || !S.baseImg) { S.vecCache = null; return; }
     const { k, oxAbs, P, H } = S.draw;
@@ -1373,20 +1468,24 @@
         && s >= 0.82 && s <= 1.22
         && dx <= mx && dy <= my && right >= S.cw - mx && bottom >= S.ch - my;
     }
-    // 交互中 / 缓存没盖住视口:旧缓存内容在世界坐标里仍然是对的,直接平移贴上去
-    // (一次 drawImage,几毫秒),不要在主线程重新描林块 / 符号这些上千个子路径 ——
-    // 手绘画风那样做每帧要把这些路径重新光栅化一遍,实测掉到 10fps(75~100ms/帧)。
-    // 缺口交给 worker 在后台重烘一张新的补上;拖动中节流到 400ms 一次,停手后 120ms 一次,
-    // 不跟主线程抢 GPU。worker 不可用 / 缓存根本不是当前这一层时才退回同步描线。
+    // 交互中 / 缓存没盖住视口:旧缓存内容在世界坐标里仍然是对的,先整张平移贴着;
+    // 新露出的窄条由"滚动缓存"分块补画(见 vecRollFrame),避免把上千子路径整片重光栅化。
     const dragging = performance.now() - lastInputAt < 200;
     if (c) {
       const sFast = k / c.k;
       const sameLayer = c.style === S.style && c.vecWorldId === S.vecWorldId
         && c.cw === S.cw && c.ch === S.ch && c.rdpr === rdpr;
       if (sameLayer && sFast >= 0.6 && sFast <= 1.8 && !vecWorkerBroken) {
-        const dxFast = oxAbs + sFast * (c.x0 - c.ox);
-        const dyFast = oyAbs + sFast * (c.y0 - c.oy);
-        ctx.drawImage(c.canvas, dxFast, dyFast, c.w * sFast, c.h * sFast);
+        const roll = vecRollFrame(c, k, oxAbs, oyAbs, P, H);
+        if (roll) {
+          ctx.drawImage(vecRoll.canvas, roll.dx, roll.dy, vecRoll.w, vecRoll.h);
+        } else {
+          const dxFast = oxAbs + sFast * (c.x0 - c.ox);
+          const dyFast = oyAbs + sFast * (c.y0 - c.oy);
+          ctx.drawImage(c.canvas, dxFast, dyFast, c.w * sFast, c.h * sFast);
+        }
+        // 拖动中重烘勤一点会让视口最外圈更早有高清内容,但 worker 每次重烘整层约要 300ms,
+        // 太勤(200ms)反而会把主线程卡出 300ms 的长帧,所以保持 400ms。
         const gap = dragging ? 400 : 120;
         if (performance.now() - lastVecBuildAt > gap) {
           lastVecBuildAt = performance.now();
@@ -1405,6 +1504,7 @@
     const s = k / c.k;
     const dx = oxAbs + s * (c.x0 - c.ox);
     const dy = oyAbs + s * (c.y0 - c.oy);
+    vecRoll = null;
     ctx.drawImage(c.canvas, dx, dy, c.w * s, c.h * s);
   }
 
