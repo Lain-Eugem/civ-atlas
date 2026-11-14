@@ -37,6 +37,8 @@
 
   var st = {
     active: false,
+    /** 只做高亮预览(不接管指针、不进入选州模式):当前高亮的国家编号 */
+    previewPid: null,
     nations: [],
     api: null,
     sessionId: '',
@@ -221,7 +223,7 @@
 
   // ── 绘制 ──────────────────────────────────────────────────────────────────
   function draw() {
-    if (!st.active) return;
+    if (!st.active && st.previewPid == null) return;
     var view = civMap() && civMap().view ? civMap().view() : null;
     var cv = st.canvas;
     var ctx = st.ctx;
@@ -276,7 +278,11 @@
   }
 
   function tick() {
-    if (!st.active) return;
+    if (!st.active && st.previewPid == null) {
+      st.raf = 0;
+      if (!st.active) hideCanvas();
+      return;
+    }
     draw();
     st.raf = window.requestAnimationFrame(tick);
   }
@@ -397,6 +403,7 @@
     st.nations = Array.isArray(opts.nations) ? opts.nations.slice() : [];
     st.api = typeof opts.api === 'function' ? opts.api : null;
     st.sessionId = opts.sessionId || '';
+    st.previewPid = null;
     st.hlPid = typeof opts.initialPolityId === 'number' ? opts.initialPolityId : null;
     st.sel = [];
     if (Array.isArray(opts.initialSelection)) {
@@ -469,9 +476,39 @@
     return st.active;
   }
 
+  /**
+   * 只做高亮预览(P1.5 名单行点击):暖橙高亮一个国家,不接管地图指针、不进入选州模式。
+   * 地图仍然可以拖动/缩放,覆盖层每帧跟着重画。opts 可补 api/sessionId/nations(供首次补拉 atlas)。
+   */
+  function preview(pid, opts) {
+    var id = typeof pid === 'number' && isFinite(pid) ? pid : null;
+    if (id == null) { clearPreview(); return false; }
+    opts = opts || {};
+    if (typeof opts.api === 'function') st.api = opts.api;
+    if (opts.sessionId) st.sessionId = opts.sessionId;
+    if (Array.isArray(opts.nations)) st.nations = opts.nations.slice();
+    if (st.active) { st.hlPid = id; emitSelection(); return true; }
+    st.previewPid = id;
+    st.hlPid = id;
+    if (!ensureCanvas()) return false;
+    ensureAtlas().then(function () {
+      if (!st.active && st.previewPid == null) return;
+      if (!st.raf) tick();
+    });
+    return true;
+  }
+
+  function clearPreview() {
+    st.previewPid = null;
+    if (st.active) return;
+    if (st.raf) { window.cancelAnimationFrame(st.raf); st.raf = 0; }
+    st.hlPid = null;
+    hideCanvas();
+  }
+
   /** 调试/测试用:内部状态快照(不参与正常流程) */
   function debugState() {
-    return { active: st.active, hlPid: st.hlPid, sel: st.sel.slice(), down: st.down, nations: st.nations.length };
+    return { active: st.active, previewPid: st.previewPid, hlPid: st.hlPid, sel: st.sel.slice(), down: st.down, nations: st.nations.length };
   }
 
   var API = {
@@ -480,6 +517,8 @@
     selection: selection,
     setSelection: setSelection,
     highlightPolity: highlightPolity,
+    preview: preview,
+    clearPreview: clearPreview,
     isActive: isActive,
     debugState: debugState,
   };

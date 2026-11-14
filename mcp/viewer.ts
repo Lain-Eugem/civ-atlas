@@ -44,7 +44,7 @@ import {
   type Session,
 } from './engine';
 import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, monarchPanels, setMonarchCard, verifySession } from './monarch';
-import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, inferCardFromBiography, type StartSetupInput } from './monarch-start';
+import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, autoNationName, inferCardFromBiography, type StartSetupInput } from './monarch-start';
 import { CARD_LIFESPAN_DEFAULT } from '../src/gen/civ/monarchCard';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
@@ -1383,6 +1383,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     return true;
   }
 
+  // P1.5:新建国家表单的「🎲自动命名」;规则与服务端自动命名一致,不撞现有国名
+  if (method === 'GET' && pathname === '/api/start/auto-name') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    sendJson(res, 200, { name: autoNationName(s) });
+    return true;
+  }
+
   if (method === 'GET' && pathname === '/api/state') {
     const sid = url.searchParams.get('sessionId') ?? '';
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
@@ -1502,6 +1511,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (args.nations !== undefined) setup.nations = args.nations;
       else if (args.add !== undefined) setup.nations = args.add;
       if (args.force === true) setup.force = true;
+      if (args.names !== undefined) setup.names = args.names;
+      if (args.playerPolityId !== undefined) setup.playerPolityId = args.playerPolityId === null ? null : Number(args.playerPolityId);
+      if (args.cleanExclaves !== undefined) setup.cleanExclaves = args.cleanExclaves;
+      if (args.allowExclaves === true) setup.allowExclaves = true;
       let result: unknown;
       try {
         result = applyStartSetup(s, setup as StartSetupInput);
@@ -1540,6 +1553,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (Array.isArray(args.regionIds)) input.regionIds = args.regionIds;
       if (args.card && typeof args.card === 'object') input.card = args.card as Record<string, unknown>;
       if (args.autoCard === true) input.autoCard = true;
+      if (args.allowExclaves === true) input.allowExclaves = true;
       const result = applyCustomStart(s, input);
       if (result && typeof result.polityId === 'number') s.playerPolityId = result.polityId;
       invalidateOwnerCache(s.id);
