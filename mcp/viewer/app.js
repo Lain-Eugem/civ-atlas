@@ -3006,7 +3006,8 @@
       if (el.reviewPanel) el.reviewPanel.hidden = true;
       saveCfg(cfgFromForm());
       let setup = null;
-      if (features.llm) {
+      const hasPolities = !!(d.state && Array.isArray(d.state.polities) && d.state.polities.length > 0);
+      if (features.llm && hasPolities) {
         setBusy(true, '正在配置君主…', '选君主范围、mock 或真模型;Key 只存在服务端内存。');
         setup = await api('/api/monarch/setup', {
           sessionId: S.sessionId,
@@ -3021,7 +3022,11 @@
         await applyState(setup.state || d.state);
       } else {
         await applyState(d.state);
-        toast('「LLM 扮演」关着:这一局国家按引擎规则自动行动,只有 Jev 在结算小事。');
+        if (features.llm) {
+          toast('第 ' + Math.round(d.state.year) + ' 年还没有在世国家:君主暂不接管,先按引擎规则推演。');
+        } else {
+          toast('「LLM 扮演」关着:这一局国家按引擎规则自动行动,只有 Jev 在结算小事。');
+        }
       }
       if (el.dmEnable.checked) {
         try {

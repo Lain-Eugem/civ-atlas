@@ -62,6 +62,16 @@
   var editingPid = null;
   /** 上一次保存返回里新建的国家(保存完成后自动选中) */
   var createdPid = null;
+  /** 落点模式:鼠标在地图上游走时高亮所在州 */
+  var placeMode = false;
+  /** 落点模式点击起点(位移 <4px 才算一次点击) */
+  var placeDown = null;
+  /** 落点预览返回的州号(多州浅蓝高亮) */
+  var previewIds = [];
+  /** 落点 hover 节流时间戳 */
+  var placeMoveAt = 0;
+  /** #map 上的落点 hover/点击监听是否已绑定 */
+  var placeBound = false;
   /** 防下拉/点选同步时递归 */
   var syncing = false;
 
@@ -98,7 +108,8 @@
     if (create) create.disabled = on || !canEdit();
   }
   function canEdit() {
-    return !!setupInfo && setupInfo.canSetup !== false && !busy;
+    // hasCities=false(第 1 年这种还没有城的年份)时只能看/改起始年,不能动国家
+    return !!setupInfo && setupInfo.canSetup !== false && setupInfo.hasCities !== false && !busy;
   }
 
   // ── 样式(自包含,不改 style.css) ──────────────────────────────────────────
@@ -133,6 +144,11 @@
       '#startCustomPanel .start-msg{flex:0 0 auto;min-height:18px;font-size:12px;line-height:1.5;white-space:pre-wrap;color:var(--ink-3,#857b6d)}',
       '#startCustomPanel .start-msg.err{color:#b23a2e}',
       '#startCustomPanel .start-msg.ok{color:#2f7d4f}',
+      // P1.6:还没有城市的年份(比如第 1 年)给一条引导,禁用国家编辑
+      '#startCustomPanel .start-nocities{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:1px solid #c98a2e;border-radius:7px;background:rgba(201,138,46,.12);font-size:12px;line-height:1.55;color:#7a5314}',
+      '#startCustomPanel .start-nocities[hidden]{display:none!important}',
+      '#startCustomPanel .start-nocities .msg{white-space:pre-wrap}',
+      '#startCustomPanel .start-nocities .btns{display:flex;gap:8px}',
       '#startCustomPanel .start-foot{flex:0 0 auto;display:flex;gap:8px;padding:8px 12px;border-top:1px solid var(--line-soft,#e6ded0)}',
       '#startCustomPanel .start-foot .btn{flex:1 1 0}',
       '#startCustomPanel .start-trait-val{font-variant-numeric:tabular-nums;font-size:12px;color:var(--ink-3,#857b6d)}',
@@ -196,6 +212,10 @@
       '  <button class="btn ghost" id="startClose" type="button" title="关闭">✕</button>',
       '</div>',
       '<div class="params-body start-panel-body">',
+      '  <div class="start-nocities" id="startNoCities" hidden>',
+      '    <div class="msg" id="startNoCitiesMsg"></div>',
+      '    <div class="btns"><button class="btn primary" id="startGotoYear" type="button">去改起始年</button></div>',
+      '  </div>',
       '  <div class="start-section">',
       '    <div class="start-section-head"><span>① 国家</span><span class="hint">点一行 = 选中该国(用于编辑君主/疆域),并高亮+飞首都</span></div>',
       '    <div class="start-stats" id="startStats"></div>',
@@ -290,8 +310,13 @@
     el('startPick').addEventListener('click', toggleRegionPicker);
     el('startNewPick').addEventListener('click', onNewPick);
     el('startNewAuto').addEventListener('click', fetchAutoName);
+    el('startGotoYear').addEventListener('click', gotoStartYear);
+    el('startNewSize').addEventListener('input', function () {
+      if (newAt) previewCreateNation();
+    });
     el('startAllowExclaves').addEventListener('change', function () {
       allowExclaves = el('startAllowExclaves').checked;
+      if (newAt) previewCreateNation();
       if (regionSel.length) { regionDirty = true; schedule(); }
     });
     el('btnCreate').addEventListener('click', createNation);
@@ -364,6 +389,12 @@
         if (!data || !Array.isArray(data.nations)) throw new Error('bad config');
         setupInfo = data;
         nations = data.nations;
+        if (data.hasCities === false) {
+          // 没有城市的年份:清掉落点/预览,避免地图残留
+          newAt = null;
+          setPlaceMode(false);
+          clearPlacePreview();
+        }
         if (selectedPid != null && !nationOf(selectedPid)) selectedPid = null;
         el('startSub').textContent = data.canSetup === false ? '第一回合已开始:开局设置已锁定' : '第一回合推演前,改动即时保存';
         renderAll();
@@ -398,6 +429,10 @@
     el('startNewPick').disabled = !canEdit();
     el('startNewAuto').disabled = !canEdit();
     el('startAllowExclaves').disabled = !canEdit();
+    var newName = $('startNewName');
+    if (newName) newName.disabled = !canEdit();
+    renderNoCities();
+    renderCreateDefaults();
   }
 
   function renderStats() {
@@ -487,11 +522,17 @@
 
   function renderCreateDefaults() {
     var label = $('startNewAtLabel');
-    if (label) {
-      label.textContent = newAt
-        ? '落点:x=' + Math.round(newAt.x) + ', y=' + Math.round(newAt.y)
-        : '落点自动(最大的无主州)';
+    if (!label) return;
+    if (newAt) {
+      if (previewIds.length) {
+        label.textContent = '落点:' + regionName(previewIds[0]) + ' · 预计 ' + previewIds.length + ' 州' +
+          (allowExclaves ? '(允许飞地)' : '');
+      } else {
+        label.textContent = '落点:x=' + Math.round(newAt.x) + ', y=' + Math.round(newAt.y);
+      }
+      return;
     }
+    label.textContent = placeMode ? '移动鼠标看州高亮,点一下选中' : '落点自动(最大的无主州)';
   }
 
   // ── 选中 / 飞行 / 预览 ────────────────────────────────────────────────────
@@ -632,21 +673,156 @@
     pending.nations.push(spec);
     el('startNewName').value = '';
     newAt = null;
+    setPlaceMode(false);
+    clearPlacePreview();
     renderCreateDefaults();
     toastMsg('正在创建国家…');
     schedule();
   }
 
+  // ── 落点:地图 hover 高亮 + 点击预览(P1.6) ────────────────────────────────
+  function setPlaceMode(on) {
+    placeMode = !!on;
+    var btn = $('startNewPick');
+    if (btn) btn.textContent = placeMode ? '✕ 取消点选落点' : '📍 在地图上点选落点';
+    var map = document.getElementById('map');
+    if (map) map.style.cursor = placeMode ? 'crosshair' : '';
+    if (placeMode) {
+      bindPlaceEvents();
+      var P = window.CivRegionPicker;
+      if (P) {
+        // 不 open() 的 hover 预览也要能加载 atlas(需要 api/sessionId/nations)
+        if (P.configure) P.configure({ api: cfg && cfg.api, sessionId: cfg && cfg.sessionId, nations: nationPickerData() });
+        if (P.ensure) P.ensure();
+      }
+      toastMsg('在地图上移动鼠标看州高亮,点一下选落点');
+    } else {
+      placeDown = null;
+      if (window.CivRegionPicker && window.CivRegionPicker.setHover) window.CivRegionPicker.setHover(null);
+    }
+    renderCreateDefaults();
+  }
+
   function onNewPick() {
-    if (!cfg || typeof cfg.pick !== 'function') { toastMsg('这个页面没有提供地图点选能力', true); return; }
-    toastMsg('在地图上点选新国家的落点…');
-    cfg.pick(function (pt) {
-      if (!pt || typeof pt.x !== 'number' || typeof pt.y !== 'number') return;
-      newAt = { x: pt.x, y: pt.y };
+    if (!canEdit()) return;
+    setPlaceMode(!placeMode);
+  }
+
+  function bindPlaceEvents() {
+    if (placeBound) return;
+    var map = document.getElementById('map');
+    if (!map) return;
+    placeBound = true;
+    map.addEventListener('pointermove', onPlaceMove, true);
+    map.addEventListener('pointerdown', onPlaceDown, true);
+    map.addEventListener('pointerup', onPlaceUp, true);
+  }
+
+  function onPlaceMove(e) {
+    if (!placeMode) return;
+    var now = Date.now();
+    if (now - placeMoveAt < 120) return;
+    placeMoveAt = now;
+    var P = window.CivRegionPicker;
+    if (!P || !P.regionAtClient || !P.setHover) return;
+    var r = P.regionAtClient(e.clientX, e.clientY);
+    if (r == null && (!window.CivRegionAtlas || !window.CivRegionAtlas.ready || !window.CivRegionAtlas.ready())) {
+      // atlas 还在加载:先预热,下一帧 mouse move 再查
+      if (P.ensure) P.ensure();
+      return;
+    }
+    P.setHover(r == null ? null : r);
+    if (!newAt) {
+      var label = $('startNewAtLabel');
+      if (label) label.textContent = r == null ? '落点:把鼠标移到陆地上' : '落点预览:' + regionName(r) + ' (点一下选中)';
+    }
+  }
+
+  function onPlaceDown(e) {
+    if (!placeMode || e.button !== 0) return;
+    placeDown = { x: e.clientX, y: e.clientY };
+  }
+
+  function onPlaceUp(e) {
+    if (!placeMode || !placeDown) return;
+    var d = placeDown;
+    placeDown = null;
+    if (Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) >= 4) return;
+    var map = document.getElementById('map');
+    var P = window.CivRegionPicker;
+    if (!map || !P || !P.worldPointAt) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // 我们把 pointerup 吃掉了,app.js 的 drag 状态会残留(不按键移动鼠标也会平移地图);补发 pointercancel 清掉
+    try { map.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, pointerId: e.pointerId })); } catch (_) {}
+    var rect = map.getBoundingClientRect();
+    var wp = P.worldPointAt(e.clientX - rect.left, e.clientY - rect.top);
+    if (!wp) { toastMsg('这个位置点不到地图,换个地方', true); return; }
+    newAt = { x: wp.x, y: wp.y };
+    setPlaceMode(false);
+    previewCreateNation();
+  }
+
+  function clearPlacePreview() {
+    previewIds = [];
+    if (window.CivRegionPicker) {
+      if (window.CivRegionPicker.previewRegions) window.CivRegionPicker.previewRegions([]);
+      if (window.CivRegionPicker.setHover) window.CivRegionPicker.setHover(null);
+    }
+  }
+
+  /** 落点预览:调只读接口,拿预计州数/首都并多州高亮;失败时清预览并提示。 */
+  function previewCreateNation() {
+    if (!cfg || !newAt) return Promise.resolve(null);
+    var size = Math.max(3, Math.min(40, Number(el('startNewSize').value) || 8));
+    return apiCall('/api/start/preview-nation', {
+      sessionId: cfg.sessionId,
+      at: { x: newAt.x, y: newAt.y },
+      size: size,
+      allowExclaves: allowExclaves
+    }).then(function (data) {
+      if (!data || !data.ok) return null;
+      previewIds = Array.isArray(data.regionIds) ? data.regionIds.slice() : [];
+      if (window.CivRegionPicker) {
+        if (window.CivRegionPicker.previewRegions) window.CivRegionPicker.previewRegions(previewIds);
+        if (window.CivRegionPicker.setHover) window.CivRegionPicker.setHover(null);
+      }
       renderCreateDefaults();
-      toastMsg('落点已选');
-      if (typeof externalPick === 'function') externalPick(newAt);
+      return data;
+    }).catch(function (err) {
+      var msg = err && err.message ? err.message : String(err);
+      clearPlacePreview();
+      newAt = null;
+      renderCreateDefaults();
+      toastMsg(msg, true);
+      return null;
     });
+  }
+
+  // ── 还没有城市的年份(P1.6):只提示+禁用编辑,保留完成/关闭 ────────────────
+  function renderNoCities() {
+    var box = $('startNoCities');
+    if (!box) return;
+    var noCities = !!setupInfo && setupInfo.hasCities === false;
+    box.hidden = !noCities;
+    if (noCities) {
+      var year = setupInfo && typeof setupInfo.year === 'number' ? Math.floor(setupInfo.year) : null;
+      var hint = setupInfo && typeof setupInfo.hintCityYear === 'number' ? setupInfo.hintCityYear : 2500;
+      el('startNoCitiesMsg').textContent = '第 ' + (year == null ? '?' : year) +
+        ' 年世界还没有城市(尚未进入建国阶段),不能新建或调整国家。\n把起始年改成 ' + hint +
+        ' 左右(默认 ' + hint + ' 年)再点「开始会话」,会重新开始这个世界的会话。';
+    }
+  }
+
+  function gotoStartYear() {
+    close();
+    var btn = document.getElementById('btnParams');
+    if (btn) btn.click();
+    window.setTimeout(function () {
+      var year = document.getElementById('startYear');
+      if (year) { try { year.focus(); year.select(); } catch (_) {} }
+      toastMsg('把起始年改成 2500 后点「开始会话」会重新开始本世界的会话');
+    }, 200);
   }
 
   function fetchAutoName() {
@@ -998,6 +1174,9 @@
         }
       });
     }).catch(function (err) {
+      // 失败后清掉落点 hover/预览,避免地图残留色块
+      setPlaceMode(false);
+      clearPlacePreview();
       if (err && err.needConfirm && Array.isArray(err.needConfirm)) {
         var msg = err.needConfirm.map(function (c) { return c.message || ''; }).join('\n');
         confirmAction = function () {
@@ -1028,6 +1207,10 @@
     nations = [];
     selectedPid = null;
     newAt = null;
+    previewIds = [];
+    placeDown = null;
+    setPlaceMode(false);
+    clearPlacePreview();
     allowExclaves = false;
     regionSel = [];
     regionPickerOn = false;
@@ -1079,6 +1262,8 @@
 
   function close() {
     if (applyTimer) { window.clearTimeout(applyTimer); applyTimer = 0; }
+    setPlaceMode(false);
+    clearPlacePreview();
     if (regionPickerOn) closeRegionPicker(false);
     if (window.CivRegionPicker && window.CivRegionPicker.clearPreview) window.CivRegionPicker.clearPreview();
     regionPickerOn = false;

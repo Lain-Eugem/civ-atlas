@@ -44,7 +44,7 @@ import {
   type Session,
 } from './engine';
 import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, monarchPanels, setMonarchCard, verifySession } from './monarch';
-import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, autoNationName, inferCardFromBiography, type StartSetupInput } from './monarch-start';
+import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, autoNationName, inferCardFromBiography, hasUsableCities, noCitiesMessage, previewNationAt, type StartSetupInput } from './monarch-start';
 import { CARD_LIFESPAN_DEFAULT } from '../src/gen/civ/monarchCard';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
@@ -1498,11 +1498,42 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       return true;
     }
 
+    // 落点预览:只算不改状态(P1.6 落点 hover/无城市引导用;无城市年份返回 409 NO_CITIES)
+    if (pathname === '/api/start/preview-nation') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const atRaw = args.at as Record<string, unknown> | undefined;
+      const input: { at?: { x: number; y: number }; size?: number; allowExclaves?: boolean } = {};
+      if (atRaw && typeof atRaw === 'object' && Number.isFinite(Number(atRaw.x)) && Number.isFinite(Number(atRaw.y))) {
+        input.at = { x: Number(atRaw.x), y: Number(atRaw.y) };
+      }
+      if (args.size !== undefined && args.size !== null && args.size !== '') input.size = num(args, 'size', 8);
+      if (args.allowExclaves === true) input.allowExclaves = true;
+      try {
+        sendJson(res, 200, previewNationAt(s, input));
+      } catch (e) {
+        const err = e as Error & { code?: string };
+        if (err.code === 'NO_CITIES') {
+          sendJson(res, 409, { code: 'NO_CITIES', error: err.message });
+        } else {
+          fail(res, 400, err.message);
+        }
+      }
+      return true;
+    }
+
     // 开局国家设置:数量 / 控制方式 / 增删国家(只允许第一回合前,每个会话一次)
     if (pathname === '/api/session/start-setup') {
       const sid = String(args.sessionId ?? '');
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
+      const setupYear = Math.floor(s.play.year);
+      // P1.6:年份太早(如第 1 年)城市还没建立,明确 409 提示,避免前端只看到"点了没反应"
+      if (!hasUsableCities(s, setupYear)) {
+        sendJson(res, 409, { code: 'NO_CITIES', error: noCitiesMessage(s, setupYear) });
+        return true;
+      }
       const setup: Record<string, unknown> = {};
       if (args.count !== undefined && args.count !== null && args.count !== '') setup.count = num(args, 'count', 0);
       if (args.remove !== undefined) setup.remove = args.remove;
@@ -1540,6 +1571,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const sid = String(args.sessionId ?? '');
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
+      const customYear = Math.floor(s.play.year);
+      // P1.6:无城市年份明确 409,而不是让 applyCustomStart 抛 500
+      if (!hasUsableCities(s, customYear)) {
+        sendJson(res, 409, { code: 'NO_CITIES', error: noCitiesMessage(s, customYear) });
+        return true;
+      }
       const atRaw = args.at as Record<string, unknown> | undefined;
       const input: Record<string, unknown> = {};
       if (args.polityId !== undefined && args.polityId !== null && args.polityId !== '') input.polityId = Number(args.polityId);

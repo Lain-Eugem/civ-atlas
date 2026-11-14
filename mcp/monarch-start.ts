@@ -147,6 +147,12 @@ export function applyCustomStart(s: Session, input: CustomStartInput = {}): Cust
     throw new Error(`开局定制只能在第一回合前(还没推演)做,当前已经跑了 ${s.rounds} 回合`);
   }
   if (isFinished(s)) throw new Error('这一局已经结束,不能再定制开局');
+  if (!hasUsableCities(s, year)) {
+    // P1.6:第 1 年这种还没有城的年份不能新建/改国家,统一抛带 code 的错误供路由返回 409
+    const err = new Error(noCitiesMessage(s, year)) as Error & { code?: string };
+    err.code = 'NO_CITIES';
+    throw err;
+  }
   if (input.at && (typeof input.at.x !== 'number' || !Number.isFinite(input.at.x) || typeof input.at.y !== 'number' || !Number.isFinite(input.at.y))) {
     throw new Error('at 需要 { x, y } 两个有限数字(世界像素坐标)');
   }
@@ -1346,6 +1352,113 @@ export function canSetupStart(s: Session): boolean {
   return s.rounds === 0 && !isFinished(s);
 }
 
+/** 建议的「世界上有城市」起始年(给无城市年份的引导文案用,不精确计算) */
+export const HINT_CITY_YEAR = 2500;
+
+/**
+ * 这个起始年的世界里有没有「能当国都的城」。
+ * 不看 polities:第 1 年这类年份城市还没建立, settlements 里可能只有未 founded 的城。
+ */
+export function hasUsableCities(s: Session, year: number = startYearOf(s)): boolean {
+  return s.civ.settlements.some((st) => st.cell >= 0 && st.founded <= year && (st.ended === undefined || st.ended > year));
+}
+
+/** 这个起始年有没有在世的国(面板文案/判断用,不影响 hasCities) */
+export function hasUsablePolities(s: Session, year: number = startYearOf(s)): boolean {
+  return alivePolities(s.civ, year, sizesNow(s.civ)).length > 0;
+}
+
+/** 无城市年份的统一提示(路由层 turn 成 409 code:'NO_CITIES') */
+export function noCitiesMessage(s: Session, year: number = startYearOf(s)): string {
+  return `第 ${year} 年世界还没有城市（尚未进入建国阶段），不能新建或调整国家。`;
+}
+
+/** 落点预览结果(只读,不写 session) */
+export interface PreviewNationInput {
+  at?: { x: number; y: number };
+  size?: number;
+  allowExclaves?: boolean;
+}
+
+export interface PreviewNationResult {
+  ok: true;
+  regionIds: number[];
+  regions: number;
+  capital: { x: number; y: number } | null;
+  capitalName: string | null;
+  warnings: string[];
+}
+
+/** 预览用的浅拷贝会话:createNewNation 里的副作用全部落在副本上,真实 civ/session 不动 */
+function forkSessionForPreview(s: Session): Session {
+  const cfg = s.monarch ? s.monarch.config : null;
+  return {
+    ...s,
+    civ: {
+      ...s.civ,
+      polity: s.civ.polity.slice(),
+      polities: s.civ.polities.map((p) => ({ ...p })),
+      settlements: s.civ.settlements.map((st) => ({ ...st })),
+    },
+    cards: s.cards ? new Map(s.cards) : undefined,
+    memory: s.memory ? new Map(s.memory) : undefined,
+    // intel 是两层 Record,预览里 endNation 可能删内层键,深浅各拷一层避免污染真实会话
+    intel: s.intel
+      ? (Object.fromEntries(
+          Object.entries(s.intel).map(([k, v]) => [k, { ...v }]),
+        ) as Record<string, Record<string, import('../src/gen/civ/monarchIntel').IntelKnowledge>>)
+      : undefined,
+    nationControl: new Map(s.nationControl),
+    customStart: s.customStart ? { ...s.customStart } : undefined,
+    monarch: s.monarch
+      ? {
+          ...s.monarch,
+          config: cfg
+            ? { ...cfg, polities: Array.isArray(cfg.polities) ? [...cfg.polities] : cfg.polities }
+            : cfg,
+        }
+      : undefined,
+  } as Session;
+}
+
+/**
+ * 落点预览:按「落点 + 州数」算出会新建到哪些州 / 国都在哪,只读不落库。
+ * 实现方式是把 createNewNation 跑在一份会话浅拷贝上,保证预览与真正创建完全一致
+ * (取州顺序 / 从哪国手里拿地 / 国都挑选都走同一套代码)。
+ * 无城市年份抛带 code='NO_CITIES' 的错误,供路由返回 409。
+ */
+export function previewNationAt(s: Session, input: PreviewNationInput = {}): PreviewNationResult {
+  const year = startYearOf(s);
+  if (s.rounds !== 0) throw new Error(`开局预览只能在第一回合前(还没推演)做,当前已经跑了 ${s.rounds} 回合`);
+  if (isFinished(s)) throw new Error('这一局已经结束,不能再预览开局国家');
+  if (input.at) {
+    const { x, y } = input.at;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('落点坐标要是数字(x/y)');
+  }
+  if (!hasUsableCities(s, year)) {
+    const err = new Error(noCitiesMessage(s, year)) as Error & { code?: string };
+    err.code = 'NO_CITIES';
+    throw err;
+  }
+  const warnings: string[] = [];
+  const fork = forkSessionForPreview(s);
+  const newId = createNewNation(fork, { at: input.at, size: input.size }, year, warnings);
+  const regionIds: number[] = [];
+  for (let r = 0; r < fork.civ.regions.count; r++) if (fork.civ.polity[r] === newId) regionIds.push(r);
+  const p = fork.civ.polities[newId] as Polity | undefined;
+  let capital: { x: number; y: number } | null = null;
+  let capitalName: string | null = null;
+  if (p) {
+    const st = fork.civ.settlements[p.capital] as Settlement | undefined;
+    if (st && st.cell >= 0) {
+      capital = pointOf(s, st.cell);
+      capitalName = st.name || null;
+    }
+  }
+  if (input.size !== undefined && warnings.length === 0) warnings.push('预览:国土按落点周围可拿的地扩到目标州数');
+  return { ok: true, regionIds, regions: regionIds.length, capital, capitalName, warnings };
+}
+
 /** 开局面板需要的名单与状态(GET /api/start/config 用) */
 export function startConfigStatus(s: Session): Record<string, unknown> {
   const year = startYearOf(s);
@@ -1362,6 +1475,9 @@ export function startConfigStatus(s: Session): Record<string, unknown> {
     startYear: s.startYear,
     rounds: s.rounds,
     canSetup: canSetupStart(s),
+    hasCities: hasUsableCities(s, year),
+    hasPolities: hasUsablePolities(s, year),
+    hintCityYear: HINT_CITY_YEAR,
     applied: s.startSetup ? cloneSetupState(s.startSetup) : null,
     pending: s.pendingStartSetup ?? null,
     count: nations.length,
@@ -1385,6 +1501,12 @@ export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSet
   const year = startYearOf(s);
   if (s.rounds !== 0) throw new Error(`开局国家设置只能在第一回合前(还没推演)做,当前已经跑了 ${s.rounds} 回合`);
   if (isFinished(s)) throw new Error('这一局已经结束,不能再改开局国家');
+  if (!hasUsableCities(s, year)) {
+    // P1.6:无城市年份统一拒绝(路由层再翻成 409 NO_CITIES,这里兜底防其他入口绕过)
+    const err = new Error(noCitiesMessage(s, year)) as Error & { code?: string };
+    err.code = 'NO_CITIES';
+    throw err;
+  }
   if (s.startSetup && !setupIn) throw new Error('这次没有新的开局设置可应用');
   const setup = setupIn ?? s.pendingStartSetup ?? {};
   if (!setup || typeof setup !== 'object' || Array.isArray(setup)) {

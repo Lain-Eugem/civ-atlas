@@ -29,16 +29,25 @@
   var CANVAS_ID = 'regionPickerLayer';
   var WATER = 0xffff;
 
-  /** 国家高亮色(暖橙) / 已选州(青) */
+  /** 国家高亮色(暖橙) / 已选州(青) / 落点预览(浅蓝) / hover(淡蓝) */
   var HL_FILL = [255, 168, 48, 104];
   var HL_EDGE = [196, 96, 0, 230];
   var SEL_FILL = [40, 196, 236, 150];
   var SEL_EDGE = [0, 120, 168, 235];
+  var PREVIEW_FILL = [70, 168, 255, 110];
+  var PREVIEW_EDGE = [24, 110, 214, 220];
+  var HOVER_FILL = [120, 208, 255, 140];
+  var HOVER_EDGE = [20, 132, 220, 240];
 
   var st = {
     active: false,
     /** 只做高亮预览(不接管指针、不进入选州模式):当前高亮的国家编号 */
     previewPid: null,
+    /** 落点预览的州(多州浅蓝,只算不选) */
+    previewRegions: [],
+    previewRegionsSet: {},
+    /** 鼠标所在州(单州淡蓝 hover) */
+    hoverRegion: null,
     nations: [],
     api: null,
     sessionId: '',
@@ -125,8 +134,23 @@
       .catch(function () { return false; });
   }
 
+  /** 提前配置 api/session/nations,供不 open() 的预览/hover 路径(P1.6 落点模式)加载 atlas。 */
+  function configure(opts) {
+    if (!opts || typeof opts !== 'object') return;
+    if (typeof opts.api === 'function') st.api = opts.api;
+    if (opts.sessionId) st.sessionId = opts.sessionId;
+    if (Array.isArray(opts.nations)) st.nations = opts.nations.slice();
+  }
+
+  /** 暴露 atlas 预热,供 start-custom 进入落点模式时调用。 */
+  function ensure() {
+    return ensureAtlas();
+  }
+
   function classOf(region, selSet, hlPid, owner) {
     if (selSet[region]) return 1;
+    if (st.previewRegionsSet[region]) return 3;
+    if (st.hoverRegion === region) return 4;
     if (hlPid != null && owner && owner[region] === hlPid) return 2;
     return 0;
   }
@@ -139,7 +163,7 @@
     var owner = snap.owner;
     var selSet = {};
     for (var s = 0; s < st.sel.length; s++) selSet[st.sel[s]] = true;
-    var key = w + 'x' + h + '|' + st.hlPid + '|' + st.sel.join(',');
+    var key = w + 'x' + h + '|' + st.hlPid + '|' + st.sel.join(',') + '|' + st.previewRegions.join(',') + '|' + st.hoverRegion;
     if (st.off && st.offKey === key) return st.off;
 
     var cv = document.createElement('canvas');
@@ -164,7 +188,9 @@
         else if (classOf(cells[y * w + right], selSet, st.hlPid, owner) !== cls) edge = true;
         else if (y > 0 && classOf(cells[i - w], selSet, st.hlPid, owner) !== cls) edge = true;
         else if (y < h - 1 && classOf(cells[i + w], selSet, st.hlPid, owner) !== cls) edge = true;
-        var src = edge ? (cls === 1 ? SEL_EDGE : HL_EDGE) : (cls === 1 ? SEL_FILL : HL_FILL);
+        var src = edge
+          ? (cls === 1 ? SEL_EDGE : cls === 3 ? PREVIEW_EDGE : cls === 4 ? HOVER_EDGE : HL_EDGE)
+          : (cls === 1 ? SEL_FILL : cls === 3 ? PREVIEW_FILL : cls === 4 ? HOVER_FILL : HL_FILL);
         var o = i * 4;
         data[o] = src[0];
         data[o + 1] = src[1];
@@ -222,8 +248,16 @@
   }
 
   // ── 绘制 ──────────────────────────────────────────────────────────────────
+  function hasLayer() {
+    return st.hlPid != null || st.sel.length > 0 || st.hoverRegion != null || st.previewRegions.length > 0;
+  }
+
+  function ensureTick() {
+    if (!st.raf) tick();
+  }
+
   function draw() {
-    if (!st.active && st.previewPid == null) return;
+    if (!st.active && st.previewPid == null && !hasLayer()) return;
     var view = civMap() && civMap().view ? civMap().view() : null;
     var cv = st.canvas;
     var ctx = st.ctx;
@@ -239,7 +273,7 @@
     ctx.setTransform(st.dpr, 0, 0, st.dpr, 0, 0);
     ctx.clearRect(0, 0, cv.width / st.dpr, cv.height / st.dpr);
 
-    if (st.hlPid == null && st.sel.length === 0) return;
+    if (!hasLayer()) return;
     var snap = atlasSnapshot();
     if (!snap) return;
     var off = buildOffscreen(snap);
@@ -278,7 +312,7 @@
   }
 
   function tick() {
-    if (!st.active && st.previewPid == null) {
+    if (!st.active && st.previewPid == null && !hasLayer()) {
       st.raf = 0;
       if (!st.active) hideCanvas();
       return;
@@ -367,6 +401,18 @@
     } catch (_) { /* 没有 PointerEvent 的旧浏览器忽略 */ }
   }
 
+  var hoverMoveAt = 0;
+  function onPointerMove(e) {
+    if (!st.active) return;
+    var now = Date.now();
+    if (now - hoverMoveAt < 90) return; // 节流,避免每帧查 atlas
+    hoverMoveAt = now;
+    var r = regionAt(e.clientX, e.clientY);
+    if (r === st.hoverRegion) return;
+    st.hoverRegion = r;
+    ensureTick();
+  }
+
   function onKeyDown(e) {
     if (!st.active) return;
     if (e.key === 'Escape') {
@@ -381,6 +427,7 @@
     if (!m || m.__regionPickerBound) return;
     m.addEventListener('pointerdown', onPointerDown, true);
     m.addEventListener('pointerup', onPointerUp, true);
+    m.addEventListener('pointermove', onPointerMove, true);
     document.addEventListener('keydown', onKeyDown, true);
     m.__regionPickerBound = true;
   }
@@ -390,6 +437,7 @@
     if (m) {
       m.removeEventListener('pointerdown', onPointerDown, true);
       m.removeEventListener('pointerup', onPointerUp, true);
+      m.removeEventListener('pointermove', onPointerMove, true);
     }
     document.removeEventListener('keydown', onKeyDown, true);
   }
@@ -404,6 +452,9 @@
     st.api = typeof opts.api === 'function' ? opts.api : null;
     st.sessionId = opts.sessionId || '';
     st.previewPid = null;
+    st.hoverRegion = null;
+    st.previewRegions = [];
+    st.previewRegionsSet = {};
     st.hlPid = typeof opts.initialPolityId === 'number' ? opts.initialPolityId : null;
     st.sel = [];
     if (Array.isArray(opts.initialSelection)) {
@@ -435,11 +486,24 @@
     if (st.raf) { window.cancelAnimationFrame(st.raf); st.raf = 0; }
     st.down = null;
     unbind();
-    hideCanvas();
     var m = mapEl();
     if (m) m.style.cursor = st.cursorBefore || '';
-    st.hlPid = null;
+    st.hoverRegion = null;
+    st.previewRegions = [];
+    st.previewRegionsSet = {};
     st.sel = [];
+    // 退出选疆域后,如果面板还在高亮某个国家(P1.5 的 preview),把国家高亮继续画出来
+    if (st.previewPid != null) {
+      st.hlPid = st.previewPid;
+      if (ensureCanvas()) {
+        ensureAtlas().then(function () {
+          if (!st.active && st.previewPid != null) ensureTick();
+        });
+      }
+    } else {
+      st.hlPid = null;
+      hideCanvas();
+    }
     var cb = st.onExit;
     st.onExit = null;
     st.onSelection = null;
@@ -476,6 +540,63 @@
     return st.active;
   }
 
+  /** 客户端像素 → 折叠后的世界像素坐标(落点 at 用,与 app.js mapPointAt 同一套折返规则) */
+  function worldPointAt(clientX, clientY) {
+    var p = mapPointAt(clientX, clientY);
+    if (!p) return null;
+    return { x: p.mx, y: p.my };
+  }
+
+  /** 客户端像素 → 州号(P1.6 落点 hover 用;不接管指针) */
+  function regionAtClient(clientX, clientY) {
+    return regionAt(clientX, clientY);
+  }
+
+  /**
+   * 单州淡蓝 hover(不接管指针、不进入选州模式)。传 null 清掉。
+   * 首次调用会补建覆盖画布/补拉 atlas;之后每帧跟着相机重画。
+   */
+  function setHover(regionId) {
+    var id = typeof regionId === 'number' && isFinite(regionId) && regionId >= 0 ? regionId : null;
+    if (st.hoverRegion === id) return;
+    st.hoverRegion = id;
+    if (!hasLayer() && !st.active && st.previewPid == null) {
+      if (st.raf) { window.cancelAnimationFrame(st.raf); st.raf = 0; }
+      hideCanvas();
+      return;
+    }
+    if (!ensureCanvas()) return;
+    ensureAtlas().then(function () {
+      if (!st.active && st.previewPid == null && !hasLayer()) return;
+      ensureTick();
+    });
+  }
+
+  /** 落点预览:多州浅蓝高亮(只算不选);传空数组/null 清掉。 */
+  function previewRegions(ids) {
+    var next = [];
+    if (Array.isArray(ids)) {
+      for (var i = 0; i < ids.length; i++) {
+        var r = ids[i];
+        if (typeof r === 'number' && isFinite(r) && r >= 0 && next.indexOf(r) < 0) next.push(r);
+      }
+    }
+    next.sort(function (a, b) { return a - b; });
+    st.previewRegions = next;
+    st.previewRegionsSet = {};
+    for (var j = 0; j < next.length; j++) st.previewRegionsSet[next[j]] = true;
+    if (!hasLayer() && !st.active && st.previewPid == null) {
+      if (st.raf) { window.cancelAnimationFrame(st.raf); st.raf = 0; }
+      hideCanvas();
+      return;
+    }
+    if (!ensureCanvas()) return;
+    ensureAtlas().then(function () {
+      if (!st.active && st.previewPid == null && !hasLayer()) return;
+      ensureTick();
+    });
+  }
+
   /**
    * 只做高亮预览(P1.5 名单行点击):暖橙高亮一个国家,不接管地图指针、不进入选州模式。
    * 地图仍然可以拖动/缩放,覆盖层每帧跟着重画。opts 可补 api/sessionId/nations(供首次补拉 atlas)。
@@ -500,6 +621,9 @@
 
   function clearPreview() {
     st.previewPid = null;
+    st.hoverRegion = null;
+    st.previewRegions = [];
+    st.previewRegionsSet = {};
     if (st.active) return;
     if (st.raf) { window.cancelAnimationFrame(st.raf); st.raf = 0; }
     st.hlPid = null;
@@ -508,7 +632,16 @@
 
   /** 调试/测试用:内部状态快照(不参与正常流程) */
   function debugState() {
-    return { active: st.active, previewPid: st.previewPid, hlPid: st.hlPid, sel: st.sel.slice(), down: st.down, nations: st.nations.length };
+    return {
+      active: st.active,
+      previewPid: st.previewPid,
+      hoverRegion: st.hoverRegion,
+      previewRegions: st.previewRegions.slice(),
+      hlPid: st.hlPid,
+      sel: st.sel.slice(),
+      down: st.down,
+      nations: st.nations.length,
+    };
   }
 
   var API = {
@@ -519,6 +652,12 @@
     highlightPolity: highlightPolity,
     preview: preview,
     clearPreview: clearPreview,
+    configure: configure,
+    ensure: ensure,
+    setHover: setHover,
+    previewRegions: previewRegions,
+    worldPointAt: worldPointAt,
+    regionAtClient: regionAtClient,
     isActive: isActive,
     debugState: debugState,
   };
