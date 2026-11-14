@@ -57,6 +57,17 @@ const RIVER_WIDTH_POWER = 0.65;
 const RIVER_NET_TOL = 0.02;
 /** 带小溪那份河网的容差:溪多(约 4.7 万点),放到 0.03(1200% 时约 0.4 屏幕像素)压一压体积 */
 const RIVER_NET_TOL_CREEK = 0.03;
+/** 细沟描线:和主站 realistic 的可见性曲线用同一套常数(VEIN_C / VEIN_E,见 render/realistic.ts) */
+const VEIN_A0 = 8;
+const VEIN_A1 = 800;
+const VEIN_C0 = 0.3;
+const VEIN_C1 = 0.85;
+const VEIN_E0 = 700;
+const VEIN_E1 = 1500;
+/** 整条线最强处低于这个强度就不画(主站底图上几乎看不出来) */
+const VEIN_MIN_STRENGTH = 0.06;
+/** 细沟折线抽稀容差(世界单位):细沟是极淡的影子,0.3 的弦高误差看不出来 */
+const VEIN_RDP_TOL = 0.3;
 
 interface TerrainCtx {
   /** 1 倍整张主图:放大现算要用的海冰 / 细沟 / 大尺度晕渲都从它取 */
@@ -88,6 +99,18 @@ export interface RiverNetLine {
 }
 
 /** 送到浏览器用 Canvas 画的矢量层。坐标都是 1 倍整张主图的像素(0..2048, 0..1024)。 */
+/**
+ * 细沟描线(卫星画风专用):扁平三元组 [x, y, s] 连成的一条线,
+ * s = 0–1 的可见强度(集水面积对数插值 × 海拔淡出,与主站底图明暗同一套曲线)。
+ */
+export interface VeinLine {
+  p: number[];
+}
+
+/** 细沟层:每世界算一次,由 GET /api/map/veins 单独下发(只在卫星画风高倍时用) */
+export interface VeinOverlay {
+  lines: VeinLine[];
+}
 export interface VectorData {
   /** 海岸线,每条 [x0,y0,x1,y1,…] */
   coast: number[][];
@@ -142,6 +165,8 @@ export interface VectorData {
 
 /** 每个世界只准备一次;WeakMap 保证世界被丢掉时这些大数组也能回收 */
 const contexts = new WeakMap<World, TerrainCtx>();
+/** 细沟层缓存(每世界一次;1 倍栅格带 gully 约 2.5s,世界丢掉时一起回收) */
+const veinOverlays = new WeakMap<World, VeinOverlay>();
 
 function ctxOf(world: World): TerrainCtx {
   const hit = contexts.get(world);
@@ -262,6 +287,7 @@ function iceInkRuns(r: Raster): Float32Array[] {
 }
 
 const round2 = (v: number): number => Math.round(v * 100) / 100;
+const round1 = (v: number): number => Math.round(v * 10) / 10;
 
 /**
  * RDP 折线抽稀:返回保留下来的点索引(首尾一定保留)。用下标而不是坐标,是为了 f / m 能按同一套
@@ -435,6 +461,71 @@ function pushRiverNet(out: RiverNetLine[], run: RiverNetLine, tol: number): void
 }
 
 /** 生成矢量层:海岸线、近岸波纹、地形符号、冰缘墨线、河流、河网、林块。墨线类都抽稀过,总量约 2.6 MB 级。 */
+/** 可见度曲线的 smoothstep(和主站 util 的 smoothstep 同义) */
+function veinSmooth(a: number, b: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * 逐像素汇流细沟(vein)的描线数据,只给卫星画风用(realistic MATERIALS.detail 的 veinK = 0.6)。
+ *
+ * 为什么需要它:卫星底图上"一条条沟"是 raster 的细沟明暗(逐像素汇流),而河 / 溪矢量线来自
+ * 地块级的流量门槛 —— 两者不同源、不同门槛,所以底图上有大量"看得出是沟、却没有河线"的地方。
+ * 这里按主站同一套可见性曲线(集水面积对数插值 × 海拔淡出)把细沟算成折线 + 强度,
+ * 前端高倍时用极淡的线描一遍,做到"底图看到什么就有什么线"。
+ *
+ * 卫星画风打开时按需拉取,每个世界算一次(1 倍栅格带 gully ≈ 2.5s),WeakMap 缓存。
+ */
+export function renderVeinOverlay(world: World): VeinOverlay {
+  const hit = veinOverlays.get(world);
+  if (hit) return hit;
+  const r = rasterize(world, 1, true);
+  const lines: VeinLine[] = [];
+  const vl = r.veinLines;
+  if (vl) {
+    const W = r.w;
+    const H = r.h;
+    const elev = r.elev;
+    const L0 = Math.log(VEIN_A0);
+    const L1 = Math.log(VEIN_A1);
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const ss: number[] = [];
+    for (let i = 0; i + 1 < vl.off.length; i++) {
+      const a0 = vl.off[i]!;
+      const a1 = vl.off[i + 1]!;
+      if (a1 - a0 < 2) continue;
+      xs.length = 0;
+      ys.length = 0;
+      ss.length = 0;
+      let best = 0;
+      for (let j = a0; j < a1; j++) {
+        const px = vl.x[j]!;
+        const py = vl.y[j]!;
+        const wxn = ((Math.round(px) % W) + W) % W;
+        const wy = Math.min(H - 1, Math.max(0, Math.round(py)));
+        const vn = (Math.log(Math.max(1, vl.a[j]!)) - L0) / (L1 - L0);
+        const fade = 1 - veinSmooth(VEIN_E0, VEIN_E1, elev[wy * W + wxn]!);
+        const st = veinSmooth(VEIN_C0, VEIN_C1, vn) * fade;
+        if (st > best) best = st;
+        xs.push(px);
+        ys.push(py);
+        ss.push(st);
+      }
+      if (best < VEIN_MIN_STRENGTH) continue;
+      const keep = rdpKeep(xs, ys, VEIN_RDP_TOL);
+      const p: number[] = [];
+      for (const k of keep) p.push(round1(xs[k]!), round1(ys[k]!), round2(ss[k]!));
+      if (p.length >= 6) lines.push({ p });
+    }
+  }
+  const out: VeinOverlay = { lines };
+  veinOverlays.set(world, out);
+  return out;
+}
+
+
 export function renderVectors(world: World): VectorData {
   const ctx = ctxOf(world);
   if (ctx.vectors) return ctx.vectors;

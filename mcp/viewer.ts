@@ -57,7 +57,7 @@ import {
   type FieldStyle,
 } from './field-render';
 import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf, parseMagicColors } from './magic-render';
-import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
+import { isTerrainStyle, renderTile, renderVectors, renderVeinOverlay, renderWhole, type TerrainStyle } from './terrain';
 import { renderOwnerPixels, ownerCivData, renderOwnerTilePixels } from './owner-map';
 import { buildLabels } from './labels';
 import { disposeMapPools, renderViaPool } from './map-pool';
@@ -592,6 +592,7 @@ const magicTilePngs = new Map<string, Buffer>();
 const ownerTilePngs = new Map<string, Buffer>();
 /** 标签层缓存:键 = sessionId|年份(世界 / 文明状态不变时只生成一次) */
 const labelsCache = new Map<string, string>();
+const veinCache = new Map<string, string>();
 
 /** 会话状态变了:整张疆域图和它的疆域瓦片都作废(瓦片按 session 前缀清) */
 function invalidateOwnerCache(sid: string): void {
@@ -958,6 +959,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const rec = getWorldRecord(worldId);
       json = JSON.stringify(renderVectors(rec.world));
       vectorCache.set(worldId, json);
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
+    return true;
+  }
+
+  // 细沟描线(卫星画风高倍用):底图上的沟影来自 raster 的逐像素汇流明暗,和河网不是同一套数据,
+  // 所以单独下发一份折线 + 强度;只在卫星画风打开时按需拉,每世界算一次(约 2.5s)。
+  if (method === 'GET' && pathname === '/api/map/veins') {
+    const worldId = url.searchParams.get('worldId') ?? '';
+    if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
+    let json = veinCache.get(worldId);
+    if (!json) {
+      const rec = getWorldRecord(worldId);
+      json = JSON.stringify(renderVeinOverlay(rec.world));
+      veinCache.set(worldId, json);
     }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(json);

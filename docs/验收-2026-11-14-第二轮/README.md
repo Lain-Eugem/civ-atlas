@@ -47,3 +47,21 @@
 4. 标签层河名只有 6 条(上游 findPlaces 有干流长度门槛);湖名/内海名来自 `civ.places.kind='lake'/'sea'`,world 本身没有 lakes 字段。
 5. 标签字号分级用 `relK`(缩放倍数)近似主站 `view.k`,未逐档与主站比对。
 6. 疆域瓦片冷块首屏 0.1–2.8 s(worker 冷启动),缓存后 2–35 ms。
+
+## 2026-11-14 补丁：卫星画风的细沟（vein）描线
+
+需求（用户 m02632）：卫星底图上能看出的沟，就要有对应的线——"所见即所画"。
+
+**为什么底图有沟、却没有河线**：底图的沟影来自 `src/gen/pixelDrain.ts` 的逐像素汇流细沟（`Raster.vein` + `veinLines`，材质 `realistic.ts MATERIALS.detail.veinK=0.6`），而河/溪矢量线来自地块级的 flux 门槛（`world.riverThreshold`=8.92、creeks 门槛 1.78）。实测 1 倍世界：陆地像素 798,707 里有细沟的 249,380（31%），其中距离河/溪矢量线 >3px 的占 61.9%，这些细沟像素所属地块 96% 的 flux < 1.78（连小溪门槛都不到）——两套数据不同源、不同门槛，所以"底图有沟、无河线"是正常现象。主站原版也是同一套流水线。
+
+**做法**：
+- 服务端 `mcp/terrain.ts` 新增 `renderVeinOverlay(world)`：`rasterize(world,1,true)`（带 gully，约 2.5s，每世界缓存）→ 按主站同一套可见性曲线 `vn=(log(a)-log(VEIN_A0))/(log(VEIN_A1)-log(VEIN_A0))`、`fade=1-smoothstep(VEIN_E0,VEIN_E1,elev)`、`st=smoothstep(VEIN_C0,VEIN_C1,vn)*fade` 逐点算强度 → 丢掉整条最强处 <0.06 的线 → RDP tol 0.3 抽稀 + 坐标 1 位/强度 2 位；输出 `VeinOverlay{lines:[{p:[x,y,s,…]}]}`。
+- 服务端 `mcp/viewer.ts` 新增 `GET /api/map/veins?worldId=`（`veinCache` 按世界缓存）。
+- 前端 `mcp/viewer/vec-draw.js` 新增 `drawVeinLines()`：仅 `style==='satellite' && relK>=2.5`；按强度分桶，两遍画（宽淡谷影 + 窄沟心），`globalCompositeOperation='multiply'` 压暗底图（和底图的"阴影"观感同一种）；跨 180° 按 bbox 复制、odd 层 y 镜像、视口外裁剪。
+- 前端 `mcp/viewer/app.js`：`S.veins`，切到卫星画风 / 建世界时 `loadVeins()` 拉一次，`draw()` 里河网之后调用。
+
+**数字**（seed=7/cells=34043）：`/api/map/veins` = **365,743 B**、4,061 条线 / 20,749 点；首次 2.66s（1 倍栅格带 gully），进程内缓存 8ms。只在卫星画风高倍时请求，其它画风不拉。
+
+**验收**：`snaps/vein/` 同视角关/开对比（`cmp-944-v6.png`、`cmp-1200-v6.png`）——底图上可见的沟都补上了极淡的细线，未出现大片凭空多出来的线；944%/1200% 均无 console 报错；root `tsc --noEmit` 0 错、`selftest` 31/31。
+
+**已知限制**：只做卫星画风（geo/classic/blank 的 `veinK=0`，底图本来没画沟）；`relK<2.5` 不画（低倍时沟本身只有 1px 上下，强行画会糊成一片）；没有开关，若觉得多余可以先去掉 `app.js` 里那段调用。

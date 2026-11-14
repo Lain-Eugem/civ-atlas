@@ -51,6 +51,9 @@
     lod: 0,
     vec: null,
     vecWorldId: null,
+    // 卫星画风的细沟描线(高倍时补一层极淡的沟影线):只在切到 satellite 时按需拉
+    veins: null,
+    veinsWorldId: null,
     sel: null,
     grid: null,
     colors: {},
@@ -595,6 +598,13 @@
     drawOwnerTiles();
     // 墨线 / 波纹 / 符号是矢量,按固定屏幕线宽画在最上层,放大多少倍都不变粗
     drawVectorsCached();
+    // 卫星画风:底图上的细沟(沟影)在高倍时也描成极淡的线,做到"底图看到什么就有什么线"
+    if (S.veins && S.style === 'satellite' && window.CivVecDraw) {
+      window.CivVecDraw.drawVeinLines(ctx, {
+        veins: S.veins, rects, k, P, H,
+        mapW: S.mapW, mapH: S.mapH, cw: S.cw, ch: S.ch, relK: S.view.k,
+      });
+    }
     drawOwnerBorders(rects);
     // 标签层:地名 / 河名 / 湖名 / 国名一次画完(labels.js 内部自己处理跨 180° / 跨极镜像)
     if (S.labels && window.CivLabels) {
@@ -1178,6 +1188,21 @@
    * 矢量层重烘优先交给 Worker(OffscreenCanvas):主线程不再被上万段线阻塞。
    * 拿不到 Worker / OffscreenCanvas / 出错时回退到主线程同步绘制。
    */
+  /** 卫星画风的细沟层:按世界拉一次(服务端已按世界缓存),拿不到就静默跳过(不影响其它画风) */
+  function loadVeins() {
+    const wid = S.worldId;
+    if (!wid || (S.veins && S.veinsWorldId === wid)) return;
+    fetch(`/api/map/veins?worldId=${encodeURIComponent(wid)}`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then((d) => {
+        if (wid !== S.worldId) return;
+        S.veins = d;
+        S.veinsWorldId = wid;
+        draw();
+      })
+      .catch((e) => { console.warn('细沟描线加载失败', e); });
+  }
+
   let vecWorker = null;
   let vecWorkerSeq = 0;
   let vecWorkerBusy = false;
@@ -1647,6 +1672,8 @@
   }
 
   async function loadBaseMap(keepView = false) {
+    // 卫星画风的细沟层:切到该画风时按需拉一次(服务端按世界缓存)
+    if (S.style === 'satellite') void loadVeins();
     if (!S.worldId) return;
     const cached = baseCacheFor().get(S.style);
     if (cached) {
@@ -2543,6 +2570,8 @@
       S.vecCache = null;
       S.vec = null;
       S.vecWorldId = null;
+      S.veins = null;
+      S.veinsWorldId = null;
       S.autoOn = false;
       S.field = { on: false, img: null, data: null, legend: null, kind: 'magic' };
       if (el.fieldEnable) el.fieldEnable.checked = false;

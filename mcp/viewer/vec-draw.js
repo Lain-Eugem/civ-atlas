@@ -649,7 +649,96 @@
     return rects;
   }
 
-  const API = { clamp, withBox, glyphInto, drawVectorsInto, visibleRectsFor };
+  /** 卫星画风底图里的细沟描线:数据来自 /api/map/veins,一条线 = [x,y,s, x,y,s, …] */
+  const VEIN_MIN_RELK = 2.5;      // 和"精细档"同一个分级点:低倍底图上的沟本身也只有 1px 上下,不描
+  const VEIN_RGB = '92,112,86';   // multiply 用的暗橄榄绿:只把底图压暗一档,不抢河的蓝
+  function drawVeinLines(g, opts) {
+    const veins = opts.veins;
+    if (!veins || !veins.lines || !veins.lines.length) return;
+    if (!(opts.relK >= VEIN_MIN_RELK)) return;
+    const rects = opts.rects;
+    if (!rects || !rects.length) return;
+    const W = opts.mapW, Hm = opts.mapH, cw = opts.cw, ch = opts.ch;
+    const sx = opts.P / W;
+    const sy = opts.H / Hm;
+    const lines = veins.lines;
+    // bbox 每世界算一次:跨 180° 时按 bbox 决定要不要在另一侧再画一份
+    let bb = veins._bb;
+    if (!bb) {
+      bb = veins._bb = new Array(lines.length);
+      for (let li = 0; li < lines.length; li++) {
+        const p = lines[li].p;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (let i = 0; i + 2 < p.length; i += 3) {
+          if (p[i] < x0) x0 = p[i];
+          if (p[i] > x1) x1 = p[i];
+          if (p[i + 1] < y0) y0 = p[i + 1];
+          if (p[i + 1] > y1) y1 = p[i + 1];
+        }
+        bb[li] = [x0, y0, x1, y1];
+      }
+    }
+    g.save();
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    for (const r of rects) {
+      // 这个 rect 覆盖的世界范围(odd 层 y 是上下镜像的,两端都算完再取 min/max)
+      const wx0 = (0 - r.x) / sx;
+      const wx1 = (cw - r.x) / sx;
+      const ya = (0 - r.yTop) / sy;
+      const yb = (ch - r.yTop) / sy;
+      const wy0 = r.odd ? Hm - Math.max(ya, yb) : Math.min(ya, yb);
+      const wy1 = r.odd ? Hm - Math.min(ya, yb) : Math.max(ya, yb);
+      const fx = (px) => r.x + px * sx;
+      const fy = (py) => (r.odd ? r.yTop + Hm - py * sy : r.yTop + py * sy);
+      const halo = new Map();
+      const core = new Map();
+      const pathOf = (m, key) => { let p = m.get(key); if (!p) m.set(key, (p = new Path2D())); return p; };
+      for (let li = 0; li < lines.length; li++) {
+        const b = bb[li];
+        if (b[2] < wx0 - 2 || b[0] > wx1 + 2 || b[3] < wy0 - 2 || b[1] > wy1 + 2) continue;
+        const p = lines[li].p;
+        const shifts = b[2] > W ? [0, -W] : b[0] < 0 ? [0, W] : [0];
+        for (const sh of shifts) {
+          let prevB = -1, prevX = 0, prevY = 0, hasPrev = false;
+          for (let i = 0; i + 5 < p.length; i += 3) {
+            const s = 0.5 * (p[i + 2] + p[i + 5]);
+            if (s < 0.45) { hasPrev = false; continue; }
+            const bucket = s < 0.6 ? 1 : s < 0.8 ? 2 : 3;
+            const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
+            const x1 = fx(p[i + 3] + sh), y1 = fy(p[i + 4]);
+            if (!Number.isFinite(x0 + y0 + x1 + y1)) { hasPrev = false; continue; }
+            if (Math.max(x0, x1) < -8 || Math.min(x0, x1) > cw + 8
+              || Math.max(y0, y1) < -8 || Math.min(y0, y1) > ch + 8) { hasPrev = false; continue; }
+            const hp = pathOf(halo, bucket);
+            const cp = pathOf(core, bucket);
+            // 短段之间用直线接上(细沟点很密,折线看不出来)
+            if (hasPrev && prevB === bucket) { hp.moveTo(prevX, prevY); cp.moveTo(prevX, prevY); }
+            else { hp.moveTo(x0, y0); cp.moveTo(x0, y0); }
+            hp.lineTo(x1, y1);
+            cp.lineTo(x1, y1);
+            prevB = bucket; prevX = x1; prevY = y1; hasPrev = true;
+          }
+        }
+      }
+      // 先淡谷影(宽、淡),再沟心(窄、深)。用 multiply 压暗底图,和主站底图上的沟影同一种"阴影"观感;
+      // 线宽跟缩放走(按世界像素),不然底图上的沟越放大越宽、我们的线却永远是 1px,对不上。
+      g.globalCompositeOperation = 'multiply';
+      for (const [m, wPx, aBase, aSpan] of [[halo, 1.8, 0.028, 0.030], [core, 0.9, 0.060, 0.060]]) {
+        for (const [bucket, path] of m) {
+          const s = (bucket + 0.5) / 4;
+          g.strokeStyle = `rgba(${VEIN_RGB},${(aBase + aSpan * s).toFixed(3)})`;
+          g.lineWidth = wPx + 0.5 * s;
+          g.stroke(path);
+        }
+      }
+      g.globalCompositeOperation = 'source-over';
+    }
+    g.restore();
+  }
+
+
+  const API = { clamp, withBox, glyphInto, drawVectorsInto, visibleRectsFor, drawVeinLines };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else globalThis.CivVecDraw = API;
 })();
