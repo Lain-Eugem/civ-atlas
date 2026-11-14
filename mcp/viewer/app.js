@@ -2964,6 +2964,8 @@
       hideMapTip();
       updateFieldStatus();
       el.polityList.innerHTML = '';
+      if (el.legend) el.legend.innerHTML = '';
+      if (el.polSub) el.polSub.textContent = '';
       el.polityDetail.innerHTML = '<div class="side-empty">世界建好了,点「开始会话」让 AI 君主接管。</div>';
       setStatus(`${d.worldId} · ${fmtInt(d.cells)} 地块 · 生成 ${d.generatedMs} ms`);
       setHint(`世界 ${d.worldId} 已生成(${fmtInt(d.cells)} 地块)。下一步:设置起始年,点「开始会话」。`);
