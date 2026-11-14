@@ -2525,6 +2525,35 @@
       if (window.CivDialogue && S.dialogue) {
         if (window.CivDialogue.renderInto) window.CivDialogue.renderInto(el.tabBody, S.dialogue, S.tab);
         else if (window.CivDialogue.renderHtml) el.tabBody.innerHTML = window.CivDialogue.renderHtml(S.dialogue, S.tab);
+        if (S.tab === 'dm' && window.CivDmChat) {
+          const pc = S.state.playerCommands || {};
+          const holder = document.createElement('div');
+          holder.className = 'dm-chat-holder';
+          el.tabBody.appendChild(holder);
+          window.CivDmChat.renderInto(holder, {
+            pending: pc.pending || [],
+            recent: pc.recent || [],
+            maxPending: pc.maxPending || 10,
+            perRound: pc.perRound || 5,
+            playerPolityName: S.state.playerPolityName || '',
+            stepYears: S.state.stepYears || 5,
+          }, {
+            send: async (text) => {
+              if (!S.sessionId) return;
+              const d = await api('/api/dm/chat', { sessionId: S.sessionId, text });
+              if (d && d.state) await applyState(d.state);
+              if (d && d.reply && d.reply.ok === false) toast('没听懂:' + ((d.reply.rejected || []).join(';') || '换个说法'));
+              else if (d && d.reply) toast('已入队:' + (d.reply.summary || ''));
+            },
+            cancel: async (id) => {
+              if (!S.sessionId) return;
+              const d = await api('/api/dm/chat/cancel', { sessionId: S.sessionId, id });
+              if (d && d.state) await applyState(d.state);
+            },
+            disabled: !S.sessionId || S.busy,
+            busy: S.busy,
+          });
+        }
         const rounds = S.dialogue.rounds || [];
         const n = rounds.filter((r) => (S.tab === 'dm' ? r.kind === 'dm' : r.kind !== 'dm')).length;
         el.tabNote.textContent = `${n} 条记录 · 第 ${S.state.rounds} / ${S.state.maxRounds} 回合`;

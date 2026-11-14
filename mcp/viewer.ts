@@ -62,6 +62,8 @@ import { isTerrainStyle, renderTile, renderVectors, renderVeinOverlay, renderWho
 import { renderOwnerPixels, ownerCivData, renderOwnerTilePixels } from './owner-map';
 import { buildLabels } from './labels';
 import { regionAtlas, regionInfoAt } from './region-info';
+import { cancelPlayerCommand, parsePlayerCommand, playerCommandView, queuePlayerCommand } from './player-commands';
+import { cleanOrders } from './orders';
 import { dialogueView } from './dialogue';
 import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
@@ -568,6 +570,10 @@ function stateView(s: Session): Record<string, unknown> {
     pendingPlan: !!s.pendingPlan,
     // 开局定制(角色卡/起始疆域);没定制 = null
     customStart: s.customStart ? { ...s.customStart, warnings: [...s.customStart.warnings] } : null,
+    // 玩家硬命令(DM 对话框):队列 + 自己的国家
+    playerPolityId: s.playerPolityId ?? null,
+    playerPolityName: s.playerPolityId != null ? polityName(civ.polities[s.playerPolityId], year) : null,
+    playerCommands: playerCommandView(s),
   };
 }
 
@@ -1431,6 +1437,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (args.card && typeof args.card === 'object') input.card = args.card as Record<string, unknown>;
       if (args.autoCard === true) input.autoCard = true;
       const result = applyCustomStart(s, input);
+      if (result && typeof result.polityId === 'number') s.playerPolityId = result.polityId;
       invalidateOwnerCache(s.id);
       chronCache.delete(s.id);
       sendJson(res, 200, { state: stateView(s), result });
@@ -1543,6 +1550,41 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       });
       invalidateOwnerCache(s.id);
       sendJson(res, 200, { dm, state: stateView(s) });
+      return true;
+    }
+
+    // 推演中的 DM 对话框:玩家直接下硬命令(解析 → 引擎校验 → 排队,下一回合开始执行)
+    if (pathname === '/api/dm/chat') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const text = String(args.text ?? '').trim();
+      const polities = (stateGet(s, { chronicle: false }).polities as { id: number; name: string; key: string }[])
+        .map((p) => ({ id: p.id, name: p.name, key: p.key }));
+      const mine = s.playerPolityId != null ? polities.find((p) => p.id === s.playerPolityId) ?? null : null;
+      const parsed = parsePlayerCommand(text, { player: mine, polities });
+      let reply: Record<string, unknown> = { ...parsed };
+      if (parsed.ok) {
+        const cleaned = cleanOrders(s.play, parsed.commands);
+        if (!cleaned.commands.length) {
+          reply = { ...parsed, ok: false, rejected: cleaned.rejected.map((r) => r.reason) };
+        } else {
+          const rec = queuePlayerCommand(s, { text, commands: parsed.commands, summary: parsed.summary });
+          reply = rec
+            ? { ...parsed, queued: rec }
+            : { ...parsed, ok: false, rejected: ['待执行命令已满(最多 10 条),先撤销几条再发'] };
+        }
+      }
+      sendJson(res, 200, { reply, state: stateView(s) });
+      return true;
+    }
+
+    if (pathname === '/api/dm/chat/cancel') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const rec = cancelPlayerCommand(s, Math.round(num(args, 'id', 0)));
+      sendJson(res, 200, { cancelled: rec, state: stateView(s) });
       return true;
     }
 

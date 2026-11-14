@@ -22,6 +22,7 @@ import { polityAlive, capitalAt, polityName } from '../src/gen/civ/growth';
 import { rulerAt } from '../src/gen/civ/story/peopleInfo';
 import { buildChronicle, entryInvolves, type ChronicleEntry } from '../src/gen/civ/story/chronicle';
 import { cleanOrders, ORDER_KINDS, KEY_HELP, type CleanedOrders } from './orders';
+import { drainPlayerCommands, newPlayerCommandState, playerCommandView, type PlayerCommandState } from './player-commands';
 import { riverReport, riverSummary, type RiverSummary } from './rivers-data';
 import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
 import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
@@ -220,6 +221,10 @@ export interface Session {
   petty?: PettyState;
   /** 开局定制(第一回合前的君主/疆域定制;没定制 = 没有) */
   customStart?: CustomStartState;
+  /** 玩家自己的国家编号(开局设置里选的;没选 = 没有) */
+  playerPolityId?: number;
+  /** 推演中玩家直接下的硬命令队列(下一回合开始时执行) */
+  playerCommands?: PlayerCommandState;
 }
 
 const sessions = new Map<string, Session>();
@@ -311,6 +316,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     queue: [],
     logDir,
     createdAt: started,
+    playerCommands: newPlayerCommandState(),
   };
   sessions.set(id, session);
   writeFileSync(
@@ -633,6 +639,8 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     ...(s.intel ? { intel: s.intel } : {}),
     ...(s.pendingPlan ? { pendingPlan: true } : {}),
     ...(s.customStart ? { customStart: s.customStart } : {}),
+    playerCommands: playerCommandView(s),
+    playerPolityId: s.playerPolityId ?? null,
     ...(chronicle ? { chronicle } : {}),
   };
 }
@@ -677,6 +685,12 @@ export interface TurnResult {
 /** 把队列里的命令交给引擎,再推 stepYears 年 */
 export function turnStep(s: Session, opts: { years?: number; orders?: readonly unknown[] } = {}): TurnResult {
   if (isFinished(s)) throw new Error(`会话 ${s.id} 已经结束(第 ${s.play.year} 年,${s.rounds}/${s.maxRounds} 回合)`);
+  // 玩家在 DM 对话框里直接下的硬命令:回合开始时先入队(最多 5 条),与其它命令一起交给引擎
+  const playerCmds = drainPlayerCommands(s);
+  if (playerCmds.length) {
+    const cleanedPlayer = cleanOrders(s.play, playerCmds);
+    s.queue.push(...cleanedPlayer.commands);
+  }
   if (opts.orders && opts.orders.length) {
     const cleaned = cleanOrders(s.play, opts.orders);
     s.queue.push(...cleaned.commands);
