@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 文明与地图 · 多 Agent 沙盒监视台 —— 前端
  *
  * 只做三件事:
@@ -2553,10 +2553,53 @@
         return `<div class="mem-row"><span class="mem-year">${fmtInt(k.year)}</span><span>P${tid} ${esc(target ? target.name : '')}:${esc(fields)}(${esc(k.quality)})</span></div>`;
       })
       .join('') || '<div class="review-note">还没派人渗透过任何国家;他国的人口、税收、稳定度在提示词里显示为「未知」。</div>';
+
+    // P5:行动点 / 君主位置 / 后代 / 本回合动作(数据全部来自 stateView.monarchPanels)
+    const panel = (st.monarchPanels || []).find((pp) => pp.polityId === p.id) || null;
+    const lastRound = (st.monarchRounds || [])[0] || null;
+    const roundEvents = lastRound && Array.isArray(lastRound.monarchEvents) ? lastRound.monarchEvents.filter((e) => e.polityId === p.id) : [];
+    let apHtml = '';
+    let locHeirsHtml = '';
+    let actHtml = '';
+    let cultivateBtn = '';
+    if (panel) {
+      const ap = panel.ap || {};
+      const total = Number(ap.apTotal) || 0;
+      const spent = Number(ap.apSpent) || 0;
+      const left = Number.isFinite(ap.remaining) ? ap.remaining : Math.max(0, total - spent);
+      const pct = total > 0 ? clamp(Math.round((spent / total) * 100), 0, 100) : 0;
+      apHtml = `<div class="crown-ap">
+          <div class="crown-ap-top"><span>行动点</span><span class="crown-ap-num">AP ${left}/${total} · 已用 ${spent}</span></div>
+          <div class="crown-ap-bar"><i style="width:${pct}%"></i></div>
+          <div class="crown-sub">本回合 ${fmtInt(ap.stepMonths || 0)} 个月(倍率 ${ap.stepFactor ?? 1}) · 科技 ${ap.tech ?? 0} · 经济 ${ap.economy ?? 0}</div>
+        </div>`;
+      const heirs = panel.heirs || [];
+      const heirHtml = heirs.length
+        ? heirs.map((h) => `<div class="mem-row"><span class="mem-year">${fmtInt(h.born)} 年生</span><span>${esc(h.name)}</span><span class="muted">培养 ${fmtInt(h.growth || 0)} 次</span></div>`).join('')
+        : '<div class="review-note">还没有培养出后代;AP 足够的回合可以让君主下「cultivate-heir」。</div>';
+      locHeirsHtml = `<div class="crown-grid">
+          ${cell('君主位置', panel.location ? panel.location.regionName : '—')}
+          ${cell('后代', heirs.length ? `${heirs.length} 位` : '无')}
+        </div>
+        <div class="detail-section"><h4>后代</h4>${heirHtml}</div>`;
+      const logs = ap.log || [];
+      const logHtml = logs.length
+        ? logs.map((a) => `<div class="mem-row${a.ok ? '' : ' bad'}"><span class="mem-year">${esc(a.action)}</span><span>${a.cost} AP</span><span>${a.ok ? '✓' : '✗'} ${esc(a.reason || '')}${a.target ? `(${esc(a.target)})` : ''}</span></div>`).join('')
+        : '<div class="review-note">本回合还没有动作。</div>';
+      const eventHtml = roundEvents.length
+        ? roundEvents.map((e) => `<div class="mem-row"><span class="mem-year">事件</span><span>${esc(e.text)}</span></div>`).join('')
+        : '';
+      actHtml = `<div class="detail-section"><h4>本回合动作(AP ${spent}/${total})</h4>${logHtml}${eventHtml}</div>`;
+      const canCultivate = left >= 3;
+      cultivateBtn = `<div><button class="btn" id="btnCrownCultivate" type="button" data-polity="${p.id}"${canCultivate ? '' : ' disabled title="AP 不够:培养后代需要 3 AP"'}>培养后代(3 AP)${canCultivate ? '' : ' · AP 不够'}</button></div>`;
+    }
+
     return `
       <div class="crown-wrap">
         <div class="crown-head"><span class="crown-name">${esc(card.name)}</span>
           <span class="crown-sub">第 ${fmtInt(card.born)} 年生 · ${esc(card.title || '君主')} · ${esc(p.name)}(P${p.id})</span></div>
+        ${apHtml}
+        ${locHeirsHtml}
         <div class="crown-grid">
           ${cell('谨慎', t.caution ?? '—')}${cell('野心', t.ambition ?? '—')}${cell('荣誉感', t.honor ?? '—')}${cell('贪欲', t.greed ?? '—')}
         </div>
@@ -2566,6 +2609,8 @@
         <div class="review-note">偏好:战争 ${esc(pref.war || '—')} · 经济 ${esc(pref.economy || '—')} · 外交 ${esc(pref.diplomacy || '—')}(玩家 / DM 可改下面的性格说明)</div>
         <textarea class="crown-persona" id="crownPersona" data-polity="${p.id}">${esc(card.persona || '')}</textarea>
         <div><button class="btn" id="btnCrownSave" type="button" data-polity="${p.id}">保存角色卡</button></div>
+        ${cultivateBtn}
+        ${actHtml}
         <div><h4 style="margin:2px 0 4px;font-size:12px">独立记忆(最近 8 条)</h4>${memHtml}</div>
         <div><h4 style="margin:2px 0 4px;font-size:12px">情报</h4>${intelRows}</div>
       </div>`;
@@ -3380,6 +3425,16 @@
 
     // 君主卡保存(事件委托:卡片是动态渲染的)
     el.tabBody.addEventListener('click', (e) => {
+      const cultivate = e.target.closest('#btnCrownCultivate');
+      if (cultivate) {
+        // P5:培养后代是君主回合里的一项「特殊动作」,没有单独的写接口;
+        // 这里只提示怎么让它发生,并展示当前 AP 预算(接口/按钮禁用来自 stateView)。
+        const pid = Number(cultivate.dataset.polity);
+        const panel = ((S.state && S.state.monarchPanels) || []).find((x) => x.polityId === pid);
+        const left = panel && panel.ap ? panel.ap.remaining : 0;
+        toast(`培养后代要 3 AP:让 P${pid} 的君主在本回合决策里带 cultivate-heir 即可(本回合还剩 ${left} AP)。`);
+        return;
+      }
       const btn = e.target.closest('#btnCrownSave');
       if (!btn) return;
       const polityId = Number(btn.dataset.polity);

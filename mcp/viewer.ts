@@ -43,7 +43,7 @@ import {
   type RulerView,
   type Session,
 } from './engine';
-import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, setMonarchCard, verifySession } from './monarch';
+import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, monarchPanels, setMonarchCard, verifySession } from './monarch';
 import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, inferCardFromBiography, type StartSetupInput } from './monarch-start';
 import { CARD_LIFESPAN_DEFAULT } from '../src/gen/civ/monarchCard';
 import { dmRound, dmSetup, dmStatus } from './dm';
@@ -502,6 +502,9 @@ function stateView(s: Session): Record<string, unknown> {
     : [];
   // 只数「控制方式 = AI」的国家:标成 program 的国家由引擎自动推演,不占君主席位
   const kingCount = kingIds.filter((id) => nationControlOf(s, id) === 'ai').length;
+  // P5:君主面板(每个 AI 国的 AP / 位置 / 后代 / 日志);当前选中国优先
+  const panels = s.monarch ? monarchPanels(s) : [];
+  const focusPanel = panels.find((p) => p.polityId === s.playerPolityId) ?? panels[0] ?? null;
 
   return {
     summary: sessionSummary(s),
@@ -522,6 +525,11 @@ function stateView(s: Session): Record<string, unknown> {
     commands: st.commands,
     monarch: s.monarch ? { ...monarchStatus(s), kingCount } : null,
     monarchRounds: s.monarch ? s.monarch.rounds.map(trimRound) : [],
+    // P5:君主机制(行动点 / 位置 / 后代 / 事件日志);monarchAp 等是「当前聚焦国」的便捷别名
+    monarchPanels: panels,
+    monarchAp: focusPanel?.ap ?? null,
+    monarchLocation: focusPanel?.location ?? null,
+    monarchHeirs: focusPanel?.heirs ?? [],
     // DM 小决策(oracle)的状态;天灾会真改引擎,小贸易只记叙事
     dm: s.dm ? dmStatus(s) : null,
     dmRounds: s.dm

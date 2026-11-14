@@ -28,7 +28,7 @@ import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
 import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
 import { cleanFieldSpec, fieldPlugin, type FieldSpec } from '../src/gen/civ/fieldPlugin';
 import type { TuningValues } from '../src/gen/civ/tuning';
-import type { MonarchCard } from '../src/gen/civ/monarchCard';
+import type { MonarchCard, MonarchCompetence, MonarchTraits } from '../src/gen/civ/monarchCard';
 import type { MemoryBook } from '../src/gen/civ/monarchMemory';
 import type { IntelKnowledge } from '../src/gen/civ/monarchIntel';
 import type { StartSetupInput, StartSetupState } from './monarch-start';
@@ -95,12 +95,62 @@ export type SessionMode = 'auto' | 'monarch';
  */
 export type NationControl = 'ai' | 'program';
 
+/** 君主后代(P5):培养出来的继承人,继位时用它的姓名/生年/性格建新卡 */
+export interface MonarchHeir {
+  name: string;
+  born: number;
+  traits: MonarchTraits;
+  competence: MonarchCompetence;
+  /** 培养程度(每培养一次 +1;继承时原样带进新卡备注) */
+  growth: number;
+  /** 培养出来的年份 */
+  createdAt: number;
+}
+
+/** 一条动作的 AP 记账(P5):成功/失败都记 ok 与 reason,超支的写 reason 拒绝 */
+export interface MonarchActionLog {
+  action: string;
+  cost: number;
+  ok: boolean;
+  reason?: string;
+  /** 目标(州名 / 国家名 / 编号),只用于展示 */
+  target?: string;
+}
+
+/** 一回合的行动点账本(P5):回合开始重算 apTotal,提交时把 apSpent/log 写定 */
+export interface MonarchRoundAp {
+  year: number;
+  apTotal: number;
+  apSpent: number;
+  log: MonarchActionLog[];
+}
+
+/** 单个君主国家的 P5 运行期状态(位置 / 后代 / 本回合 AP / 日志) */
+export interface MonarchPolityState {
+  /** 君主所在州(初始 = 国都州;亲征/安抚都按它判距离) */
+  location?: { regionId: number } | null;
+  /** 培养出来的后代(按培养先后;继位时取第一个) */
+  heirs?: MonarchHeir[];
+  /** 本回合 AP 账本(plan 阶段算,commit 后保留到下一回合) */
+  roundAp?: MonarchRoundAp;
+  /** 给编年史/报告用的事件小记(引擎没有可写的自定义史事,先记在会话里) */
+  journal?: { year: number; kind: string; text: string }[];
+  /** 角色卡被继位钉住(不按引擎推演出来的君主重建) */
+  pinned?: boolean;
+  /** 君主的卒年(自然死亡 / 亲征阵亡) */
+  died?: number;
+  /** 被俘到哪一年(这段时间不能亲征) */
+  capturedUntil?: number;
+}
+
 /** 君主模式在会话上的状态(配置 + 每回合日志;具体结构由 mcp/monarch.ts 解释) */
 export interface MonarchState {
   config: Record<string, unknown>;
   rounds: Record<string, unknown>[];
   /** 这一局君主的寿命(岁):默认 90;开局角色卡启用种族系统时按卡上的 lifespan 写回 */
   lifespan?: number;
+  /** P5:按国家编号的君主运行期状态(位置 / 后代 / AP / 日志) */
+  byPolity?: Record<string, MonarchPolityState>;
 }
 
 /** DM 小决策在会话上的状态(配置 + 每回合日志;具体结构由 mcp/dm.ts 解释) */
@@ -712,6 +762,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     nationControl: nationControlView(s),
     startSetup: s.startSetup ?? null,
     pendingStartSetup: s.pendingStartSetup ?? null,
+    ...(s.monarch ? { monarchLifespan: s.monarch.lifespan ?? null, monarchByPolity: s.monarch.byPolity ?? {} } : {}),
     playerCommands: playerCommandView(s),
     playerPolityId: s.playerPolityId ?? null,
     ...(chronicle ? { chronicle } : {}),

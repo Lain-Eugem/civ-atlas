@@ -1247,6 +1247,14 @@ details.advanced > summary { font-weight: 500; }
 .crown-cell .k { font-size: 10.5px; color: var(--ink-3); }
 .crown-cell .v { font-size: 13px; font-weight: 600; margin-top: 2px; }
 .crown-persona { width: 100%; min-height: 76px; resize: vertical; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; line-height: 1.6; }
+/* P5:君主页的行动点 / 动作日志 */
+.crown-ap { display: flex; flex-direction: column; gap: 5px; padding: 9px 10px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line-soft); }
+.crown-ap-top { display: flex; justify-content: space-between; align-items: baseline; font-size: 11.5px; color: var(--ink-2); }
+.crown-ap-num { font-weight: 600; color: var(--ink); font-size: 12.5px; }
+.crown-ap-bar { height: 5px; background: var(--field); border-radius: 999px; overflow: hidden; }
+.crown-ap-bar i { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
+.mem-row.bad { color: var(--warn); }
+.mem-row .muted { color: var(--ink-3); }
 .mem-row { display: flex; gap: 8px; padding: 5px 0; border-bottom: 1px dashed var(--line-soft); font-size: 11.5px; line-height: 1.55; }
 .mem-row:last-child { border-bottom: 0; }
 .mem-year { flex: 0 0 auto; color: var(--ink-3); font-variant-numeric: tabular-nums; }
