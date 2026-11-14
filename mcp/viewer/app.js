@@ -68,6 +68,17 @@
     magicSeq: 0,
     magicTimer: 0,
     magicLoading: false,
+    // 疆域高清瓦片:放大后替代整张 2048 PNG;整张图仍负责缩小时兜底 + 国界线
+    ownerTiles: new Map(),
+    ownerTilePending: new Set(),
+    ownerTileSeq: 0,
+    ownerTileTimer: 0,
+    /** 疆域状态指纹(和 /api/map/owners 返回的一致):变了就作废瓦片 */
+    ownerFingerprint: null,
+    /** 标签层(地名 / 河名 / 湖名 / 国名):服务端按年份生成,/api/labels 一次拉全 */
+    labels: null,
+    labelsSession: null,
+    labelsYear: null,
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -570,24 +581,37 @@
     drawHiTiles();
     drawMagicHiTiles();
     const magicSharp = !interacting && S.magic.on && magicTilesCoverView();
+    // 疆域同理:当前层瓦片全部到齐才从整张 2048 PNG 切到瓦片,否则先贴整张
+    const ownerSharp = !interacting && ownerTilesCoverView();
     for (const r of rects) {
       ctx.save();
       if (r.odd) { ctx.translate(0, 2 * r.yTop + H); ctx.scale(1, -1); }
       // 魔力层:缩小时用整张 2048 图;放大后等当前层瓦片全部到齐再切瓦片(避免缺块闪烁)。
       const magicFlat = S.magic.on && !magicSharp ? S.magic.img : null;
-      const overlays = [S.field.on ? S.field.img : null, magicFlat, S.ownersImg];
+      const overlays = [S.field.on ? S.field.img : null, magicFlat, ownerSharp ? null : S.ownersImg];
       for (const img of overlays) if (img) ctx.drawImage(img, r.x, r.yTop, P, H);
       ctx.restore();
     }
+    drawOwnerTiles();
     // 墨线 / 波纹 / 符号是矢量,按固定屏幕线宽画在最上层,放大多少倍都不变粗
     drawVectorsCached();
     drawOwnerBorders(rects);
-    for (const r of rects) {
-      // 文字不能跟着翻转,单独按镜像后的位置画
-      if (S.state) drawLabels(ctx, r.x, r.yTop, k, r.odd, H);
+    // 标签层:地名 / 河名 / 湖名 / 国名一次画完(labels.js 内部自己处理跨 180° / 跨极镜像)
+    if (S.labels && window.CivLabels) {
+      window.CivLabels.draw(ctx, {
+        items: S.labels, rects, k, P, H,
+        mapW: S.mapW, mapH: S.mapH, style: S.style,
+        relK: S.view.k, cw: S.cw, ch: S.ch,
+      });
+    } else {
+      for (const r of rects) {
+        // 回退:旧的国名标签(标签层没拉到时还能看国名)
+        if (S.state) drawLabels(ctx, r.x, r.yTop, k, r.odd, H);
+      }
     }
     scheduleTiles();
     scheduleMagicTiles();
+    scheduleOwnerTiles();
     updateZoomLabel();
   }
 
@@ -607,7 +631,7 @@
    * 所以只要改了地形或上色的算法,这里就要 +1,否则老浏览器会一直用旧图。
    */
   // 改地形 / 上色算法时 +1:瓦片和底图都是 immutable 缓存,不换 URL 老浏览器会一直用旧图
-  const MAP_VER = 5;
+  const MAP_VER = 6;
   /** 与 mcp/terrain.ts 的 TERRAIN_STYLES 一致 */
   const STYLES = ['fantasy', 'satellite', 'geo', 'white', 'classic'];
 
@@ -616,7 +640,7 @@
     // 1 倍底图(2048 宽)本身够缩小时用。高分屏上 100% 的 kd 也可能 > 1,但那样
     // 只会生成 1.4 倍的低档瓦片,和整图拼起来反而出现细线 / 色块(见"缩小错乱"),
     // 所以只有真正放大到 2 倍档才现算,最小档也从 2 倍起。
-    if (kd <= 1.8 || S.style === 'classic') return 0;
+    if (kd <= 1.8) return 0;
     // 只取 2 的整数次幂:这样一圈地图正好 tileCols(lod)=4*lod 列、一层 tileRows(lod)=2*lod 行,
     // 都是整数 —— 同一块世界区域不管落在哪个重复单元,列号取模后都是同一个键、同一张图,
     // 拖到第几个"世界"都不用重渲,也不会出现越拖越大的坐标。档数还比 √2 少一半。
@@ -635,7 +659,7 @@
   }
 
   function scheduleTiles() {
-    if (!S.worldId || S.style === 'classic' || !S.lod) return;
+    if (!S.worldId || !S.lod) return;
     if (S.tileTimer) clearTimeout(S.tileTimer);
     S.tileTimer = setTimeout(() => { S.tileTimer = 0; void loadHiTiles(); }, 180);
   }
@@ -808,8 +832,12 @@
     ctx.clip();
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
-    ctx.strokeStyle = S.style === 'white' ? 'rgba(70,72,76,0.82)' : 'rgba(58,45,34,0.86)';
-    ctx.lineWidth = 1.15 / m;
+    // 写实系(geo / satellite / classic)岸线用主站的蓝墨色,手绘用暖墨,白模用灰
+    const realisticInk = S.style === 'geo' || S.style === 'satellite' || S.style === 'classic';
+    ctx.strokeStyle = S.style === 'white'
+      ? 'rgba(70,72,76,0.82)'
+      : realisticInk ? 'rgba(63,111,152,0.7)' : 'rgba(58,45,34,0.86)';
+    ctx.lineWidth = (realisticInk ? 1.5 : 1.15) / m;
     ctx.stroke(lines.coast);
     if (lines.lake) ctx.stroke(lines.lake);
     ctx.restore();
@@ -994,6 +1022,117 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * 疆域高清瓦片(和地形瓦片同一套坐标)
+   *
+   * 整张疆域图是 2048 宽 PNG,放大到几倍就糊了;这里按当前 LOD 向服务端要
+   * /api/map/owner-tile,水彩 / 国界浓边在服务端按瓦片像素重算。
+   * 低倍率、或当前层还没到齐时仍贴整张图兜底;到齐后整张切瓦片(避免缺块闪一下)。
+   * 国界线是矢量(见 drawOwnerBorders),始终按屏幕像素画,不受瓦片影响。
+   * ------------------------------------------------------------------ */
+  function ownerTileKey(lod, i, j) {
+    return `${tileAt(lod, i, j).key}|${S.ownerFingerprint || ''}`;
+  }
+
+  function ownerTileAt(lod, i, j) {
+    const t = tileAt(lod, i, j);
+    return { key: `${t.key}|${S.ownerFingerprint || ''}`, x: t.x, y: t.y };
+  }
+
+  function clearOwnerTiles() {
+    S.ownerTiles.clear();
+    S.ownerTilePending.clear();
+    S.ownerTileSeq++;
+    if (S.ownerTileTimer) clearTimeout(S.ownerTileTimer);
+    S.ownerTileTimer = 0;
+  }
+
+  function scheduleOwnerTiles() {
+    if (!S.sessionId || !S.ownerFingerprint || S.style === 'classic' || !S.lod) return;
+    if (S.ownerTileTimer) clearTimeout(S.ownerTileTimer);
+    S.ownerTileTimer = setTimeout(() => { S.ownerTileTimer = 0; void loadOwnerTiles(); }, 180);
+  }
+
+  /** 当前层疆域瓦片是否全部到齐(到齐才从整张图切到瓦片,避免中间缺块闪一下) */
+  function ownerTilesCoverView() {
+    if (!S.ownerFingerprint || !S.lod || !S.ownerTiles.size) return false;
+    const g = tileGridAt(S.lod);
+    if (!g || g.step < 4) return false;
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        if (!S.ownerTiles.has(ownerTileKey(g.lod, i, j))) return false;
+      }
+    }
+    return true;
+  }
+
+  /** 已缓存的疆域块:当前层到齐后画(整张图负责兜底) */
+  function drawOwnerTiles() {
+    if (!S.ownerFingerprint || !S.lod || !S.ownerTiles.size) return;
+    if (!ownerTilesCoverView()) return;
+    const g = tileGridAt(S.lod);
+    if (!g) return;
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        const img = S.ownerTiles.get(ownerTileKey(g.lod, i, j));
+        if (img) ctx.drawImage(img, g.oxAbs + i * g.step, g.oyAbs + j * g.step, g.step + 0.6, g.step + 0.6);
+      }
+    }
+  }
+
+  async function loadOwnerTiles() {
+    if (!S.sessionId || !S.ownerFingerprint || !S.lod) return;
+    const g = tileGrid();
+    if (!g) return;
+    const seq = S.ownerTileSeq;
+    const want = [];
+    for (let j = g.j0; j <= g.j1; j++) {
+      for (let i = g.i0; i <= g.i1; i++) {
+        const t = ownerTileAt(g.lod, i, j);
+        if (!S.ownerTiles.has(t.key) && !S.ownerTilePending.has(t.key)) want.push({ i, j, key: t.key, x: t.x, y: t.y });
+      }
+    }
+    if (!want.length) return;
+    const cx = (g.i0 + g.i1) / 2;
+    const cy = (g.j0 + g.j1) / 2;
+    want.sort((a, b) => (Math.abs(a.i - cx) + Math.abs(a.j - cy)) - (Math.abs(b.i - cx) + Math.abs(b.j - cy)));
+    // 疆域块比地形块贵(S=4 约 0.3 秒),一次少排几块,服务端是 4 个 worker 的池子
+    const jobs = want.slice(0, 12);
+    for (const w of jobs) S.ownerTilePending.add(w.key);
+    const stale = () => seq !== S.ownerTileSeq || S.lod !== g.lod || !S.ownerFingerprint;
+    /** 换档作废时把还没发的 pending 一起清掉,否则它们会永远留在 Set 里挡住重试 */
+    const dropRest = (from) => {
+      for (let q = from; q < jobs.length; q++) S.ownerTilePending.delete(jobs[q].key);
+    };
+    const one = async (w) => {
+      if (stale()) { S.ownerTilePending.delete(w.key); return; }
+      const qs = `sessionId=${encodeURIComponent(S.sessionId)}&S=${g.lod}&x=${w.x}&y=${w.y}&size=${TILE}`;
+      try {
+        const r = await fetch(`/api/map/owner-tile?${qs}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const img = await createImageBitmap(await r.blob());
+        if (stale()) { if (img.close) img.close(); return; }
+        S.ownerTiles.set(w.key, img);
+        while (S.ownerTiles.size > 64) {
+          const first = S.ownerTiles.keys().next().value;
+          if (first === undefined) break;
+          const old = S.ownerTiles.get(first);
+          if (old && old.close) { try { old.close(); } catch (_) { /* ignore */ } }
+          S.ownerTiles.delete(first);
+        }
+        requestDraw();
+      } catch (_) {
+        // 单块失败就继续用整张图兜底,不打断对局
+      } finally {
+        S.ownerTilePending.delete(w.key);
+      }
+    };
+    for (let p = 0; p < jobs.length; p += 6) {
+      if (stale()) { dropRest(p); return; }
+      await Promise.all(jobs.slice(p, p + 6).map(one));
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
    * 矢量细节层(主站 render/detail.ts 的做法):海岸线、近岸波纹、山/树符号
    *
    * 底图与高清瓦片里的墨线 / 波纹已经在服务端去掉,这里按固定屏幕线宽画。
@@ -1133,9 +1272,10 @@
    * 重建矢量层缓存:视口四周多画一圈边距,拖动时先贴图,快拖出边距再重画。
    * 正常走 Worker 异步重烘(不阻塞主线程);Worker 不可用才退回主线程同步画。
    */
-  /** 哪些画法要用矢量层:fantasy 用全套墨线 / 林块 / 符号,geo / satellite / white 只用共用的河网;classic 仍是纯栅格底图 */
+  /** 哪些画法要用矢量层:fantasy 用全套墨线 / 林块 / 符号;写实系(geo / satellite / classic)用河网 + 岸线墨线;white 只用河网 */
   function vecStyleOn() {
-    return S.style === 'fantasy' || S.style === 'geo' || S.style === 'satellite' || S.style === 'white';
+    return S.style === 'fantasy' || S.style === 'geo' || S.style === 'satellite'
+      || S.style === 'white' || S.style === 'classic';
   }
 
   function buildVecCache() {
@@ -1224,6 +1364,26 @@
   }
 
   /**
+   * 国界样式:集中在这里,调参数只动这一处。
+   * 坐标是主图像素、按屏幕固定线宽画(canvas 坐标就是屏幕像素,线宽 1 = 1px,dash 同理),
+   * 所以放大多少倍都不变粗。默认照主站手绘风:细墨色虚线(dash [4,3])。
+   * baseStroke / baseWidth 是垫在虚线下面的一条极淡奶白底线(深色地形上分得清国界用),
+   * 想要纯虚线把 baseStroke 设成 null 即可。
+   */
+  function ownerBorderStyle() {
+    return {
+      stroke: 'rgba(58,32,20,0.85)',
+      width: 1,
+      dash: [4, 3],
+      lineCap: 'round',
+      lineJoin: 'round',
+      baseStroke: 'rgba(246,236,210,0.35)',
+      baseWidth: 1,
+      baseDash: [],
+    };
+  }
+
+  /**
    * 国界:主站 borderLines 已经平滑好的折线(坐标 = 主图像素),按屏幕固定线宽画。
    * 只叠在手绘风上(white / classic 等不画,和主站 civ 层一致);跨 180° 的线在另一侧再画一份。
    */
@@ -1231,6 +1391,7 @@
     const lines = S.ownerBorders;
     if (!lines || !lines.length || S.style !== 'fantasy') return;
     if (!S.draw || !S.mapW || !S.mapH) return;
+    const st = ownerBorderStyle();
     const sx = S.draw.P / S.mapW;
     const sy = S.draw.H / S.mapH;
     const drawPass = (strokeStyle, lineWidth, dash) => {
@@ -1256,11 +1417,10 @@
         ctx.restore();
       }
     };
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    // 第一遍奶白底线压住底图纹理,第二遍墨色虚线(屏幕像素,放大多少倍都不变粗)
-    drawPass('rgba(246,236,210,0.6)', 3.2, []);
-    drawPass('rgba(58,32,20,0.85)', 2, [5, 3]);
+    ctx.lineJoin = st.lineJoin;
+    ctx.lineCap = st.lineCap;
+    if (st.baseStroke && st.baseWidth > 0) drawPass(st.baseStroke, st.baseWidth, st.baseDash || []);
+    drawPass(st.stroke, st.width, st.dash);
     ctx.setLineDash([]);
   }
 
@@ -1540,10 +1700,34 @@
       S.mapW = d.width || S.mapW;
       S.mapH = d.height || S.mapH;
       S.ownerBorders = (d.borders || []).map(withBox);
+      // 状态指纹变了(新国家 / 换色 / 政体变化):上一批疆域瓦片全部作废
+      const fingerprint = d.fingerprint || '';
+      if (S.ownerFingerprint !== fingerprint) {
+        S.ownerFingerprint = fingerprint;
+        clearOwnerTiles();
+      }
       S.ownersImg = await loadImage(`data:image/png;base64,${d.png}`);
+      await loadLabels();
       draw();
     } catch (e) {
       toast(`疆域图生成失败:${e instanceof Error ? e.message : String(e)}`, true);
+    }
+  }
+
+  /**
+   * 标签层(地名 / 河名 / 湖名 / 国名):服务端按当前年份一次生成几百条;
+   * 字号按 relK 分级(屏幕像素有下限),放大不会变成巨字。
+   */
+  async function loadLabels() {
+    if (!S.sessionId) { S.labels = null; return; }
+    try {
+      const d = await api(`/api/labels?sessionId=${encodeURIComponent(S.sessionId)}`);
+      S.labels = d.items || [];
+      S.labelsSession = S.sessionId;
+      S.labelsYear = d.year ?? null;
+    } catch (e) {
+      S.labels = null;
+      console.warn('标签层生成失败', e);
     }
   }
 
@@ -2346,6 +2530,10 @@
       if (el.reviewPanel) el.reviewPanel.hidden = true;
       S.ownersImg = null;
       S.ownerBorders = null;
+      S.ownerFingerprint = null;
+      S.labels = null;
+      S.labelsYear = null;
+      clearOwnerTiles();
       S.grid = null;
       S.sel = null;
       S.baseImg = null;

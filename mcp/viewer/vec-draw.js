@@ -19,6 +19,24 @@
   }
 
   /**
+   * 服务端下发的写实系岸线字段(coastReal / lakeReal)是原始折线;手绘那份在 app.js 里已经
+   * 包成 { p, x0, x1 }。两种都接受:整组第一次用到时现包(结果按数组缓存,worker 里各自缓存)。
+   */
+  const boxedCache = new WeakMap();
+  function boxLines(list) {
+    if (!Array.isArray(list)) return [];
+    let out = boxedCache.get(list);
+    if (out) return out;
+    out = list;
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      if (!b || !b.p) { out = list.map(withBox); break; }
+    }
+    boxedCache.set(list, out);
+    return out;
+  }
+
+  /**
    * 一个地形符号的几何,塞进两条 Path2D:fill(山的实心三角)和 stroke(其余线条)。
    * 整帧只调两次 fill / stroke,避免三千多个符号时上万次 canvas 调用。
    */
@@ -262,6 +280,15 @@
       fluxRef: 1400,
       riverFlux: [2.4, 1.4],
     },
+    // 经典卫星(写实系默认画法):主站 MATERIALS.classic.river / riverFlux
+    classic: {
+      color: 'rgb(58,124,180)',
+      minW: 0.55,
+      growW: 1.9,
+      bank: { color: 'rgba(22,40,30,0.34)', thinW: 0.45 },
+      fluxRef: 1400,
+      riverFlux: [1, 1],
+    },
     // 白模
     white: { color: 'rgb(150,186,214)', minW: 0.55, growW: 1.9, bank: null, fluxRef: 1400, riverFlux: [2.5, 1.5] },
     // 手绘羊皮纸:和主站 fantasyRiverStyle 同一套颜色 / 宽度,保留手绘的细线感
@@ -462,11 +489,17 @@
     const v = opts.vec;
     const style = opts.style;
     const fantasy = style === 'fantasy';
-    // 河网是所有画法共用的;纸感墨线 / 波纹 / 冰缘 / 林块 / 山符号只有手绘风有
-    const onlyRivers = style === 'geo' || style === 'satellite' || style === 'white';
+    // 河网是所有画法共用的;写实系(geo / satellite / classic)在底色之上再补一层岸线墨线,
+    // 纸感墨线 / 波纹 / 冰缘 / 林块 / 山符号只有手绘风有
+    const realistic = style === 'geo' || style === 'satellite' || style === 'classic';
+    const onlyRivers = realistic || style === 'white';
     if (!v || (!fantasy && !onlyRivers) || !opts.rects.length) return;
     const ink = 'rgba(58,45,34,0.86)';
     const inkSoft = 'rgba(58,45,34,0.17)';
+    // 写实系岸线墨线:照主站 MATERIALS.geo.coast = rgb(63,111,152) α0.7。主站 COAST_PX=3、
+    // 朝陆那半边被陆地盖住,看上去约 1.5px;这里按居中 1.5px 画。
+    const realInk = 'rgba(63,111,152,0.7)';
+    const realInkLW = 1.5;
     const W = opts.mapW, H = opts.H;
     const sx = opts.P / opts.mapW;              // 屏幕像素 / 整图像素
     const sy = opts.H / opts.mapH;
@@ -474,6 +507,10 @@
     const gs = relK <= 1.35 ? 1 : Math.pow(relK / 1.35, -0.22);
     const unit = gs * sx;                       // 符号大小:比地图放大得慢,不会撑满屏幕
     const fine = relK >= 2.5;
+    // 写实系岸线用哪一档:低倍用服务端新下发的单档(tol 0.9)那份;高倍(fine,和手绘风同一个
+    // 分级点)换成手绘的 fine 档 —— 同一份几何、只是抽稀更细,放大后不发毛。旧缓存缺新字段时退回手绘那份。
+    const realCoast = fine ? boxLines(v.coastFine || v.coastReal || v.coast) : boxLines(v.coastReal || v.coast);
+    const realLake = fine ? boxLines(v.lakeFine || v.lakeReal || v.lake) : boxLines(v.lakeReal || v.lake);
     const coast = fine ? v.coastFine : v.coast;
     const lake = fine ? v.lakeFine : v.lake;
     const ice = fine ? v.iceFine : v.ice;
@@ -494,33 +531,33 @@
     for (const r of opts.rects) {
       const fx = (px) => r.x + px * sx;
       const fy = (py) => (r.odd ? r.yTop + H - py * sy : r.yTop + py * sy);
-      if (fantasy) {
-        const strokeLines = (lists, color, lw) => {
-          g.strokeStyle = color;
-          g.lineWidth = lw;
-          g.beginPath();
-          let seg = 0;
-          for (const list of lists) {
-            for (const b of list) {
-              const p = b.p;
-              const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
-              for (const sh of shifts) {
-                let pen = false;    // 上一段还连着,可以省掉 moveTo
-                for (let i = 0; i + 3 < p.length; i += 2) {
-                  const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
-                  const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
-                  if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
-                  if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
-                    || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
-                  if (!pen) { g.moveTo(x0, y0); pen = true; }
-                  g.lineTo(x1, y1);
-                  if (++seg >= 3000) { g.stroke(); g.beginPath(); pen = false; seg = 0; }
-                }
+      const strokeLines = (lists, color, lw) => {
+        g.strokeStyle = color;
+        g.lineWidth = lw;
+        g.beginPath();
+        let seg = 0;
+        for (const list of lists) {
+          for (const b of list) {
+            const p = b.p;
+            const shifts = b.x1 > W ? [0, -W] : b.x0 < 0 ? [0, W] : [0];
+            for (const sh of shifts) {
+              let pen = false;    // 上一段还连着,可以省掉 moveTo
+              for (let i = 0; i + 3 < p.length; i += 2) {
+                const x0 = fx(p[i] + sh), y0 = fy(p[i + 1]);
+                const x1 = fx(p[i + 2] + sh), y1 = fy(p[i + 3]);
+                if (!Number.isFinite(x0 + y0 + x1 + y1)) { pen = false; continue; }
+                if (Math.max(x0, x1) < -6 || Math.min(x0, x1) > cw + 6
+                  || Math.max(y0, y1) < -6 || Math.min(y0, y1) > ch + 6) { pen = false; continue; }
+                if (!pen) { g.moveTo(x0, y0); pen = true; }
+                g.lineTo(x1, y1);
+                if (++seg >= 3000) { g.stroke(); g.beginPath(); pen = false; seg = 0; }
               }
             }
           }
-          g.stroke();
-        };
+        }
+        g.stroke();
+      };
+      if (fantasy) {
         g.save();
         g.lineJoin = 'round';
         g.lineCap = 'butt';
@@ -542,6 +579,23 @@
         // 林块:主站 detail.ts 的层级顺序是 海岸墨线 → 林块 → 河流 → 山符号,所以插在这里(河流之前)。
         // 主站的林块从来不烘进底图,所以高清块(tileFull)里也照画。
         drawForestInRect(g, v, r, sx, sy, H, relK, cw, ch, W);
+      } else if (realistic) {
+        // 写实系(geo / satellite / classic)的岸线墨线:底色之上、河网之前。颜色 / 线宽照主站
+        // 地图册(MATERIALS.geo.coast)。铺满高清块时瓦片自带一份岸线(app.js 的 tileLines),
+        // 这里裁掉 tileCover 盖住的区域免得两条线叠着;tileFull 时整份都不画,和手绘风同一套机制。
+        if (!tileFull) {
+          g.save();
+          g.lineJoin = 'round';
+          g.lineCap = 'butt';
+          if (tileCover.length) {
+            const cover = new Path2D();
+            cover.rect(-20, -20, cw + 40, ch + 40);
+            for (const t of tileCover) cover.rect(t.x, t.y, t.w, t.h);
+            g.clip(cover, 'evenodd');
+          }
+          strokeLines([realLake, realCoast], realInk, realInkLW);
+          g.restore();
+        }
       }
       // 河网画在墨线 / 林块之后(与主站 detail.ts 的层级顺序一致:墨线 → 林块 → 河 → 山符号),
       // 这样河口压在岸线墨线上而不是被墨线切断;tileCover 的裁剪已经结束,高清块里没烘河所以照画。

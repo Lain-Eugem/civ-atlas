@@ -35,6 +35,7 @@ import {
   isFinished,
   sessionSummary,
   magicView,
+  worldIdOf,
   type EventView,
   type PolityView,
   type RulerView,
@@ -57,7 +58,8 @@ import {
 } from './field-render';
 import { DEFAULT_MAGIC_STYLE, renderMagicMap, renderMagicTile, magicDataJson, magicLegendOf, magicLayerOf, parseMagicColors } from './magic-render';
 import { isTerrainStyle, renderTile, renderVectors, renderWhole, type TerrainStyle } from './terrain';
-import { renderOwnerPixels } from './owner-map';
+import { renderOwnerPixels, ownerCivData, renderOwnerTilePixels } from './owner-map';
+import { buildLabels } from './labels';
 import { disposeMapPools, renderViaPool } from './map-pool';
 import type { World } from '../src/gen/world';
 import type { Civ, Polity } from '../src/gen/civ/types';
@@ -111,7 +113,7 @@ function pngChunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([len, typ, data, crc]);
 }
 
-function encodePng(width: number, height: number, rgba: Uint8Array): Buffer {
+function encodePng(width: number, height: number, rgba: Uint8Array | Uint8ClampedArray): Buffer {
   const stride = width * 4;
   const raw = Buffer.alloc((stride + 1) * height);
   for (let y = 0; y < height; y++) {
@@ -586,6 +588,17 @@ const fieldPngs = new Map<string, { png: Buffer; legend: unknown }>();
 const magicPngs = new Map<string, { png: Buffer; legend: unknown; frameYear: number | null }>();
 /** 「魔力」高清瓦片缓存:键 = sessionId|年份|S|x|y|size(每块只算一次) */
 const magicTilePngs = new Map<string, Buffer>();
+/** 疆域高清瓦片缓存:键 = sessionId|状态指纹|S|x|y|size(和整张疆域图同时失效) */
+const ownerTilePngs = new Map<string, Buffer>();
+/** 标签层缓存:键 = sessionId|年份(世界 / 文明状态不变时只生成一次) */
+const labelsCache = new Map<string, string>();
+
+/** 会话状态变了:整张疆域图和它的疆域瓦片都作废(瓦片按 session 前缀清) */
+function invalidateOwnerCache(sid: string): void {
+  ownerCache.delete(sid);
+  const prefix = `${sid}|`;
+  for (const key of ownerTilePngs.keys()) if (key.startsWith(prefix)) ownerTilePngs.delete(key);
+}
 
 function optNum(v: string | null): number | undefined {
   if (v === null || v === '') return undefined;
@@ -685,7 +698,6 @@ function parseTileQuery(q: URLSearchParams): TileQuery {
   if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('x / y 必须是数字');
   if (!Number.isInteger(size) || size < 16 || size > 1024) throw new Error('size 超出范围');
   const style = styleOf(q);
-  if (style === 'classic') throw new Error('classic 画法没有高清瓦片');
   return { worldId, style, S, x, y, size, key: `${worldId}|${style}|r${TILE_RENDER_VER}|${S}|${x}|${y}|${size}` };
 }
 
@@ -694,12 +706,9 @@ async function getBasePng(worldId: string, style: TerrainStyle): Promise<Buffer>
   const hit = baseCache.get(key);
   if (hit) return hit;
   const rec = getWorldRecord(worldId);
-  // classic = 改造前沙盒自己的三角栅格底图,留作对照 / 兜底;其余画法直接跑主站的渲染管线。
-  // 首次渲染在 worker 池里跑(不阻塞其它请求),池不可用就原地渲染。
-  const map =
-    style === 'classic'
-      ? renderWorldMap(rec.world)
-      : ((await renderViaPool(worldId, rec.world, { kind: 'whole', style })) ?? renderWhole(rec.world, style));
+  // 所有画法(含 classic)都走主站同一条渲染管线;首次渲染在 worker 池里跑(不阻塞其它请求),
+  // 池不可用就原地渲染。
+  const map = (await renderViaPool(worldId, rec.world, { kind: 'whole', style })) ?? renderWhole(rec.world, style);
   const png = encodePng(map.width, map.height, map.rgba);
   baseCache.set(key, png);
   return png;
@@ -960,7 +969,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const worldId = url.searchParams.get('worldId') ?? '';
     if (!worldId) { fail(res, 400, '缺 worldId'); return true; }
     const style = styleOf(url.searchParams);
-    if (style === 'classic') { sendJson(res, 200, { state: 'done', done: 0, total: 0, style }); return true; }
     const st = method === 'POST'
       ? startPrewarm(worldId, style)
       : prewarmState.get(`${worldId}|${style}`) ?? { state: 'idle', done: 0, total: 0, startedAt: 0, style };
@@ -1028,6 +1036,53 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       borders: m.borders,
       fingerprint: m.fingerprint,
     });
+    return true;
+  }
+
+  // 标签层:地名 / 河名 / 湖名 / 国名,按会话当前年份生成(几百条,JSON 传一次)
+  if (method === 'GET' && pathname === '/api/labels') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const year = s.play.year;
+    const key = `${s.id}|${year}`;
+    let json = labelsCache.get(key);
+    if (!json) {
+      json = JSON.stringify(buildLabels(s.world, s.civ, { year }));
+      labelsCache.set(key, json);
+      if (labelsCache.size > 8) labelsCache.clear();
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(json);
+    return true;
+  }
+
+  // 疆域高清瓦片:放大后按当前倍率现算一块(和 /api/map/tile 同一套坐标约定);
+  // 整张疆域网(/api/map/owners)仍负责缩小时的兜底 + 240 网格 + 国界线。
+  if (method === 'GET' && pathname === '/api/map/owner-tile') {
+    const q = url.searchParams;
+    const sid = q.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const S = Number(q.get('S'));
+    const x = Number(q.get('x'));
+    const y = Number(q.get('y'));
+    const size = Number(q.get('size'));
+    if (!Number.isFinite(S) || S < 0.25 || S > 24) { fail(res, 400, 'S 超出范围'); return true; }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
+    if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
+    const s = getSession(sid);
+    const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
+    const key = `${sid}|${fingerprint}|${S}|${x}|${y}|${size}`;
+    const hit = ownerTilePngs.get(key);
+    if (hit) { sendPng(res, hit); return true; }
+    const civ = ownerCivData(s.civ);
+    const map =
+      (await renderViaPool(worldIdOf(s.worldParams), s.world, { kind: 'owner', S, x, y, size, civ })) ??
+      renderOwnerTilePixels(s.world, civ, S, x, y, size);
+    const png = encodePng(map.width, map.height, map.rgba);
+    if (ownerTilePngs.size > 512) ownerTilePngs.clear();
+    ownerTilePngs.set(key, png);
+    sendPng(res, png);
     return true;
   }
 
@@ -1252,7 +1307,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         ...(dmPreset ? { dmPreset: true } : {}),
         ...(magicField !== undefined ? { magicField } : {}),
       });
-      ownerCache.delete(session.id);
+      invalidateOwnerCache(session.id);
       chronCache.delete(session.id);
       sendJson(res, 200, { session: summary, state: stateView(session) });
       return true;
@@ -1292,7 +1347,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
       const round = await monarchRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
       return true;
     }
@@ -1317,7 +1372,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
             .filter((r) => Number.isInteger(r.polityId) && Number.isInteger(r.index))
         : undefined;
       const round = await monarchCommit(s, reject ? { reject } : {});
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
       return true;
     }
@@ -1362,7 +1417,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         ...(args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) }),
         ...(Array.isArray(args.decisions) ? { decisions: args.decisions } : {}),
       });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { dm, state: stateView(s) });
       return true;
     }
@@ -1391,7 +1446,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
       const petty = await pettyRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { petty, state: stateView(s) });
       return true;
     }
@@ -1401,7 +1456,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
       const turn = turnStep(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
-      ownerCache.delete(s.id);
+      invalidateOwnerCache(s.id);
       sendJson(res, 200, { turn, state: stateView(s) });
       return true;
     }

@@ -34,7 +34,7 @@ import { subSeed } from '../src/gen/util';
 import { macroGrids, realisticPixels, realisticWindowPixels, type MacroGrids } from '../src/render/realistic';
 import type { SurfaceLook } from '../src/render/surface';
 
-/** 沙盒里可选的地形画法。classic = 改造前的三角栅格底图,由 viewer.ts 自己画,这里不处理。 */
+/** 沙盒里可选的地形画法。classic = 主站经典卫星画法(realistic 的 'classic' look),和 geo/satellite 同一条写实流水线。 */
 export const TERRAIN_STYLES = ['fantasy', 'satellite', 'geo', 'white', 'classic'] as const;
 export type TerrainStyle = (typeof TERRAIN_STYLES)[number];
 
@@ -42,7 +42,7 @@ export function isTerrainStyle(x: unknown): x is TerrainStyle {
   return TERRAIN_STYLES.includes(x as TerrainStyle);
 }
 
-const LOOK: Record<'satellite' | 'geo', SurfaceLook> = { satellite: 'detail', geo: 'geo' };
+const LOOK: Record<'satellite' | 'geo' | 'classic', SurfaceLook> = { satellite: 'detail', geo: 'geo', classic: 'classic' };
 
 /**
  * 河网几何的固定线宽档:只用来算 DenseRiver.w(真正下发的是 f / m,前端按当前画风和缩放现算宽度)。
@@ -71,7 +71,7 @@ interface TerrainCtx {
   vectors: VectorData | null;
   /** 河网几何缓存(与画风无关,只算一次) */
   riverNet: RiverNetLine[] | null;
-  /** 带小溪的河网几何缓存(放大后 geo/satellite/white 用,和主站 realistic 的 riversOf 同一套) */
+  /** 带小溪的河网几何缓存(放大后 geo/satellite/white/classic 用,和主站 realistic 的 riversOf 同一套) */
   riverNetCreek: RiverNetLine[] | null;
 }
 
@@ -105,6 +105,15 @@ export interface VectorData {
   ice: number[][];
   /** 冰缘墨线(放大后的精细版) */
   iceFine: number[][];
+  /**
+   * 写实系(geo / satellite / classic)的海岸墨线:和手绘 coast 是同一套追线(fantasyCoastLines)、
+   * 同一份水陆边界,只是写实系按主站地图册(realistic.ts MATERIALS.geo.coast)的墨色 / 线宽画。
+   * 单独给一份字段,写实系不必依赖手绘那份;单档抽稀 tol 0.9(1 整图像素)+ 坐标量化 0.1,
+   * 约 +63KB(未量化会到 +122KB,多种子实测 63–81KB)。
+   */
+  coastReal: number[][];
+  /** 写实系湖岸墨线(见 coastReal) */
+  lakeReal: number[][];
   /** 河流分级阈值:flux 低于它的河段不画,和主站 world.riverThreshold 同义 */
   riverThreshold: number;
   /**
@@ -232,7 +241,7 @@ function wholePixels(world: World, ctx: TerrainCtx, style: TerrainStyle): Uint8C
     } else if (style === 'white') {
       px = whitePixels(ctx.whole);
     } else {
-      px = realisticPixels(ctx.whole, LOOK[style as 'satellite' | 'geo'] ?? 'detail').px;
+      px = realisticPixels(ctx.whole, LOOK[style as 'satellite' | 'geo' | 'classic'] ?? 'detail').px;
     }
     ctx.px.set(style, px);
   }
@@ -425,7 +434,7 @@ function pushRiverNet(out: RiverNetLine[], run: RiverNetLine, tol: number): void
   out.push({ x, y, f, m });
 }
 
-/** 生成矢量层:海岸线、近岸波纹、地形符号、冰缘墨线、河流、河网、林块。墨线类都抽稀过,总量约 2 MB 级。 */
+/** 生成矢量层:海岸线、近岸波纹、地形符号、冰缘墨线、河流、河网、林块。墨线类都抽稀过,总量约 2.6 MB 级。 */
 export function renderVectors(world: World): VectorData {
   const ctx = ctxOf(world);
   if (ctx.vectors) return ctx.vectors;
@@ -435,6 +444,13 @@ export function renderVectors(world: World): VectorData {
   const lines = fantasyCoastLines(ctx.whole);
   const flat = (arr: Float32Array[], tol: number): number[][] =>
     arr.map((p) => Array.from(simplifyLine(p, tol)));
+  // 写实系岸线的坐标再量化到 0.1 地图像素:低倍下远不到 1 屏幕像素,JSON 却便宜一大截
+  // (林块坐标也是这么处理,注释见下面 forest 那段)
+  const flatQuant = (arr: Float32Array[], tol: number): number[][] =>
+    flat(arr, tol).map((p) => {
+      for (let i = 0; i < p.length; i++) p[i] = Math.round(p[i] * 10) / 10;
+      return p;
+    });
   const groups = seaRippleLines(ctx.whole, fp.sea.dist, fp.sea.fade);
   // planGlyphs 一次算出两样:地形符号和林块(主站 render/fantasy.ts 的 Plan),这里都复用
   const plan = planGlyphs(world);
@@ -465,6 +481,10 @@ export function renderVectors(world: World): VectorData {
   ctx.vectors = {
     coast: flat(lines.sea, 0.9),
     lake: flat(lines.lake, 0.9),
+    // 写实系的岸线 / 湖岸墨线:同一套追线,单档抽稀(tol 0.9)+ 坐标量化 0.1。写实系与手绘风
+    // 共用这份几何,只是各自用不同的墨色 / 线宽画;再下发一份精细档要多 510KB,所以写实系只给粗档。
+    coastReal: flatQuant(lines.sea, 0.9),
+    lakeReal: flatQuant(lines.lake, 0.9),
     ripple: groups.map((group) => flat(group, 1.4)),
     coastFine: flat(lines.sea, 0.12),
     lakeFine: flat(lines.lake, 0.12),
@@ -637,7 +657,7 @@ export function renderTile(
     } else if (style === 'white') {
       px = whitePixels(r);
     } else {
-      px = realisticWindowPixels(r, grids, LOOK[style as 'satellite' | 'geo'] ?? 'detail');
+      px = realisticWindowPixels(r, grids, LOOK[style as 'satellite' | 'geo' | 'classic'] ?? 'detail');
     }
 
     for (let t = 0; t < segH; t++) {

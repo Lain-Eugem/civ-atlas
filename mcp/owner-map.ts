@@ -16,6 +16,7 @@ import { Layer, type Civ } from '../src/gen/civ/types';
 import type { CivDrawParams } from '../src/render/civ/overlay';
 import { pixelRegions, washPixels } from '../src/render/civ/territory';
 import { borderLines } from '../src/render/civ/borders';
+import { rasterizeWindow, sphereCoverWindow, zoomSource, type ZoomSource } from '../src/gen/rasterWindow';
 import { worldRaster } from './terrain';
 
 export interface OwnerPixels {
@@ -85,4 +86,207 @@ function ownerBorderLines(world: World, raster: Raster, civ: Civ): number[][] {
   return borderLines(fake, Layer.Polity)
     .filter((l) => l.pts.length >= 4)
     .map((l) => Array.from(l.pts, (v) => Math.round(v * 100) / 100));
+}
+
+/* ------------------------------------------------------------------ *
+ * 疆域高清瓦片:放大后按当前倍率现算一块(和地形瓦片同一套坐标)
+ *
+ * 整张疆域图是 1 倍主图(2048 宽)的 PNG,放大到 8 倍就是拿 256 像素宽的位图去铺屏,
+ * 糊成一片。这里照 terrain.ts 的 renderTile 做:屏幕上要多大就从球面重新铺像素,
+ * 再跑同一条 washPixels,所以水彩、浓边、颗粒和整张图逐像素一致(留边裁掉后无缝)。
+ * ------------------------------------------------------------------ */
+
+/** 疆域瓦片渲染要用的 Civ 数据:只留三个 TypedArray,方便丢进 worker 线程 */
+export interface OwnerCivData {
+  /** 州 → 国家编号(= Civ.regions.of;水 / 无主 = −1) */
+  of: Int32Array;
+  /** 州 → 国家编号的归属表(= Civ.polity) */
+  polity: Int16Array;
+  /** 国 id → RGB(colors[id×3 …]) */
+  colors: Uint8Array;
+}
+
+/** 从 Civ 里抽出画疆域要用的最小数据(整张图 / 瓦片共用) */
+export function ownerCivData(civ: Civ): OwnerCivData {
+  return { of: civ.regions.of, polity: civ.polity, colors: polityColors(civ) };
+}
+
+/**
+ * 疆域瓦片的留边(1 倍像素):washPixels 的浓边查表最远 64 像素,
+ * 留 72 保证裁掉留边后每块算出来的水彩和整张图逐像素一致(拼块无缝)。
+ */
+const OWNER_TILE_PAD = 72;
+
+/** zoomSource 会算河口 / 谷线 / 刻痕,约 0.6 秒;每个 World 只算一次 */
+const ownerSrcCache = new WeakMap<World, ZoomSource>();
+function ownerSrcOf(world: World): ZoomSource {
+  let src = ownerSrcCache.get(world);
+  if (!src) {
+    src = zoomSource(world, worldRaster(world));
+    ownerSrcCache.set(world, src);
+  }
+  return src;
+}
+
+/**
+ * 单块疆域 RGBA。坐标约定完全照抄 terrain.ts 的 renderTile:
+ * (x,y) = 这块左上角在 S 倍展开平面上的像素坐标,可以越过左右边(经度周期)、
+ * 上下边(跨极点时整块镜像,奇数层),返回 size×size 的未预乘 RGBA(水 / 无主 alpha = 0)。
+ * 低倍率仍用 renderOwnerPixels 的整张 PNG 兜底,两边是同一套 wash 管线。
+ */
+export function renderOwnerTilePixels(
+  world: World,
+  civ: OwnerCivData,
+  S: number,
+  x: number,
+  y: number,
+  size: number,
+): OwnerPixels {
+  const src = ownerSrcOf(world);
+  const whole = worldRaster(world);
+  const W = world.width * S;
+  const H = world.height * S;
+  const P = OWNER_TILE_PAD;
+  const n = size + 2 * P;
+  const out = new Uint8ClampedArray(size * size * 4);
+  let py = 0;
+  while (py < size) {
+    const layer = Math.floor((y + py) / H);
+    let end = py + 1;
+    while (end < size && Math.floor((y + end) / H) === layer) end++;
+    const segH = end - py;
+    const odd = ((layer % 2) + 2) % 2 === 1;
+    const ysFirst = odd ? (layer + 1) * H - (y + py) : (y + py) - layer * H;
+    const ysLast = odd ? (layer + 1) * H - (y + end - 1) : (y + end - 1) - layer * H;
+    const y0 = Math.min(ysFirst, ysLast);
+    const xs = odd ? x - W / 2 : x;
+    const xr = (((xs - P) % W) + W) % W;
+    const m = segH + 2 * P;
+    // 水陆 / 像素→地块 / 州→国家归属:和整张图同一条算路,只是窗口带留边
+    const water = waterWindow(world, src, whole, S, xs - P, y0 - P, n, m);
+    const cov = sphereCoverWindow(world, S, xr, y0 - P, n, m);
+    const cell = cellsOf(world.mesh, cov);
+    const pixRegion = pixelRegions(
+      world.mesh,
+      { w: n, h: m, water, cell } as unknown as Raster,
+      civ.of,
+    );
+    const buf = new Uint8ClampedArray(n * m * 4);
+    washPixels(
+      { w: n, h: m, f: 1, pixRegion, owner: civ.polity, colors: civ.colors, style: 'fantasy', polity: true },
+      buf,
+    );
+    for (let t = 0; t < segH; t++) {
+      const srcRow = odd ? segH - 1 - t : t;
+      const from = ((srcRow + P) * n + P) * 4;
+      out.set(buf.subarray(from, from + size * 4), (py + t) * size * 4);
+    }
+    py = end;
+  }
+  return { width: size, height: size, rgba: out, borders: [] };
+}
+
+/**
+ * 像素 → 最近顶点(= 地块 cell)。逐像素复刻 src/gen/raster.ts 的 sphereFill(2×10⁶ 像素实测零误差),
+ * 因为 rasterizeWindow 出来的窗口 raster 的 cell 永远是空数组(它只给地形上色用)。
+ */
+function cellsOf(
+  mesh: World['mesh'],
+  cov: { tri: Int32Array; wa: Float32Array; wb: Float32Array },
+): Int32Array {
+  const tri = mesh.triangles;
+  const N = cov.tri.length;
+  const cell = new Int32Array(N);
+  for (let k = 0; k < N; k++) {
+    const ti = cov.tri[k] - 1;
+    if (ti < 0) continue;
+    const a = tri[ti * 3];
+    const b = tri[ti * 3 + 1];
+    const c = tri[ti * 3 + 2];
+    const ua = cov.wa[k];
+    const ub = cov.wb[k];
+    const uc = 1 - ua - ub;
+    cell[k] = ua >= ub ? (ua >= uc ? a : c) : ub >= uc ? b : c;
+  }
+  return cell;
+}
+
+/**
+ * 窗口内的水陆(1 = 水,0 = 陆)。
+ * 精确的 S 级水陆要把 rasterizeWindow 的整条地形上色管线跑一遍(656² 窗口 0.3–1.2 秒),
+ * 这里只用水陆,所以按「高低倍率水陆近似不变」取低倍率再双线性放大:
+ *   S ≤ 2 → 直接拿整张 1 倍水陆图取样(免费);
+ *   S ≥ 4 → 在 2 倍平面 rasterizeWindow 一个小窗口(20–280 毫秒)。
+ * 实测水彩 alpha 与 S 级精确水陆只差 0.0%–0.2%(沿岸 1–2 像素),和地形海岸严丝合缝。
+ */
+function waterWindow(
+  world: World,
+  src: ZoomSource,
+  whole: Raster,
+  S: number,
+  x0: number,
+  y0: number,
+  n: number,
+  m: number,
+): Uint8Array {
+  const Sw = S >= 4 ? 2 : 1;
+  const scale = Sw / S;
+  const xq0 = x0 * scale;
+  const yq0 = y0 * scale;
+  if (Sw === 1) {
+    return sampleWater(whole.water, whole.w, whole.h, 0, 0, xq0, yq0, scale, n, m, true);
+  }
+  const srcW = world.width * Sw;
+  const x0U = Math.floor(xq0) - 1;
+  const y0U = Math.floor(yq0) - 1;
+  const nw = Math.ceil((n + 2) * scale) + 3;
+  const mw = Math.ceil((m + 2) * scale) + 3;
+  const r = rasterizeWindow(src, Sw, ((x0U % srcW) + srcW) % srcW, y0U, nw, mw);
+  return sampleWater(r.water, r.w, r.h, x0U, y0U, xq0, yq0, scale, n, m, false);
+}
+
+/**
+ * 双线性取水陆:data 是源平面的 water(≠0 就算水);
+ * (x0U, y0U) = 源窗口第 0 列 / 行对应的未 wrap 坐标;wrapX 时列按世界周期绕回,行永远夹在两极。
+ */
+function sampleWater(
+  data: ArrayLike<number>,
+  w: number,
+  h: number,
+  x0U: number,
+  y0U: number,
+  xq0: number,
+  yq0: number,
+  scale: number,
+  n: number,
+  m: number,
+  wrapX: boolean,
+): Uint8Array {
+  const out = new Uint8Array(n * m);
+  for (let y = 0; y < m; y++) {
+    const qy = yq0 + (y + 0.5) * scale - 0.5 - y0U;
+    let y1 = Math.floor(qy);
+    const fy = qy - y1;
+    const r1 = y1 < 0 ? 0 : y1 > h - 1 ? h - 1 : y1;
+    const r2 = r1 + 1 > h - 1 ? h - 1 : r1 + 1;
+    for (let x = 0; x < n; x++) {
+      const qx = xq0 + (x + 0.5) * scale - 0.5 - x0U;
+      let x1 = Math.floor(qx);
+      const fx = qx - x1;
+      let x2: number;
+      if (wrapX) {
+        x1 = ((x1 % w) + w) % w;
+        x2 = (x1 + 1) % w;
+      } else {
+        x1 = x1 < 0 ? 0 : x1 > w - 1 ? w - 1 : x1;
+        x2 = x1 + 1 > w - 1 ? w - 1 : x1 + 1;
+      }
+      const a = data[r1 * w + x1] > 0 ? 1 : 0;
+      const b = data[r1 * w + x2] > 0 ? 1 : 0;
+      const c = data[r2 * w + x1] > 0 ? 1 : 0;
+      const d = data[r2 * w + x2] > 0 ? 1 : 0;
+      out[y * n + x] = (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy > 0.5 ? 1 : 0;
+    }
+  }
+  return out;
 }

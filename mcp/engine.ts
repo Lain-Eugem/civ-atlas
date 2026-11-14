@@ -22,6 +22,7 @@ import { polityAlive, capitalAt, polityName } from '../src/gen/civ/growth';
 import { rulerAt } from '../src/gen/civ/story/peopleInfo';
 import { buildChronicle, entryInvolves, type ChronicleEntry } from '../src/gen/civ/story/chronicle';
 import { cleanOrders, ORDER_KINDS, KEY_HELP, type CleanedOrders } from './orders';
+import { riverReport, riverSummary, type RiverSummary } from './rivers-data';
 import { dmKnobs, dmTuningValues, mergeKnobs } from '../src/gen/civ/dm';
 import { MAGIC_LAYER, magicPlugin, magicStrengthOf } from '../src/gen/civ/magicPlugin';
 import { cleanFieldSpec, fieldPlugin, type FieldSpec } from '../src/gen/civ/fieldPlugin';
@@ -372,6 +373,8 @@ export interface SessionSummary {
   finished: boolean;
   world: { worldId: string; seed: number; cells: number };
   polities: number;
+  /** 河流对地块的影响落在哪:河道条数/地块数/沾河州/沿河承载力占比(见 rivers-data.ts) */
+  rivers: RiverSummary;
   fingerprint: string;
   logDir: string;
   /** 本局玩家自定义场(没开 = 不给这个字段) */
@@ -397,6 +400,7 @@ export function sessionSummary(s: Session): SessionSummary {
     finished: isFinished(s),
     world: { worldId: worldIdOf(s.worldParams), seed: s.worldParams.seed, cells: s.worldParams.cells },
     polities: aliveCount(s.civ, s.play.year),
+    rivers: riverSummary(s.world, s.civ),
     fingerprint: civHash(s.civ),
     logDir: s.logDir,
     ...(s.fields?.length ? { fields: s.fields.map((f) => f.id) } : {}),
@@ -592,6 +596,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     rounds: s.rounds,
     finished: isFinished(s),
     polities: alive,
+    rivers: riverReport(s.world, s.civ, year),
     commandQueue: s.queue.length,
     commands: s.play.commands.map((v) => ({ kind: v.kind, from: v.from, time: commandTime(v), ...restOf(v) })),
     fingerprint: civHash(s.civ),
