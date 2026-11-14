@@ -54,13 +54,13 @@
    */
   function regionLineStyle(style) {
     if (style === 'geo' || style === 'satellite') {
-      return { stroke: 'rgba(118,134,150,0.34)', width: 0.7, dash: [2, 3], lineCap: 'round', lineJoin: 'round' };
+      return { stroke: 'rgba(110,128,148,0.52)', width: 1.0, dash: [4, 2], lineCap: 'round', lineJoin: 'round' };
     }
     if (style === 'white' || style === 'classic') {
-      return { stroke: 'rgba(90,82,70,0.22)', width: 0.7, dash: [2, 3], lineCap: 'round', lineJoin: 'round' };
+      return { stroke: 'rgba(90,82,70,0.42)', width: 1.0, dash: [4, 2], lineCap: 'round', lineJoin: 'round' };
     }
     // fantasy(默认手绘风):暖褐色,和国界的墨线一个色系,压淡
-    return { stroke: 'rgba(90,70,48,0.30)', width: 0.7, dash: [2, 3], lineCap: 'round', lineJoin: 'round' };
+    return { stroke: 'rgba(88,66,44,0.55)', width: 1.0, dash: [4, 2], lineCap: 'round', lineJoin: 'round' };
   }
 
   /**
