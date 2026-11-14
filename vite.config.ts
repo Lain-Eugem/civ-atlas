@@ -189,7 +189,7 @@ export default defineConfig({
     strictPort: true,
     // 开发时别监视缓存/临时目录:预渲染瓦片(.runs)和验证截图(snaps)动辄几百 MB,
     // 而且脚本写临时文件时会被 Windows 锁住,watcher 抛 EBUSY 会把 dev server 弄崩
-    watch: { ignored: ['**/.runs/**', '**/snaps/**'] },
+    watch: { ignored: ['**/.runs/**', '**/snaps/**', '**/*.tmpdir/**', '**/.*.tmpdir/**', '**/*.tmp'] },
   },
   // 只跑 tests/ 下的单测;本地工具目录(.claude/)里的不算。
   // 先后和分份(PR 检查上分几台机器跑)按各文件大概多久排,见 tests/lib/shardSequencer.ts
