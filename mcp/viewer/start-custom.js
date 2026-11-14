@@ -1,5 +1,5 @@
 /*
- * 君主开局定制面板(viewer 客户端模块,IIFE,不依赖 app.js 内部状态)。
+ * 君主开局面板(viewer 客户端模块,IIFE,不依赖 app.js 内部状态)。
  *
  * 由 mcp/viewer/app.js 的「✦ 开局设置」按钮调用:
  *   window.CivStart.open({ sessionId, state, api, pick, onApplied })
@@ -7,11 +7,19 @@
  * - pick(cb):进入地图点选模式;用户点地图后回调 cb({ x, y })(主图世界像素 0..2048 / 0..1024)
  * - onApplied(data):应用成功后的回调,data = { state, result }(Lead 用它刷新看板)
  *
- * 对外契约:
- *   window.CivStart.open(cfg) / close() / collect() / bindPick(cb) / pickAt(x, y)
+ * 面板分两段:
+ *   ① 国家名单:数量(3–30)、每国控制方式(AI 君主 / 程序自动)、删国、新建国家(带落点)
+ *      —— 走 POST /api/session/start-setup,每个会话只能应用一次(第一回合前)
+ *   ② 君主定制:选一个现有国家或新建国家,改角色卡与起始疆域
+ *      —— 走 POST /api/session/custom-start(原有能力,保留)
+ * 两段都只是本地预览,点「应用开局」才提交;有删改时先提交国家设置,再提交君主定制。
  *
- * 后端路由(Lead 接线):
+ * 后端路由:
+ *   GET  /api/start/config?sessionId=<id>   -> { nations:[{polityId,name,color,capital,regions,seatName,control}], count, min, max, canSetup, applied, control, regions }
  *   GET  /api/start/nations?sessionId=<id>  -> { nations: StartNation[] }
+ *   POST /api/session/start-setup           -> { ok, result: StartSetupResult, state }
+ *        body: { sessionId, count?, remove?:number[], controls?:{[id]:'ai'|'program'}, nations?:[{at?,size?,card?,control?}], force? }
+ *        409 = 删到最后一州需要确认,body = { error, needConfirm:[{polityId,name,message}] },确认后带 force:true 重提
  *   POST /api/session/custom-start          -> { state, result: CustomStartResult }
  *        body: { sessionId, polityId?, at?: {x,y}, size?, card?, autoCard? }
  */
@@ -23,12 +31,35 @@
 
   /** @type {null | {sessionId:string, state:any, api:Function, pick:Function, onApplied:Function}} */
   var cfg = null;
-  /** 点选得到的世界像素坐标;null = 没选(新建国家时后端回退到最大无主州) */
+  /** ② 君主定制的点选位置;null = 没选(新建国家时后端回退到最大无主州) */
   var pickedAt = null;
-  /** 当前国家列表 */
+  /** ① 新增国家的点选位置;null = 让后端挑最大的无主州 */
+  var addAt = null;
+  /** ② 当前国家列表(GET /api/start/nations) */
   var nations = [];
+  /** ① 开局国家设置状态(GET /api/start/config);null = 这个版本没有该接口 */
+  var setupInfo = null;
+  /** ① 本地预览:将删除的国家编号 */
+  var removedIds = {};
+  /** ① 本地预览:国家编号 → 控制方式 */
+  var controls = {};
+  /** ① 应用前的控制方式(只提交改过的) */
+  var initialControls = {};
+  /** ① 本地预览:将新建的国家 [{size, at?}] */
+  var addedNations = [];
+  var addedSeq = 0;
+  /** ① 目标国家数量(滑块值) */
+  var countTarget = 0;
+  /** ① 滑块初始值(没动就不提交 count) */
+  var countBase = 0;
+  /** ① 应用过之后锁定(一个会话只能应用一次) */
+  var countriesLocked = false;
+  /** ② 君主定制是否有本地改动 */
+  var customDirty = false;
   /** 正在请求中 */
   var busy = false;
+  /** 待确认的删除动作 */
+  var confirmAction = null;
   /** bindPick 注册的外部回调(可选) */
   var externalPick = null;
 
@@ -55,6 +86,12 @@
     box.className = 'start-msg' + (isErr ? ' err' : ' ok');
   }
 
+  function setBtnBusy(on) {
+    var apply = el('startApply');
+    apply.disabled = on;
+    apply.textContent = on ? '应用中…' : '应用开局';
+  }
+
   // ── 样式:最小自足样式(不改 style.css;Lead 可以覆盖/补充 start-* 类) ─────
   function injectStyle() {
     if ($(STYLE_ID)) return;
@@ -62,9 +99,9 @@
     style.id = STYLE_ID;
     style.textContent = [
       '#' + PANEL_ID + '[hidden]{display:none!important}',
-      '#' + PANEL_ID + '{position:absolute;left:var(--gap,12px);top:calc(var(--top-h,0px) + var(--gap,12px)*2);z-index:60;width:392px;max-height:calc(100vh - var(--top-h,0px) - var(--gap,12px)*3);display:flex;flex-direction:column;overflow:hidden;background:var(--panel-solid,#fffdf8);color:var(--ink,#2b2622);border:1px solid var(--line,#d9d2c6);border-radius:var(--r-panel,10px);box-shadow:0 10px 30px rgba(0,0,0,.18)}',
+      '#' + PANEL_ID + '{position:absolute;left:var(--gap,12px);top:calc(var(--top-h,0px) + var(--gap,12px)*2);z-index:60;width:404px;max-height:calc(100vh - var(--top-h,0px) - var(--gap,12px)*3);display:flex;flex-direction:column;overflow:hidden;background:var(--panel-solid,#fffdf8);color:var(--ink,#2b2622);border:1px solid var(--line,#d9d2c6);border-radius:var(--r-panel,10px);box-shadow:0 10px 30px rgba(0,0,0,.18)}',
       '#' + PANEL_ID + ' .panel-head{flex:0 0 auto}',
-      '#startCustomPanel .start-panel-body{overflow:auto;display:flex;flex-direction:column;gap:8px;padding:10px 12px}',
+      '#startCustomPanel .start-panel-body{overflow:auto;display:flex;flex-direction:column;gap:10px;padding:10px 12px}',
       '#startCustomPanel .start-panel-body .field{display:flex;flex-direction:column;gap:4px;margin:0}',
       '#startCustomPanel .field>span,#startCustomPanel .field>label{font-size:12px;color:var(--ink-2,#5c544a)}',
       '#startCustomPanel input[type=text],#startCustomPanel select,#startCustomPanel textarea{width:100%;box-sizing:border-box;background:var(--field,#f6f1e7);color:var(--ink,#2b2622);border:1px solid var(--line-soft,#e6ded0);border-radius:6px;padding:5px 7px;font:inherit;font-size:13px}',
@@ -82,7 +119,33 @@
       '#startCustomPanel .start-msg.ok{color:#2f7d4f}',
       '#startCustomPanel .start-foot{flex:0 0 auto;display:flex;gap:8px;padding:8px 12px;border-top:1px solid var(--line-soft,#e6ded0)}',
       '#startCustomPanel .start-foot .btn{flex:1 1 0}',
-      '#startCustomPanel .start-trait-val{font-variant-numeric:tabular-nums;font-size:12px;color:var(--ink-3,#857b6d)}'
+      '#startCustomPanel .start-trait-val{font-variant-numeric:tabular-nums;font-size:12px;color:var(--ink-3,#857b6d)}',
+      // ① 国家名单
+      '#startCustomPanel .start-section{display:flex;flex-direction:column;gap:6px;border-top:1px dashed var(--line-soft,#e6ded0);padding-top:8px;min-width:0}',
+      '#startCustomPanel .start-section:first-child{border-top:0;padding-top:0}',
+      '#startCustomPanel .start-section-head{display:flex;align-items:baseline;gap:8px;font-size:12px;font-weight:600;color:var(--ink-2,#5c544a)}',
+      '#startCustomPanel .start-section-head .hint{font-weight:400;font-size:11px;color:var(--ink-3,#857b6d);flex:1 1 auto;text-align:right}',
+      '#startCustomPanel .start-hint{font-size:11px;line-height:1.5;color:var(--ink-3,#857b6d);white-space:pre-wrap}',
+      '#startCustomPanel .start-nations{display:flex;flex-direction:column;gap:3px;max-height:210px;overflow:auto;padding-right:2px}',
+      '#startCustomPanel .start-nation-row{display:flex;align-items:center;gap:6px;border:1px solid var(--line-soft,#e6ded0);border-radius:6px;padding:3px 6px;background:var(--field,#f6f1e7);font-size:12px;min-width:0}',
+      '#startCustomPanel .start-nation-row .swatch{flex:0 0 auto;width:10px;height:10px;border-radius:2px;border:1px solid rgba(0,0,0,.15)}',
+      '#startCustomPanel .start-nation-row .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '#startCustomPanel .start-nation-row .meta{flex:0 0 auto;color:var(--ink-3,#857b6d);font-variant-numeric:tabular-nums}',
+      '#startCustomPanel .start-nation-row select{flex:0 0 auto;width:auto;padding:1px 4px;font-size:11px}',
+      '#startCustomPanel .start-nation-row .btn-del{flex:0 0 auto;border:0;background:transparent;color:#b23a2e;cursor:pointer;font-size:13px;padding:1px 3px;border-radius:4px}',
+      '#startCustomPanel .start-nation-row .btn-del:hover{background:rgba(178,58,46,.12)}',
+      '#startCustomPanel .start-nation-row.removed{opacity:.55;text-decoration:line-through}',
+      '#startCustomPanel .start-nation-row.removed .btn-del{text-decoration:none}',
+      '#startCustomPanel .start-nation-row.auto-trim{border-style:dashed;border-color:#c98a2e;background:rgba(201,138,46,.08)}',
+      '#startCustomPanel .start-nation-row.auto-trim .nm::after{content:"（数量调整:将自动删除）";color:#a36f1d;font-size:11px}',
+      '#startCustomPanel .start-add{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+      '#startCustomPanel .start-add input[type=range]{flex:1 1 60px;width:auto}',
+      '#startCustomPanel .start-add .hint{font-size:11px;color:var(--ink-3,#857b6d);flex:1 1 100%}',
+      '#startCustomPanel .start-confirm{border:1px solid #c98a2e;border-radius:6px;background:rgba(201,138,46,.1);padding:6px 8px;display:flex;flex-direction:column;gap:6px}',
+      '#startCustomPanel .start-confirm[hidden]{display:none!important}',
+      '#startCustomPanel .start-confirm .msg{font-size:12px;line-height:1.5;color:#7a5212;white-space:pre-wrap}',
+      '#startCustomPanel .start-confirm .btns{display:flex;gap:6px}',
+      '#startCustomPanel .start-confirm .btns .btn{flex:1 1 0;font-size:12px;padding:3px 6px}'
     ].join('\n');
     document.head.appendChild(style);
   }
@@ -104,15 +167,40 @@
       '  <button class="btn ghost" id="startClose" type="button" title="关闭">✕</button>',
       '</div>',
       '<div class="params-body start-panel-body">',
-      '  <label class="field"><span>君主国家</span><select id="startNation"></select></label>',
-      '  <div class="start-coord">',
-      '    <button class="btn" id="startPick" type="button">📍 在地图上点选</button>',
-      '    <span class="hint" id="startAtLabel">未选位置(默认落在最大的无主州)</span>',
+      '  <div class="start-section">',
+      '    <div class="start-section-head"><span>① 国家名单</span><span class="hint" id="startSetupState"></span></div>',
+      '    <label class="field"><span>国家数量 <b id="startCountVal">0</b></span>',
+      '      <input id="startCount" type="range" min="3" max="30" step="1" value="3">',
+      '    </label>',
+      '    <div class="start-hint" id="startCountHint"></div>',
+      '    <div class="start-nations" id="startNationRows"></div>',
+      '    <div class="start-add">',
+      '      <button class="btn ghost" id="startAddNation" type="button">＋ 新增国家</button>',
+      '      <span class="start-trait-val">州数 <b id="startAddSizeVal">6</b></span>',
+      '      <input id="startAddSize" type="range" min="3" max="20" step="1" value="6">',
+      '      <button class="btn ghost" id="startAddPick" type="button">📍 落点</button>',
+      '    </div>',
+      '    <div class="start-hint" id="startAddAtLabel">落点未选(默认落在最大的无主州)</div>',
+      '    <div class="start-confirm" id="startConfirm" hidden>',
+      '      <div class="msg" id="startConfirmMsg"></div>',
+      '      <div class="btns">',
+      '        <button class="btn primary" id="startConfirmYes" type="button">确认删除</button>',
+      '        <button class="btn ghost" id="startConfirmNo" type="button">取消</button>',
+      '      </div>',
+      '    </div>',
       '  </div>',
-      '  <label class="field"><span>初始州数 <b id="startSizeVal">8</b></span>',
-      '    <input id="startSize" type="range" min="3" max="40" step="1" value="8">',
-      '  </label>',
-      '  <label class="field check"><input id="startAutoCard" type="checkbox" checked><span>自动生成角色卡</span></label>',
+      '  <div class="start-section">',
+      '    <div class="start-section-head"><span>② 君主定制</span><span class="hint" id="startCustomState"></span></div>',
+      '    <label class="field"><span>君主国家</span><select id="startNation"></select></label>',
+      '    <div class="start-coord">',
+      '      <button class="btn" id="startPick" type="button">📍 在地图上点选</button>',
+      '      <span class="hint" id="startAtLabel">未选位置(默认落在最大的无主州)</span>',
+      '    </div>',
+      '    <label class="field"><span>初始州数 <b id="startSizeVal">8</b></span>',
+      '      <input id="startSize" type="range" min="3" max="40" step="1" value="8">',
+      '    </label>',
+      '    <label class="field check"><input id="startAutoCard" type="checkbox" checked><span>自动生成角色卡</span></label>',
+      '  </div>',
       '  <fieldset id="startCardFields" class="start-card-fields" disabled>',
       '    <label class="field"><span>君主名(留空 = 自动)</span><input id="startName" type="text" maxlength="16" placeholder="例如:萧景桓"></label>',
       '    <div class="row">',
@@ -151,24 +239,46 @@
     el('startClose').addEventListener('click', close);
     el('startCancel').addEventListener('click', close);
     el('startApply').addEventListener('click', onApply);
-    el('startPick').addEventListener('click', onPick);
+    el('startPick').addEventListener('click', function () { onPick('monarch'); });
+    el('startAddPick').addEventListener('click', function () { onPick('add'); });
     el('startRandom').addEventListener('click', randomizeCard);
-    el('startNation').addEventListener('change', onNationChanged);
+    el('startNation').addEventListener('change', function () {
+      customDirty = true;
+      onNationChanged();
+    });
     el('startSize').addEventListener('input', function () {
+      customDirty = true;
       el('startSizeVal').textContent = String(el('startSize').value);
     });
     el('startAutoCard').addEventListener('change', function () {
+      customDirty = true;
       el('startCardFields').disabled = el('startAutoCard').checked;
     });
+    el('startCardFields').addEventListener('input', function () { customDirty = true; });
+    el('startCardFields').addEventListener('change', function () { customDirty = true; });
     var traits = [['startCaution', 'startCautionVal'], ['startAmbition', 'startAmbitionVal'], ['startHonor', 'startHonorVal'], ['startGreed', 'startGreedVal']];
     traits.forEach(function (pair) {
       el(pair[0]).addEventListener('input', function () {
         el(pair[1]).textContent = String(el(pair[0]).value);
       });
     });
+    // ① 国家数量 / 增删 / 控制方式
+    el('startCount').addEventListener('input', onCountInput);
+    el('startAddSize').addEventListener('input', function () {
+      el('startAddSizeVal').textContent = String(el('startAddSize').value);
+    });
+    el('startAddNation').addEventListener('click', onAddNation);
+    el('startNationRows').addEventListener('click', onRowsClick);
+    el('startNationRows').addEventListener('change', onRowsChange);
+    el('startConfirmYes').addEventListener('click', function () {
+      var act = confirmAction;
+      hideConfirm();
+      if (typeof act === 'function') act();
+    });
+    el('startConfirmNo').addEventListener('click', hideConfirm);
   }
 
-  // ── 国家列表 ───────────────────────────────────────────────────────────────
+  // ── 通用请求 ───────────────────────────────────────────────────────────────
   function apiCall(path, body) {
     if (cfg && typeof cfg.api === 'function') return cfg.api(path, body);
     var opts = body === undefined ? undefined : {
@@ -184,6 +294,25 @@
     });
   }
 
+  /** start-setup 要能读到 409 里的 needConfirm,直接用 fetch 而不是 cfg.api */
+  function setupCall(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) {
+          var err = new Error((data && data.error) || ('HTTP ' + res.status));
+          err.needConfirm = data && data.needConfirm;
+          throw err;
+        }
+        return data;
+      });
+    });
+  }
+
+  // ── ② 君主定制:国家列表 ───────────────────────────────────────────────────
   function fallbackNations() {
     var st = cfg && cfg.state;
     var list = st && Array.isArray(st.polities) ? st.polities : [];
@@ -259,29 +388,255 @@
   }
 
   // ── 地图点选(cfg.pick 回调) ───────────────────────────────────────────────
-  function onPick() {
+  function onPick(target) {
     if (!cfg || typeof cfg.pick !== 'function') {
       toastMsg('这个页面没有提供地图点选能力,请手动填坐标或直接应用', true);
       return;
     }
-    toastMsg('在地图上点选君主的起始位置…');
+    toastMsg(target === 'add' ? '在地图上点选新国家的落点…' : '在地图上点选君主的起始位置…');
     cfg.pick(function (pt) {
       if (!pt || typeof pt.x !== 'number' || typeof pt.y !== 'number') return;
-      pickedAt = { x: pt.x, y: pt.y };
-      el('startAtLabel').textContent = '已选位置:x=' + Math.round(pt.x) + ', y=' + Math.round(pt.y);
-      toastMsg('已选位置(可以继续改州数/角色卡)');
-      if (typeof externalPick === 'function') externalPick(pickedAt);
+      if (target === 'add') {
+        addAt = { x: pt.x, y: pt.y };
+        el('startAddAtLabel').textContent = '落点:已选 x=' + Math.round(pt.x) + ', y=' + Math.round(pt.y);
+        toastMsg('新国家落点已选(继续调州数或再加一个)');
+      } else {
+        pickedAt = { x: pt.x, y: pt.y };
+        customDirty = true;
+        el('startAtLabel').textContent = '已选位置:x=' + Math.round(pt.x) + ', y=' + Math.round(pt.y);
+        toastMsg('已选位置(可以继续改州数/角色卡)');
+      }
+      if (typeof externalPick === 'function') externalPick(pickedAt || addAt);
     });
   }
 
   function pickAt(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number') return;
     pickedAt = { x: x, y: y };
+    customDirty = true;
     el('startAtLabel').textContent = '已选位置:x=' + Math.round(x) + ', y=' + Math.round(y);
   }
 
   function bindPick(cb) {
     externalPick = typeof cb === 'function' ? cb : null;
+  }
+
+  // ── ① 开局国家设置:加载 + 预览 ────────────────────────────────────────────
+  function loadConfig() {
+    var sid = cfg.sessionId;
+    return apiCall('/api/start/config?sessionId=' + encodeURIComponent(sid))
+      .then(function (data) {
+        if (!data || !Array.isArray(data.nations)) throw new Error('bad config');
+        setSetupInfo(data);
+      })
+      .catch(function () {
+        setSetupInfo(null);
+      });
+  }
+
+  function setSetupInfo(data) {
+    setupInfo = data;
+    removedIds = {};
+    controls = {};
+    initialControls = {};
+    addedNations = [];
+    addAt = null;
+    if (data) {
+      data.nations.forEach(function (n) {
+        var c = n.control === 'program' ? 'program' : 'ai';
+        controls[n.polityId] = c;
+        initialControls[n.polityId] = c;
+      });
+      countriesLocked = data.canSetup === false;
+      countTarget = effectiveCount();
+      countBase = countTarget;
+      var slider = el('startCount');
+      slider.min = String(data.min || 3);
+      slider.max = String(data.max || 30);
+      slider.value = String(countTarget);
+      el('startAddSizeVal').textContent = String(el('startAddSize').value);
+      el('startSetupState').textContent = countriesLocked ? '已应用(每局一次)' : '';
+    } else {
+      countriesLocked = true;
+      el('startSetupState').textContent = '这个版本没有开局国家设置接口';
+    }
+    el('startAddAtLabel').textContent = '落点未选(默认落在最大的无主州)';
+    renderSetup();
+    renderCustomState();
+  }
+
+  function liveNations() {
+    if (!setupInfo) return [];
+    return setupInfo.nations.filter(function (n) { return !removedIds[n.polityId]; });
+  }
+
+  function effectiveCount() {
+    if (!setupInfo) return 0;
+    return liveNations().length + addedNations.length;
+  }
+
+  function sortedBySizeAsc(list) {
+    return list.slice().sort(function (a, b) {
+      return (a.regions || 0) - (b.regions || 0) || b.polityId - a.polityId;
+    });
+  }
+
+  /** 预览:按数量目标,哪些国家会被自动删掉(后端删州数最少的) */
+  function autoTrimIds() {
+    var ids = {};
+    if (!setupInfo) return ids;
+    var diff = effectiveCount() - countTarget;
+    if (diff <= 0) return ids;
+    var victims = sortedBySizeAsc(liveNations()).slice(0, diff);
+    victims.forEach(function (n) { ids[n.polityId] = true; });
+    return ids;
+  }
+
+  function countHint() {
+    if (!setupInfo) return '';
+    var diff = countTarget - effectiveCount();
+    if (removedIdsHasAny() || addedNations.length) {
+      var manual = [];
+      if (removedIdsHasAny()) manual.push('手动删除 ' + Object.keys(removedIds).length + ' 国');
+      if (addedNations.length) manual.push('手动新建 ' + addedNations.length + ' 国');
+      var base = '当前预览:' + effectiveCount() + ' 国(' + manual.join('、') + ')';
+      if (diff < 0) return base + '\n数量目标:' + countTarget + ' 国,应用时会再自动删 ' + (-diff) + ' 个州数最少的国家';
+      if (diff > 0) return base + '\n数量目标:' + countTarget + ' 国,应用时会再自动补建 ' + diff + ' 个国家(默认 6 州)';
+      return base + '\n数量目标:' + countTarget + ' 国,数量一致';
+    }
+    if (diff < 0) return '应用时会自动删掉 ' + (-diff) + ' 个州数最少的国家(' + countTarget + ' 国)';
+    if (diff > 0) return '应用时会自动补建 ' + diff + ' 个国家(默认 6 州,' + countTarget + ' 国)';
+    return '国家数量不变(' + countTarget + ' 国)';
+  }
+
+  function removedIdsHasAny() {
+    for (var k in removedIds) if (Object.prototype.hasOwnProperty.call(removedIds, k)) return true;
+    return false;
+  }
+
+  function renderSetup() {
+    var slider = el('startCount');
+    el('startCountVal').textContent = String(countTarget || 0);
+    slider.disabled = countriesLocked || !setupInfo;
+    el('startAddNation').disabled = countriesLocked;
+    el('startAddPick').disabled = countriesLocked;
+    el('startAddSize').disabled = countriesLocked;
+    el('startCountHint').textContent = countriesLocked ? '' : countHint();
+    var box = el('startNationRows');
+    if (!setupInfo) { box.innerHTML = ''; return; }
+    var autos = autoTrimIds();
+    var rows = [];
+    setupInfo.nations.forEach(function (n) {
+      var isRemoved = !!removedIds[n.polityId];
+      var isAuto = !isRemoved && !!autos[n.polityId];
+      var cls = 'start-nation-row' + (isRemoved ? ' removed' : '') + (isAuto ? ' auto-trim' : '');
+      var control = controls[n.polityId] === 'program' ? 'program' : 'ai';
+      rows.push(
+        '<div class="' + cls + '" data-id="' + n.polityId + '">' +
+        '<span class="swatch" style="background:' + esc(n.color || '#999999') + '"></span>' +
+        '<span class="nm" title="' + esc(n.name + (n.seatName ? ' · 国都 ' + n.seatName : '')) + '">' + esc(n.name) + '</span>' +
+        '<span class="meta">' + (n.regions || 0) + ' 州</span>' +
+        (isRemoved
+          ? '<button class="btn-del" type="button" data-act="undo" title="撤销删除">↺</button>'
+          : '<select data-act="control" title="控制方式"' + (countriesLocked ? ' disabled' : '') + '>' +
+            '<option value="ai"' + (control === 'ai' ? ' selected' : '') + '>AI 君主</option>' +
+            '<option value="program"' + (control === 'program' ? ' selected' : '') + '>程序自动</option>' +
+            '</select>' +
+            '<button class="btn-del" type="button" data-act="del" title="删除这个国家(州变无主)"' + (countriesLocked ? ' disabled' : '') + '>✕</button>') +
+        '</div>'
+      );
+    });
+    addedNations.forEach(function (a, i) {
+      rows.push(
+        '<div class="start-nation-row auto-trim" data-added="' + i + '">' +
+        '<span class="swatch" style="background:#2f7d4f"></span>' +
+        '<span class="nm">待新建国家 #' + (i + 1) + '</span>' +
+        '<span class="meta">' + a.size + ' 州' + (a.at ? ' · 已选落点' : '') + '</span>' +
+        '<button class="btn-del" type="button" data-act="undo-add" title="撤销新建"' + (countriesLocked ? ' disabled' : '') + '>↺</button>' +
+        '</div>'
+      );
+    });
+    if (!setupInfo.nations.length && !addedNations.length) {
+      rows.push('<div class="start-hint">这个会话在当前年份没有在世的国。</div>');
+    }
+    box.innerHTML = rows.join('');
+  }
+
+  function onCountInput() {
+    countTarget = Number(el('startCount').value) || 3;
+    renderSetup();
+  }
+
+  function onRowsClick(ev) {
+    var target = ev.target;
+    if (!target || !target.getAttribute) return;
+    var act = target.getAttribute('data-act');
+    if (!act) return;
+    var row = target.parentNode;
+    while (row && row.getAttribute && !row.getAttribute('data-id') && !row.getAttribute('data-added')) row = row.parentNode;
+    if (!row) return;
+    if (act === 'del') {
+      var id = Number(row.getAttribute('data-id'));
+      var n = null;
+      setupInfo.nations.forEach(function (x) { if (x.polityId === id) n = x; });
+      if (!n) return;
+      confirmDelete(n);
+    } else if (act === 'undo') {
+      delete removedIds[Number(row.getAttribute('data-id'))];
+      renderSetup();
+    } else if (act === 'undo-add') {
+      addedNations.splice(Number(row.getAttribute('data-added')), 1);
+      renderSetup();
+    }
+  }
+
+  function onRowsChange(ev) {
+    var target = ev.target;
+    if (!target || target.getAttribute('data-act') !== 'control') return;
+    var row = target.parentNode;
+    while (row && row.getAttribute && !row.getAttribute('data-id')) row = row.parentNode;
+    if (!row) return;
+    controls[Number(row.getAttribute('data-id'))] = target.value === 'program' ? 'program' : 'ai';
+  }
+
+  // ── ① 删除确认 ────────────────────────────────────────────────────────────
+  function confirmDelete(n) {
+    var msg = (n.regions || 0) <= 1
+      ? '「' + n.name + '」该国家只有最后一个州，删除将移除整个国家，是否继续？'
+      : '删除「' + n.name + '」:' + (n.regions || 0) + ' 个州会变成无主,是否继续？';
+    confirmAction = function () {
+      removedIds[n.polityId] = true;
+      renderSetup();
+      toastMsg('已标记删除:「' + n.name + '」(点「应用开局」后生效)');
+    };
+    el('startConfirmMsg').textContent = msg;
+    el('startConfirm').hidden = false;
+  }
+
+  function hideConfirm() {
+    confirmAction = null;
+    var box = $('startConfirm');
+    if (box) box.hidden = true;
+  }
+
+  function onAddNation() {
+    if (!setupInfo || countriesLocked) return;
+    addedNations.push({
+      size: Math.max(3, Math.min(20, Number(el('startAddSize').value) || 6)),
+      at: addAt ? { x: addAt.x, y: addAt.y } : undefined
+    });
+    addAt = null;
+    el('startAddAtLabel').textContent = '落点未选(默认落在最大的无主州)';
+    renderSetup();
+    toastMsg('已加入待新建国家(' + addedNations.length + ' 个待新建,点「应用开局」后生效)');
+  }
+
+  function renderCustomState() {
+    var box = $('startCustomState');
+    if (!box) return;
+    var st = cfg && cfg.state;
+    var applied = st && st.customStart;
+    box.textContent = applied ? '已定制:' + applied.polityId : '';
   }
 
   // ── 角色卡 ────────────────────────────────────────────────────────────────
@@ -313,7 +668,7 @@
     };
   }
 
-  /** 收集本次请求的 body(不含 sessionId,由调用方补) */
+  /** 收集 ② 君主定制的请求 body(不含 sessionId,由调用方补) */
   function collect() {
     var n = selectedNation();
     var body = {
@@ -330,12 +685,12 @@
         if (name) body.card = { name: name };
       }
     }
-    if (!body.autoCard && !n) body.card = collectCard();
-    else if (!body.autoCard && n) body.card = collectCard();
+    if (!body.autoCard) body.card = collectCard();
     return body;
   }
 
   function randomizeCard() {
+    customDirty = true;
     el('startAutoCard').checked = false;
     el('startCardFields').disabled = false;
     var rnd = function (lo, hi) { return lo + Math.floor(Math.random() * (hi - lo + 1)); };
@@ -356,51 +711,145 @@
   }
 
   // ── 应用 ──────────────────────────────────────────────────────────────────
-  function onApply() {
-    if (!cfg || busy) return;
-    busy = true;
-    var apply = el('startApply');
-    apply.disabled = true;
-    apply.textContent = '应用中…';
-    toastMsg('正在应用开局定制…');
-    var body = collect();
-    body.sessionId = cfg.sessionId;
-    Promise.resolve()
-      .then(function () { return apiCall('/api/session/custom-start', body); })
-      .then(function (data) {
-        var result = (data && (data.result || data.start)) || {};
-        var summary = '✓ 已应用:' + (result.name || ('P' + result.polityId)) +
-          ' · ' + (result.regions != null ? result.regions + ' 州' : '') +
-          (result.seatName ? ' · 国都 ' + result.seatName : '') +
-          (result.mode === 'new' ? '(新建)' : '');
-        var warns = result.warnings && result.warnings.length ? '\n⚠ ' + result.warnings.join('\n⚠ ') : '';
-        toastMsg(summary + warns);
-        if (data && data.state && cfg) cfg.state = data.state;
-        if (cfg && typeof cfg.onApplied === 'function') {
-          try {
-            var maybe = cfg.onApplied(data);
-            if (maybe && typeof maybe.then === 'function') return maybe.then(afterApplied);
-          } catch (e) { /* 刷新失败不影响已经应用的结果 */ }
-        }
-        afterApplied();
-      })
-      .catch(function (err) {
-        toastMsg('应用失败:' + (err && err.message ? err.message : String(err)), true);
-      })
-      .then(function () {
-        busy = false;
-        apply.disabled = false;
-        apply.textContent = '应用开局';
+  /** ① 国家设置请求体;null = 没有要提交的改动 */
+  function setupBody(force) {
+    if (!setupInfo || countriesLocked) return null;
+    var body = { sessionId: cfg.sessionId };
+    var dirty = removedIdsHasAny() || addedNations.length > 0;
+    if (countTarget !== countBase) {
+      body.count = countTarget;
+      dirty = true;
+    }
+    if (removedIdsHasAny()) body.remove = Object.keys(removedIds).map(Number);
+    var changedControls = {};
+    for (var id in controls) {
+      if (!Object.prototype.hasOwnProperty.call(controls, id)) continue;
+      if (controls[id] !== initialControls[id]) changedControls[id] = controls[id];
+    }
+    if (Object.keys(changedControls).length) {
+      body.controls = changedControls;
+      dirty = true;
+    }
+    if (addedNations.length) {
+      body.nations = addedNations.map(function (a) {
+        return a.at ? { at: a.at, size: a.size } : { size: a.size };
       });
+    }
+    if (force === true) { body.force = true; dirty = true; }
+    return dirty ? body : null;
   }
 
-  function afterApplied() {
-    return loadNations().then(function () {
-      if (cfg && cfg.state && cfg.state.customStart) { /* 保持当前选择 */ }
+  function applySetup(force) {
+    var body = setupBody(force);
+    if (!body) return Promise.resolve({ skipped: true });
+    toastMsg('正在应用国家设置(删国/新建/控制方式)…');
+    return setupCall('/api/session/start-setup', body).then(function (data) {
+      var result = (data && data.result) || {};
+      var parts = [];
+      if (result.removed && result.removed.length) parts.push('删除 ' + result.removed.length + ' 国');
+      if (result.added && result.added.length) parts.push('新建 ' + result.added.length + ' 国');
+      if (result.resized && result.resized.length) parts.push('调整 ' + result.resized.length + ' 国州数');
+      if (result.movedCapitals && result.movedCapitals.length) parts.push('迁都 ' + result.movedCapitals.length + ' 次');
+      if (result.warsEnded && result.warsEnded.length) parts.push('结束战争 ' + result.warsEnded.length + ' 场');
+      var warns = result.warnings && result.warnings.length ? '\n⚠ ' + result.warnings.join('\n⚠ ') : '';
+      countriesLocked = true;
+      if (data && data.state && cfg) cfg.state = data.state;
+      toastMsg('✓ 国家设置已应用:' + (parts.join(' · ') || '数量 ' + result.count + ' 国') + warns);
+      if (cfg && typeof cfg.onApplied === 'function') {
+        try {
+          var maybe = cfg.onApplied(data);
+          if (maybe && typeof maybe.then === 'function') return maybe.catch(function () {});
+        } catch (e) { /* 刷新失败不影响已经应用的结果 */ }
+      }
+      return data;
+    }).catch(function (err) {
+      if (err && err.needConfirm && Array.isArray(err.needConfirm)) {
+        var msg = err.needConfirm.map(function (c) { return c.message || ''; }).join('\n');
+        confirmAction = function () { return applySetup(true); };
+        el('startConfirmMsg').textContent = msg;
+        el('startConfirm').hidden = false;
+        toastMsg('有国家只剩最后一个州:确认后才能整个删掉', true);
+        throw err;
+      }
+      toastMsg('国家设置失败:' + (err && err.message ? err.message : String(err)), true);
+      throw err;
+    });
+  }
+
+  function applyCustomStart() {
+    var body = collect();
+    body.sessionId = cfg.sessionId;
+    toastMsg('正在应用君主定制…');
+    return apiCall('/api/session/custom-start', body).then(function (data) {
+      var result = (data && (data.result || data.start)) || {};
+      var summary = '✓ 已应用:' + (result.name || ('P' + result.polityId)) +
+        ' · ' + (result.regions != null ? result.regions + ' 州' : '') +
+        (result.seatName ? ' · 国都 ' + result.seatName : '') +
+        (result.mode === 'new' ? '(新建)' : '');
+      var warns = result.warnings && result.warnings.length ? '\n⚠ ' + result.warnings.join('\n⚠ ') : '';
+      toastMsg(summary + warns);
+      customDirty = false;
+      if (data && data.state && cfg) cfg.state = data.state;
+      if (cfg && typeof cfg.onApplied === 'function') {
+        try {
+          var maybe = cfg.onApplied(data);
+          if (maybe && typeof maybe.then === 'function') return maybe.catch(function () {});
+        } catch (e) { /* 刷新失败不影响已经应用的结果 */ }
+      }
+      return data;
+    }).catch(function (err) {
+      toastMsg('君主定制失败:' + (err && err.message ? err.message : String(err)), true);
+      throw err;
+    });
+  }
+
+  function onApply() {
+    if (!cfg || busy) return;
+    var hasSetup = !!setupBody(false);
+    if (!hasSetup && !customDirty) {
+      toastMsg('没有要应用的改动:先调数量/控制方式/删国/新增国家,或选择君主国家改角色卡');
+      return;
+    }
+    busy = true;
+    setBtnBusy(true);
+    hideConfirm();
+    var chain = Promise.resolve();
+    if (hasSetup) {
+      chain = chain.then(function () { return applySetup(false); });
+    }
+    if (customDirty) {
+      chain = chain.then(function () { return applyCustomStart(); });
+    }
+    chain.then(function () {
+      busy = false;
+      setBtnBusy(false);
+      return Promise.all([loadConfig(), loadNations()]).then(function () {
+        renderCustomState();
+      });
+    }).catch(function () {
+      busy = false;
+      setBtnBusy(false);
+      loadConfig();
     });
   }
 
   // ── 打开/关闭 ─────────────────────────────────────────────────────────────
+  function resetLocalPreview() {
+    removedIds = {};
+    controls = {};
+    initialControls = {};
+    addedNations = [];
+    addAt = null;
+    countTarget = 0;
+    countBase = 0;
+    countriesLocked = false;
+    customDirty = false;
+    busy = false;
+    hideConfirm();
+    el('startAddAtLabel').textContent = '落点未选(默认落在最大的无主州)';
+    el('startAddSizeVal').textContent = String(el('startAddSize').value);
+  }
+
   function open(options) {
     if (!options || !options.sessionId) throw new Error('CivStart.open 需要 sessionId');
     cfg = {
@@ -413,6 +862,8 @@
     injectStyle();
     buildPanel();
     pickedAt = null;
+    addAt = null;
+    resetLocalPreview();
     el('startMsg').textContent = '';
     el('startMsg').className = 'start-msg';
     el('startAtLabel').textContent = '未选位置(默认落在最大的无主州)';
@@ -424,6 +875,8 @@
     el('startName').value = '';
     el('startPersona').value = '';
     el(PANEL_ID).hidden = false;
+    setBtnBusy(false);
+    loadConfig();
     loadNations();
   }
 
@@ -437,6 +890,8 @@
     close: close,
     collect: collect,
     bindPick: bindPick,
-    pickAt: pickAt
+    pickAt: pickAt,
+    // 调试/测试用:当前本地预览的 start-setup 请求体
+    setupBody: setupBody
   };
 })();

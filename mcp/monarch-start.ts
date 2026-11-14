@@ -8,9 +8,9 @@
  * 必须在第一回合之前(rounds === 0)调用;调用后 stateGet/sessionSummary 立即能读到新国家,
  * turnStep/monarchRound 照常跑(直接改 civ.polity 后,续推会以它作为当前国土)。
  */
-import type { Session } from './engine';
-import { civHash, isFinished, sizesNow } from './engine';
-import type { Civ, Polity, Settlement } from '../src/gen/civ/types';
+import type { NationControl, Session } from './engine';
+import { civHash, isFinished, nationControlOf, nationControlView, sizesNow } from './engine';
+import type { Annal, Civ, Polity, Settlement } from '../src/gen/civ/types';
 import { capitalAt, polityAlive, polityName } from '../src/gen/civ/growth';
 import { POLITY_PALETTE } from '../src/gen/civ/polities';
 import { namePolities } from '../src/gen/civ/naming';
@@ -23,6 +23,12 @@ export const CUSTOM_START_SIZE_MIN = 3;
 export const CUSTOM_START_SIZE_MAX = 40;
 /** 没给 size 时默认给 8 州("中") */
 export const CUSTOM_START_SIZE_DEFAULT = 8;
+/** 开局国家数量下限(与 plan §P1 的 3–30 一致) */
+export const START_COUNT_MIN = 3;
+/** 开局国家数量上限 */
+export const START_COUNT_MAX = 30;
+/** 按数量补建国家时,新国家默认州数 */
+export const START_ADD_SIZE_DEFAULT = 6;
 
 /** 陆上相邻的 AdjKind:Flat=0 / River=1 / Mountain=2(不 import const enum,isolatedModules 下当值用会报错) */
 const LAND_EDGE_MAX = 2;
@@ -694,4 +700,649 @@ function hexOf(color: readonly number[]): string {
     out += v.toString(16).padStart(2, '0');
   }
   return out;
+}
+
+// ── 开局国家设置:数量 / 控制方式 / 增删 ──────────────────────────────────────
+
+/**
+ * 第一回合推演之前,一次性定下「这一局有哪些国家、谁由 AI 君主接管、谁交给引擎自动推演」。
+ * 与 applyCustomStart 的区别:这里管整张名单(增删 + 数量),applyCustomStart 只管一个君主国家。
+ * 两者都只能在 rounds === 0 时调用;本函数每个会话只能应用一次。
+ *
+ * 删国规则(plan §0.3-4):
+ * - 删掉的国家:它的州全部变无主(civ.polity[r] = -1),国家标记 ended = 开局年;
+ * - 删到首都州(还有别的州):从保留的州里挑一个作为新国都,capitals 里追加一条;
+ * - 删到最后一州:没传 force 就抛错让人确认;force = true 才把整个国家删掉。
+ * 删国同时清:进行中的战争(补 peace 史事)、进行中的条约(补 expire 史事)、
+ * 角色卡 / 君主记忆 / 渗透情报 / 控制方式 / 玩家席位 / 开局定制记录 / 君主配置名单。
+ */
+export interface StartNationSpec {
+  /** 现有国家 id;省略 = 按 at(或不给落点)新建一个国家 */
+  polityId?: number;
+  /** 新建时的落点(世界像素坐标,与地图点选回调同一坐标系) */
+  at?: { x: number; y: number };
+  /** 目标州数:新建默认 6,现有国省略 = 不调 */
+  size?: number;
+  /** 角色卡字段(与 applyCustomStart 的 card 同义) */
+  card?: Record<string, unknown>;
+  /** true = 不读 card,按引擎的 monarchCard 自动生成 */
+  autoCard?: boolean;
+  /** 这个国家由谁控制;省略 = 按会话 mode 缺省(monarch 会话默认 ai) */
+  control?: NationControl;
+}
+
+/** 开局国家设置输入(openSession.setup 与 POST /api/session/start-setup 同一形状) */
+export interface StartSetupInput {
+  /** 应用后保留的国家数量(3–30):少了删最小的,多了补建 */
+  count?: number;
+  /** 新建 / 调整现有国家 */
+  nations?: StartNationSpec[];
+  /** 整国删除(州全部变无主;会清战争/条约/角色卡等) */
+  remove?: number[];
+  /** 只删几个州(州变无主;删到首都州会随机迁都;删成最后一州要 force) */
+  removeRegions?: number[];
+  /** 每国控制方式:{ "3": "ai", "5": "program" } */
+  controls?: Record<string, NationControl>;
+  /** 允许把删到最后一州的国家整个删掉(前端确认对话框后传 true) */
+  force?: boolean;
+}
+
+/** 已应用的开局国家设置(存在 Session.startSetup;一次性) */
+export interface StartSetupState {
+  appliedYear: number;
+  /** 应用后的国家数 */
+  count: number;
+  /** 用户要求的目标国家数(没给 = null) */
+  targetCount: number | null;
+  /** 实际写进 Session.nationControl 的显式覆盖(国家编号 → 控制方式) */
+  controls: Record<string, NationControl>;
+  /** 这次删掉的国家编号 */
+  removed: number[];
+  /** 这次新建的国家编号 */
+  added: number[];
+  warnings: string[];
+}
+
+/** 迁都记录 */
+export interface StartSetupCapitalMove {
+  polityId: number;
+  name: string;
+  fromRegion: number;
+  fromCapital: string | null;
+  toRegion: number;
+  toCapital: string | null;
+}
+
+/** applyStartSetup 的返回(路由原样透给前端) */
+export interface StartSetupResult extends StartSetupState {
+  sessionId: string;
+  startYear: number;
+  /** 被改过州数的现有国家 */
+  resized: { polityId: number; name: string; regions: number }[];
+  movedCapitals: StartSetupCapitalMove[];
+  warsEnded: { war: number; a: number; b: number }[];
+  treatiesEnded: number[];
+  /** force=false 时删到最后一州的国家(同时挂在抛出的 error.needConfirm 上) */
+  needConfirm: { polityId: number; name: string; regions: number; message: string }[];
+  applied: true;
+  fingerprint: string;
+}
+
+interface SetupContext {
+  year: number;
+  force: boolean;
+  warnings: string[];
+  removed: number[];
+  added: number[];
+  resized: StartSetupResult['resized'];
+  movedCapitals: StartSetupCapitalMove[];
+  warsEnded: StartSetupResult['warsEnded'];
+  treatiesEnded: number[];
+  needConfirm: StartSetupResult['needConfirm'];
+}
+
+/** 开局国家设置能不能做:第一回合前、会话没结束、还没应用过 */
+export function canSetupStart(s: Session): boolean {
+  return s.rounds === 0 && !isFinished(s) && !s.startSetup;
+}
+
+/** 开局面板需要的名单与状态(GET /api/start/config 用) */
+export function startConfigStatus(s: Session): Record<string, unknown> {
+  const year = startYearOf(s);
+  const nations = listStartNations(s).map((n) => ({ ...n, control: nationControlOf(s, n.polityId) }));
+  let owned = 0;
+  for (let r = 0; r < s.civ.regions.count; r++) if (s.civ.polity[r] >= 0) owned++;
+  return {
+    sessionId: s.id,
+    year,
+    startYear: s.startYear,
+    rounds: s.rounds,
+    canSetup: canSetupStart(s),
+    applied: s.startSetup ? cloneSetupState(s.startSetup) : null,
+    pending: s.pendingStartSetup ?? null,
+    count: nations.length,
+    min: START_COUNT_MIN,
+    max: START_COUNT_MAX,
+    control: nationControlView(s),
+    regions: { total: s.civ.regions.count, owned, unowned: s.civ.regions.count - owned },
+    nations,
+  };
+}
+
+/**
+ * 应用开局国家设置。只允许在第一回合前调用,每个会话只能应用一次。
+ * 参数省略时用 openSession 带进来的 setup(pendingStartSetup)。
+ */
+export function applyStartSetup(s: Session, setupIn?: StartSetupInput): StartSetupResult {
+  const year = startYearOf(s);
+  if (s.rounds !== 0) throw new Error(`开局国家设置只能在第一回合前(还没推演)做,当前已经跑了 ${s.rounds} 回合`);
+  if (isFinished(s)) throw new Error('这一局已经结束,不能再改开局国家');
+  if (s.startSetup) throw new Error('开局国家设置已经应用过,一个会话只能应用一次;要改请重开一局');
+  const setup = setupIn ?? s.pendingStartSetup ?? {};
+  if (!setup || typeof setup !== 'object' || Array.isArray(setup)) {
+    throw new Error('setup 要是 { count?, nations?, remove?, removeRegions?, controls?, force? } 对象');
+  }
+
+  const ctx: SetupContext = {
+    year,
+    force: setup.force === true,
+    warnings: [],
+    removed: [],
+    added: [],
+    resized: [],
+    movedCapitals: [],
+    warsEnded: [],
+    treatiesEnded: [],
+    needConfirm: [],
+  };
+
+  /* ---- 1. 解析 + 预校验(全部通过才开始改,避免半途抛错留下脏状态) ---- */
+  const removeIds = readIdList(setup.remove, 'remove');
+  const removeRegions = readRegionList(setup.removeRegions, s.civ.regions.count);
+  const specs = readNations(setup.nations);
+  const controls = readControls(setup.controls);
+  const targetCount = setup.count === undefined || setup.count === null ? null : readCount(setup.count);
+  const sizes0 = sizesNow(s.civ);
+
+  const removedSet = new Set(removeIds);
+  for (const id of removeIds) {
+    const p = s.civ.polities[id];
+    if (!p) throw new Error(`P${id} 不存在,不能删除`);
+    if (!polityAlive(p, year) || (sizes0.get(id) ?? 0) <= 0) throw new Error(`P${id} 在第 ${year} 年已经不在了,不能删除`);
+  }
+  // 只删州时,算每个国家还剩几州:删到 0 州要 force 才继续
+  const left = new Map<number, number>();
+  for (const [id, n] of sizes0) left.set(id, n);
+  for (const id of removeIds) left.set(id, 0);
+  const regionSet = new Set<number>();
+  for (const r of removeRegions) {
+    const owner = s.civ.polity[r];
+    if (owner < 0) throw new Error(`州 ${r} 本来就是无主的(或已随国家删掉),不用再删`);
+    if (removedSet.has(owner)) continue;
+    left.set(owner, (left.get(owner) ?? 0) - 1);
+    regionSet.add(r);
+  }
+  if (!ctx.force) {
+    for (const [id, n] of left) {
+      if (removedSet.has(id)) continue; // 整国删 = 已确认
+      if (n > 0 || (sizes0.get(id) ?? 0) <= 0) continue;
+      let touched = false;
+      for (let r = 0; r < s.civ.regions.count; r++) {
+        if (s.civ.polity[r] === id && regionSet.has(r)) { touched = true; break; }
+      }
+      if (!touched) continue;
+      const p = s.civ.polities[id]!;
+      const name = polityName(p, year);
+      ctx.needConfirm.push({ polityId: id, name, regions: sizes0.get(id) ?? 0, message: lastRegionMessage(name) });
+    }
+  }
+  if (ctx.needConfirm.length) {
+    const err = new Error(ctx.needConfirm.map((c) => c.message).join(' ')) as Error & { needConfirm?: unknown };
+    err.needConfirm = ctx.needConfirm;
+    throw err;
+  }
+  for (let i = 0; i < specs.length; i++) {
+    const spec = specs[i]!;
+    if (spec.polityId !== undefined) {
+      const p = s.civ.polities[spec.polityId];
+      if (!p) throw new Error(`nations[${i}]:P${spec.polityId} 不存在`);
+      if (removedSet.has(spec.polityId)) throw new Error(`nations[${i}]:P${spec.polityId} 同时在 remove 里,不能既删又改`);
+      if (!polityAlive(p, year) || (sizes0.get(spec.polityId) ?? 0) <= 0) throw new Error(`nations[${i}]:P${spec.polityId} 在第 ${year} 年已经不在了`);
+    }
+    if (spec.control !== undefined && spec.control !== 'ai' && spec.control !== 'program') {
+      throw new Error(`nations[${i}]:control 只能是 "ai" 或 "program"`);
+    }
+  }
+
+  /* ---- 2. 删国家 / 删州 ---- */
+  for (const id of removeIds) removeNation(s, id, ctx);
+  for (const r of removeRegions) {
+    if (!regionSet.has(r)) continue; // 属于被整国删掉的,已经无主
+    removeOneRegion(s, r, ctx, false);
+  }
+
+  /* ---- 3. nations:新建 / 调州数 ---- */
+  for (const spec of specs) {
+    let id: number;
+    if (spec.polityId !== undefined) {
+      id = spec.polityId;
+      const current = sizesNow(s.civ).get(id) ?? 0;
+      const want = spec.size === undefined ? undefined : clampSize(spec.size);
+      if (want !== undefined && want !== current) {
+        const sizes = sizesNow(s.civ);
+        if (want > current) growTerritory(s, id, want, sizes, ctx.warnings);
+        else shrinkTerritory(s, id, want, year, ctx.warnings);
+        const after = sizesNow(s.civ).get(id) ?? 0;
+        if (after !== current) {
+          const p = s.civ.polities[id]!;
+          ctx.resized.push({ polityId: id, name: polityName(p, year), regions: after });
+        }
+      }
+    } else {
+      try {
+        id = createNewNation(s, { at: spec.at, size: spec.size ?? START_ADD_SIZE_DEFAULT }, year, ctx.warnings);
+      } catch (e) {
+        ctx.warnings.push(`新建国家失败:${e instanceof Error ? e.message : String(e)}`);
+        continue;
+      }
+      ctx.added.push(id);
+      addStartCard(s, id, ctx, spec.card, spec.autoCard === true);
+    }
+    if (spec.control !== undefined) {
+      const p = s.civ.polities[id];
+      if (p && polityAlive(p, year) && (sizesNow(s.civ).get(id) ?? 0) > 0) s.nationControl.set(id, spec.control);
+      else ctx.warnings.push(`nations:应用后 P${id} 已经不在,忽略它的 control`);
+    }
+  }
+
+  /* ---- 4. 数量:多删("最小"的先走)少补(默认 6 州) ---- */
+  if (targetCount !== null) {
+    let guard = 0;
+    for (;;) {
+      const alive = aliveNow(s, year);
+      if (alive.length === targetCount) break;
+      if (guard++ > Math.abs(alive.length - targetCount) + 30) {
+        ctx.warnings.push('数量调整没有收敛,先停在当前数量');
+        break;
+      }
+      if (alive.length > targetCount) {
+        const victim = [...alive].sort((a, b) => a.regions - b.regions || b.polityId - a.polityId)[0]!;
+        removeNation(s, victim.polityId, ctx);
+      } else {
+        const before = alive.length;
+        try {
+          const id = createNewNation(s, { size: START_ADD_SIZE_DEFAULT }, year, ctx.warnings);
+          ctx.added.push(id);
+          addStartCard(s, id, ctx);
+        } catch (e) {
+          ctx.warnings.push(`补建国家失败:${e instanceof Error ? e.message : String(e)}`);
+          break;
+        }
+        if (aliveNow(s, year).length <= before) {
+          ctx.warnings.push('补建国家没有让总数变多:地图上没有可拿的州了');
+          break;
+        }
+      }
+    }
+  }
+
+  /* ---- 5. 控制方式:写显式覆盖,清掉已经不在的国家 ---- */
+  for (const [k, v] of Object.entries(controls)) {
+    const id = Number(k);
+    const p = s.civ.polities[id];
+    if (!p || !polityAlive(p, year) || (sizesNow(s.civ).get(id) ?? 0) <= 0) {
+      ctx.warnings.push(`controls 里的 P${id} 应用后已经不在,忽略`);
+      continue;
+    }
+    s.nationControl.set(id, v);
+  }
+  for (const id of [...s.nationControl.keys()]) {
+    const p = s.civ.polities[id];
+    if (!p || !polityAlive(p, year) || (sizesNow(s.civ).get(id) ?? 0) <= 0) s.nationControl.delete(id);
+  }
+
+  /* ---- 6. 换 civ 对象(edits.ts 的 polityKey 按 civ 对象缓存 WeakMap) ---- */
+  s.civ = { ...s.civ };
+  s.pendingStartSetup = undefined;
+
+  /* ---- 7. 汇总 ---- */
+  const alive = aliveNow(s, year);
+  if (targetCount !== null && alive.length !== targetCount) {
+    ctx.warnings.push(`目标 ${targetCount} 国,实际 ${alive.length} 国(地图上能建 / 能删的到头了)`);
+  }
+  const finalControls: Record<string, NationControl> = {};
+  for (const n of alive) {
+    const c = s.nationControl.get(n.polityId);
+    if (c) finalControls[String(n.polityId)] = c;
+  }
+  const state: StartSetupState = {
+    appliedYear: year,
+    count: alive.length,
+    targetCount,
+    controls: finalControls,
+    removed: [...ctx.removed],
+    added: [...ctx.added],
+    warnings: [...ctx.warnings],
+  };
+  s.startSetup = state;
+  return {
+    sessionId: s.id,
+    startYear: s.startYear,
+    ...state,
+    resized: ctx.resized,
+    movedCapitals: ctx.movedCapitals,
+    warsEnded: ctx.warsEnded,
+    treatiesEnded: ctx.treatiesEnded,
+    needConfirm: ctx.needConfirm,
+    applied: true,
+    fingerprint: civHash(s.civ),
+  };
+}
+
+/** 最后一州的确认文案(前端直接展示;单元测试按这个短语断言) */
+export function lastRegionMessage(name: string): string {
+  return `「${name}」该国家只有最后一个州，删除将移除整个国家，是否继续？`;
+}
+
+// ── 开局国家设置的内部实现 ──────────────────────────────────────────────────
+
+function cloneSetupState(state: StartSetupState): StartSetupState {
+  return {
+    ...state,
+    controls: { ...state.controls },
+    removed: [...state.removed],
+    added: [...state.added],
+    warnings: [...state.warnings],
+  };
+}
+
+function readIdList(raw: unknown, field: string): number[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`${field} 要是国家编号数组`);
+  const out: number[] = [];
+  for (const v of raw) {
+    const id = Number(v);
+    if (!Number.isInteger(id) || id < 0) throw new Error(`${field} 里 "${String(v)}" 不是国家编号`);
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+function readRegionList(raw: unknown, count: number): number[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error('removeRegions 要是州编号数组');
+  const out: number[] = [];
+  for (const v of raw) {
+    const r = Number(v);
+    if (!Number.isInteger(r) || r < 0 || r >= count) throw new Error(`removeRegions 里 "${String(v)}" 不是有效州编号(0–${count - 1})`);
+    if (!out.includes(r)) out.push(r);
+  }
+  return out;
+}
+
+function readControls(raw: unknown): Record<string, NationControl> {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('controls 要是 { "国家编号": "ai" | "program" } 对象');
+  const out: Record<string, NationControl> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const id = Number(k);
+    if (!Number.isInteger(id) || id < 0) throw new Error(`controls 的键 "${k}" 不是国家编号`);
+    if (v !== 'ai' && v !== 'program') throw new Error(`controls["${k}"] 只能是 "ai" 或 "program"`);
+    out[String(id)] = v;
+  }
+  return out;
+}
+
+function readCount(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error('count 要是数字');
+  return Math.min(START_COUNT_MAX, Math.max(START_COUNT_MIN, Math.round(n)));
+}
+
+function readNations(raw: unknown): StartNationSpec[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error('nations 要是数组');
+  return raw.map((v, i) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`nations[${i}] 要是对象`);
+    const o = v as Record<string, unknown>;
+    const spec: StartNationSpec = {};
+    if (o.polityId !== undefined && o.polityId !== null) {
+      const id = Number(o.polityId);
+      if (!Number.isInteger(id) || id < 0) throw new Error(`nations[${i}].polityId 要是国家编号`);
+      spec.polityId = id;
+    }
+    if (o.at !== undefined && o.at !== null) {
+      if (typeof o.at !== 'object' || Array.isArray(o.at)) throw new Error(`nations[${i}].at 要是 { x, y }`);
+      const at = o.at as Record<string, unknown>;
+      const x = Number(at.x);
+      const y = Number(at.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`nations[${i}].at 需要两个有限数字 x / y`);
+      spec.at = { x, y };
+    }
+    if (o.size !== undefined && o.size !== null) {
+      const size = Number(o.size);
+      if (!Number.isFinite(size) || size <= 0) throw new Error(`nations[${i}].size 要是正数`);
+      spec.size = size;
+    }
+    if (o.card !== undefined && o.card !== null) {
+      if (typeof o.card !== 'object' || Array.isArray(o.card)) throw new Error(`nations[${i}].card 要是对象`);
+      spec.card = o.card as Record<string, unknown>;
+    }
+    if (o.autoCard !== undefined) spec.autoCard = o.autoCard === true;
+    if (o.control !== undefined && o.control !== null) {
+      const c = o.control;
+      if (c !== 'ai' && c !== 'program') throw new Error(`nations[${i}].control 只能是 "ai" 或 "program"`);
+      spec.control = c;
+    }
+    return spec;
+  });
+}
+
+/** 在世国家(含州数),按州数从多到少 */
+function aliveNow(s: Session, year: number): { polityId: number; name: string; regions: number }[] {
+  const sizes = sizesNow(s.civ);
+  const out: { polityId: number; name: string; regions: number }[] = [];
+  for (const p of s.civ.polities) {
+    const regions = sizes.get(p.id) ?? 0;
+    if (regions <= 0 || !polityAlive(p, year)) continue;
+    out.push({ polityId: p.id, name: polityName(p, year), regions });
+  }
+  out.sort((a, b) => b.regions - a.regions || a.polityId - b.polityId);
+  return out;
+}
+
+/** 给新建的国家建一张角色卡(失败只记 warning,下一轮 ensureCards 会重建) */
+function addStartCard(
+  s: Session,
+  polityId: number,
+  ctx: SetupContext,
+  card?: Record<string, unknown>,
+  autoCard = true,
+): void {
+  try {
+    const useAuto = card ? autoCard === true : true;
+    const built = buildCard(s, polityId, true, { card, autoCard: useAuto }, ctx.warnings);
+    s.cards ??= new Map();
+    s.cards.set(polityId, built);
+  } catch (e) {
+    ctx.warnings.push(`P${polityId} 的角色卡没建成(第一回合会按引擎君主重建):${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+function ownRegions(civ: Civ, polityId: number): number[] {
+  const out: number[] = [];
+  for (let r = 0; r < civ.polity.length; r++) if (civ.polity[r] === polityId) out.push(r);
+  return out;
+}
+
+/** 某国当年国都所在的州(-1 = 找不到) */
+function capitalRegionOf(civ: Civ, p: Polity, year: number): number {
+  const sid = capitalAt(p, year);
+  const st = civ.settlements[sid];
+  return st ? st.region : -1;
+}
+
+/** 确定性伪随机:同一世界 / 国家 / 年份 / 序号总是同一个数(测试可复现) */
+function hashIndex(seed: number, polityId: number, year: number, salt: number): number {
+  let h = (seed ^ 0x9e3779b9) >>> 0;
+  h = Math.imul(h ^ (polityId + 0x85ebca6b), 0xc2b2ae35) >>> 0;
+  h = Math.imul(h ^ (Math.round(year) + 0x27d4eb2f + salt), 0x165667b1) >>> 0;
+  return (h ^ (h >>> 15)) >>> 0;
+}
+
+/** 在给定的州里挑一座城:活城优先、容量大的优先、preferRegion 加权 */
+function pickSettlementInRegions(civ: Civ, regions: readonly number[], preferRegion: number): number {
+  const want = new Set(regions);
+  let best = -1;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (const st of civ.settlements) {
+    if (!want.has(st.region)) continue;
+    let score = st.ended === undefined ? 1000 : 0;
+    score += typeof st.capacity === 'number' && Number.isFinite(st.capacity) ? st.capacity : 0;
+    if (st.region === preferRegion) score += 100;
+    if (score > bestScore) {
+      bestScore = score;
+      best = st.id;
+    }
+  }
+  return best;
+}
+
+/** 国都州被删掉、国家还有别的州:从保留的州里挑一个新国都,capitals 追加一条 */
+function migrateCapital(s: Session, polityId: number, ctx: SetupContext): StartSetupCapitalMove | null {
+  const civ = s.civ;
+  const p = civ.polities[polityId];
+  if (!p) return null;
+  const own = ownRegions(civ, polityId);
+  if (!own.length) return null;
+  const oldSid = capitalAt(p, ctx.year);
+  const old = civ.settlements[oldSid];
+  const region = own[hashIndex(civ.seed, polityId, ctx.year, ctx.movedCapitals.length) % own.length]!;
+  const chosen = pickSettlementInRegions(civ, own, region);
+  if (chosen < 0) {
+    ctx.warnings.push(`「${polityName(p, ctx.year)}」的首都州被删,但剩下的州里没有城:暂不记录新国都`);
+    return null;
+  }
+  const to = civ.settlements[chosen];
+  const base = p.capitals && p.capitals.length ? p.capitals : [{ year: p.founded, settlement: p.capital }];
+  p.capitals = [...base, { year: ctx.year, settlement: chosen }];
+  const move: StartSetupCapitalMove = {
+    polityId,
+    name: polityName(p, ctx.year),
+    fromRegion: old ? old.region : -1,
+    fromCapital: old ? old.name : null,
+    toRegion: region,
+    toCapital: to ? to.name : null,
+  };
+  ctx.movedCapitals.push(move);
+  ctx.warnings.push(`「${move.name}」国都从${move.fromCapital ?? '旧城'}迁到${move.toCapital ?? '新址'}(原首都州被删)`);
+  return move;
+}
+
+/** 删一个州;删到 0 州时按 fromWholeNation 收尾(删整国 / 删到最后一州) */
+function removeOneRegion(s: Session, region: number, ctx: SetupContext, fromWholeNation: boolean): void {
+  const civ = s.civ;
+  const owner = civ.polity[region];
+  if (owner < 0) return;
+  const p = civ.polities[owner];
+  if (!p) return;
+  const sizes = sizesNow(civ);
+  const capRegion = capitalRegionOf(civ, p, ctx.year);
+  civ.polity[region] = -1;
+  const after = (sizes.get(owner) ?? 0) - 1;
+  sizes.set(owner, after);
+  if (after > 0) {
+    if (capRegion === region) migrateCapital(s, owner, ctx);
+    return;
+  }
+  endNation(s, owner, ctx, fromWholeNation ? 'remove' : 'last-region');
+}
+
+/** 整国删除:按州逐个删(先删首都州,能记录一次随机迁都),最后 endNation */
+function removeNation(s: Session, polityId: number, ctx: SetupContext): void {
+  const civ = s.civ;
+  const p = civ.polities[polityId];
+  if (!p) return;
+  const year = ctx.year;
+  const name = polityName(p, year);
+  const regs = ownRegions(civ, polityId);
+  if (!regs.length) {
+    ctx.warnings.push(`P${polityId} 已经没有州了,跳过删除`);
+    return;
+  }
+  const capRegion = capitalRegionOf(civ, p, year);
+  const order = regs.slice().sort((a, b) => (a === capRegion ? 0 : 1) - (b === capRegion ? 0 : 1) || a - b);
+  for (const r of order) removeOneRegion(s, r, ctx, true);
+  ctx.warnings.push(`删除国家「${name}」:${regs.length} 个州变无主`);
+}
+
+/** 进行中的战争(war 史事开、peace 史事关;按史事顺序重放) */
+function openWars(civ: Civ): { id: number; a: number; b: number }[] {
+  const wars = new Map<number, { id: number; a: number; b: number }>();
+  for (const e of civ.annals) {
+    if (e.kind === 'war' && e.war >= 0) wars.set(e.war, { id: e.war, a: e.a, b: e.b });
+    else if (e.kind === 'peace') wars.delete(e.war);
+  }
+  return [...wars.values()];
+}
+
+/** 还活着的条约(约 / 续约 开,约满 关;背约不结束条约) */
+function liveTreaties(civ: Civ): { id: number; parties: number[] }[] {
+  const live = new Map<number, number[]>();
+  for (const e of civ.annals) {
+    if (e.kind === 'treaty') {
+      if (e.cause === 'renew' && live.has(e.war)) {
+        if (e.ps) live.set(e.war, [...e.ps]);
+        continue;
+      }
+      live.set(e.war, e.ps ? [...e.ps] : [e.a, e.b]);
+    } else if (e.kind === 'expire') {
+      live.delete(e.war);
+    }
+  }
+  return [...live.entries()].map(([id, parties]) => ({ id, parties }));
+}
+
+/** 国家灭亡:标记 ended、补 peace / expire 史事、清角色卡 / 记忆 / 情报 / 控制方式 / 席位与定制引用 */
+function endNation(s: Session, polityId: number, ctx: SetupContext, reason: 'remove' | 'last-region'): void {
+  const civ = s.civ;
+  const year = ctx.year;
+  const p = civ.polities[polityId];
+  if (!p) return;
+  if (p.ended === undefined) p.ended = year;
+  const name = polityName(p, year);
+  if (!ctx.removed.includes(polityId)) ctx.removed.push(polityId);
+  for (const w of openWars(civ)) {
+    if (w.a !== polityId && w.b !== polityId) continue;
+    civ.annals.push({ year, kind: 'peace', a: w.a, b: w.b, region: -1, settlement: -1, war: w.id });
+    ctx.warsEnded.push({ war: w.id, a: w.a, b: w.b });
+  }
+  for (const t of liveTreaties(civ)) {
+    if (!t.parties.includes(polityId)) continue;
+    const ps = t.parties.filter((x) => x !== polityId);
+    const a = ps.length ? ps[0]! : polityId;
+    const b = ps.length > 1 ? ps[1]! : a;
+    civ.annals.push({ year, kind: 'expire', a, b, region: -1, settlement: -1, war: t.id, ps });
+    ctx.treatiesEnded.push(t.id);
+  }
+  s.cards?.delete(polityId);
+  s.memory?.delete(polityId);
+  if (s.intel) {
+    delete s.intel[String(polityId)];
+    for (const key of Object.keys(s.intel)) delete s.intel[key]![String(polityId)];
+  }
+  s.nationControl.delete(polityId);
+  if (s.playerPolityId === polityId) {
+    s.playerPolityId = undefined;
+    ctx.warnings.push('删掉的国家原来是玩家国家:玩家席位已清空');
+  }
+  if (s.customStart && s.customStart.polityId === polityId) {
+    s.customStart = undefined;
+    ctx.warnings.push('删掉的国家原来是开局定制国:定制记录已清除');
+  }
+  const cfg = s.monarch?.config as { polities?: unknown } | undefined;
+  if (cfg && Array.isArray(cfg.polities)) {
+    cfg.polities = (cfg.polities as unknown[]).filter((x) => Number(x) !== polityId);
+  }
+  ctx.warnings.push(`「${name}」第 ${year} 年灭亡(${reason === 'remove' ? '整国删除' : '删到最后一州'})`);
 }

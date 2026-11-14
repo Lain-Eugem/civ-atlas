@@ -28,6 +28,7 @@ import {
 } from '../src/gen/civ/monarch';
 import {
   civHash,
+  nationControlOf,
   submitOrders,
   turnStep,
   worldIdOf,
@@ -81,6 +82,15 @@ function configOf(s: Session): MonarchRunConfig {
   const c = s.monarch?.config;
   if (!c) throw new Error('这个会话还没有配置君主模式;先调用 civ_monarch_setup');
   return c as unknown as MonarchRunConfig;
+}
+
+/**
+ * 只保留控制方式为 AI 的国家。
+ * 开局设置(P1)里标成 'program' 的国家不交给 LLM,由引擎在 turnStep 里自动推演;
+ * 没做过开局设置时按会话 mode 缺省(monarch 会话 = 全部 AI,行为与改造前一致)。
+ */
+function aiMonarchIds(s: Session, ids: readonly number[]): number[] {
+  return ids.filter((id) => nationControlOf(s, id) === 'ai');
 }
 
 /** 配置哪些国家由外部君主接管(可重复调用覆盖配置) */
@@ -162,7 +172,7 @@ export interface BriefResult {
 /** 只读本回合每个君主的简报(不调 LLM、不推演),给外部编排器/调试用 */
 export function monarchBriefList(s: Session): BriefResult {
   const cfg = s.monarch ? (s.monarch.config as unknown as MonarchRunConfig) : null;
-  const ids = pickMonarchIds(s.civ, s.play.year, cfg ? cfg.polities : 'all');
+  const ids = aiMonarchIds(s, pickMonarchIds(s.civ, s.play.year, cfg ? cfg.polities : 'all'));
   const briefs = buildMonarchBriefs(s.civ, s.play, ids);
   return {
     sessionId: s.id,
@@ -171,8 +181,8 @@ export function monarchBriefList(s: Session): BriefResult {
     polities: briefs.length,
     briefs,
     note: cfg
-      ? 'briefs[].text 是发给对应君主的完整提示;不调用 LLM,也不改任何状态'
-      : '还没配置君主模式,这里按全部在世国家出简报;先调 civ_monarch_setup 才会按配置的国家出',
+      ? 'briefs[].text 是发给对应君主的完整提示;不调用 LLM,也不改任何状态(只含控制方式为 AI 的国家)'
+      : '还没配置君主模式,这里按全部在世国家出简报;先调 civ_monarch_setup 才会按配置的国家出(只含 AI 国)',
   };
 }
 
@@ -310,8 +320,8 @@ export async function monarchPlan(s: Session, opts: { years?: number } = {}): Pr
   if (s.endYear !== undefined && s.play.year >= s.endYear) throw new Error(`会话已经到第 ${s.play.year} 年(>= endYear ${s.endYear})`);
 
   const year = Math.floor(s.play.year);
-  const ids = pickMonarchIds(s.civ, s.play.year, cfg.polities);
-  if (!ids.length) throw new Error(`第 ${year} 年没有在世的君主可接管`);
+  const ids = aiMonarchIds(s, pickMonarchIds(s.civ, s.play.year, cfg.polities));
+  // 控制方式为 'program' 的国家不交给 LLM:留 0 个 AI 国也合法,本回合由引擎自动推演它们
   ensureCards(s, ids, year);
   const briefs = buildMonarchBriefs(s.civ, s.play, ids);
   const turnIndex = s.rounds;

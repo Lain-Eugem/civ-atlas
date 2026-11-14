@@ -36,13 +36,15 @@ import {
   sessionSummary,
   magicView,
   worldIdOf,
+  nationControlOf,
+  nationControlView,
   type EventView,
   type PolityView,
   type RulerView,
   type Session,
 } from './engine';
 import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, setMonarchCard, verifySession } from './monarch';
-import { listStartNations, applyCustomStart } from './monarch-start';
+import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, type StartSetupInput } from './monarch-start';
 import { dmRound, dmSetup, dmStatus } from './dm';
 import { pettyRound, pettySetup, pettyStatus } from './petty';
 import { monarchBorders, pickMonarchIds } from '../src/gen/civ/monarch';
@@ -494,10 +496,11 @@ function stateView(s: Session): Record<string, unknown> {
   const events = chron.entries;
   const wars = events.filter((e) => e.kind === 'war' && e.year <= year && e.end >= year);
 
-  const kingCount = s.monarch
+  const kingIds = s.monarch
     ? pickMonarchIds(civ, year, (s.monarch.config as unknown as { polities: 'all' | number | number[] }).polities)
-        .length
-    : 0;
+    : [];
+  // 只数「控制方式 = AI」的国家:标成 program 的国家由引擎自动推演,不占君主席位
+  const kingCount = kingIds.filter((id) => nationControlOf(s, id) === 'ai').length;
 
   return {
     summary: sessionSummary(s),
@@ -570,6 +573,10 @@ function stateView(s: Session): Record<string, unknown> {
     pendingPlan: !!s.pendingPlan,
     // 开局定制(角色卡/起始疆域);没定制 = null
     customStart: s.customStart ? { ...s.customStart, warnings: [...s.customStart.warnings] } : null,
+    // 开局国家设置(数量 / 控制方式 / 增删):nationControl 是应用后的即时结果
+    nationControl: nationControlView(s),
+    startSetup: s.startSetup ?? null,
+    pendingStartSetup: s.pendingStartSetup ?? null,
     // 玩家硬命令(DM 对话框):队列 + 自己的国家
     playerPolityId: s.playerPolityId ?? null,
     playerPolityName: s.playerPolityId != null ? polityName(civ.polities[s.playerPolityId], year) : null,
@@ -616,6 +623,8 @@ function invalidateOwnerCache(sid: string): void {
   const prefix = `${sid}|`;
   for (const key of ownerTilePngs.keys()) if (key.startsWith(prefix)) ownerTilePngs.delete(key);
   for (const key of atlasCache.keys()) if (key.startsWith(prefix)) atlasCache.delete(key);
+  // 标签层也按会话缓存:开局增删国家发生在同一回合里,年份没变,不清理会继续显示已删国家的国名。
+  for (const key of labelsCache.keys()) if (key.startsWith(prefix)) labelsCache.delete(key);
 }
 
 function optNum(v: string | null): number | undefined {
@@ -1340,6 +1349,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     return true;
   }
 
+  if (method === 'GET' && pathname === '/api/start/config') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    sendJson(res, 200, startConfigStatus(getSession(sid)));
+    return true;
+  }
+
   if (method === 'GET' && pathname === '/api/start/nations') {
     const sid = url.searchParams.get('sessionId') ?? '';
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
@@ -1405,6 +1421,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         llm: args.features && typeof args.features === 'object' ? (args.features as Record<string, unknown>).llm !== false : true,
         jev: args.features && typeof args.features === 'object' ? (args.features as Record<string, unknown>).jev === true : false,
       };
+      // 开局国家设置(数量 / 控制方式 / 增删):可以在建会话时一起带上,建完立刻应用
+      const setupArg =
+        args.setup && typeof args.setup === 'object' && !Array.isArray(args.setup)
+          ? (args.setup as StartSetupInput)
+          : undefined;
       const { session, summary } = openSession({
         worldId,
         startYear,
@@ -1415,10 +1436,52 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         review: args.review === true,
         ...(dmPreset ? { dmPreset: true } : {}),
         ...(magicField !== undefined ? { magicField } : {}),
+        ...(setupArg ? { setup: setupArg } : {}),
       });
+      let startSetup: unknown = null;
+      if (setupArg) {
+        try {
+          startSetup = applyStartSetup(session);
+        } catch (e) {
+          fail(res, 400, e instanceof Error ? e.message : String(e));
+          return true;
+        }
+      }
       invalidateOwnerCache(session.id);
       chronCache.delete(session.id);
-      sendJson(res, 200, { session: summary, state: stateView(session) });
+      sendJson(res, 200, { session: summary, state: stateView(session), ...(startSetup ? { startSetup } : {}) });
+      return true;
+    }
+
+    // 开局国家设置:数量 / 控制方式 / 增删国家(只允许第一回合前,每个会话一次)
+    if (pathname === '/api/session/start-setup') {
+      const sid = String(args.sessionId ?? '');
+      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+      const s = getSession(sid);
+      const setup: Record<string, unknown> = {};
+      if (args.count !== undefined && args.count !== null && args.count !== '') setup.count = num(args, 'count', 0);
+      if (args.remove !== undefined) setup.remove = args.remove;
+      if (args.removeRegions !== undefined) setup.removeRegions = args.removeRegions;
+      if (args.controls !== undefined) setup.controls = args.controls;
+      if (args.nations !== undefined) setup.nations = args.nations;
+      else if (args.add !== undefined) setup.nations = args.add;
+      if (args.force === true) setup.force = true;
+      let result: unknown;
+      try {
+        result = applyStartSetup(s, setup as StartSetupInput);
+      } catch (e) {
+        const err = e as Error & { needConfirm?: unknown };
+        if (Array.isArray(err.needConfirm)) {
+          // 删到最后一州:前端据此弹确认框,确认后带 force:true 再提交
+          sendJson(res, 409, { error: err.message, needConfirm: err.needConfirm });
+        } else {
+          fail(res, 400, err.message);
+        }
+        return true;
+      }
+      invalidateOwnerCache(s.id);
+      chronCache.delete(s.id);
+      sendJson(res, 200, { ok: true, result, state: stateView(s) });
       return true;
     }
 
