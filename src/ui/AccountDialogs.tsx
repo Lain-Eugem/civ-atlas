@@ -19,7 +19,7 @@
  *
  * 这里只留登录窗和外壳;登录以后才用得到的窗口在 AccountPanels.tsx,点开才下载。
  */
-import { Suspense, lazy, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { Suspense, lazy, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon } from './icons';
 import { PRIVACY_URL, TERMS_URL } from './links';
@@ -212,19 +212,66 @@ const PhonePanel = lazy(() => import('./PhoneDialog').catch(() => ({ default: Pa
 // ---------------------------------------------------------------------------
 // 窗口外壳
 
-/** 对话框开着时按 Esc 关掉(先于页面上别的 Esc) */
-function useEscape(f: () => void) {
-  const latest = useRef(f);
-  latest.current = f;
+/**
+ * 窗口栈:后来开的盖在先开的上面。Esc 只关最上面那一层,Tab / Shift+Tab 把焦点圈在窗口里,
+ * 开着时不会跑到后面的页面上;关掉以后把焦点还给点开它的地方。
+ */
+interface DialogEntry {
+  node: HTMLElement;
+  esc: () => void;
+}
+const dialogStack: DialogEntry[] = [];
+
+/** 窗口里能聚焦、看得见的东西 */
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+function focusables(node: HTMLElement): HTMLElement[] {
+  return [...node.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.getClientRects().length > 0);
+}
+
+/** 把一层窗口登记进栈:进栈 / 出栈、Esc、Tab 圈焦点、打开时聚焦、关闭后归还焦点 */
+function useDialogLayer(nodeRef: RefObject<HTMLDivElement>, onClose: (() => void) | undefined) {
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
+    const node = nodeRef.current;
+    if (!node) return;
+    const entry: DialogEntry = { node, esc: () => close.current?.() };
+    dialogStack.push(entry);
+    const before = document.activeElement as HTMLElement | null;
+    // 打开时焦点放进窗口(子组件已经自己聚焦了就不动,比如登录窗的邮箱框)
+    if (!node.contains(document.activeElement)) (focusables(node)[0] ?? node).focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.stopPropagation();
-      latest.current();
+      // 只由最上面那层处理:下面那层(先开的)别跟着关掉、也别抢 Tab
+      if (dialogStack[dialogStack.length - 1] !== entry) return;
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        e.preventDefault();
+        entry.esc();
+      } else if (e.key === 'Tab') {
+        const list = focusables(entry.node);
+        if (!list.length) {
+          e.preventDefault();
+          return;
+        }
+        const cur = document.activeElement as HTMLElement | null;
+        const at = cur ? list.indexOf(cur) : -1;
+        // 焦点在窗口外,或到了头 / 尾:绕到另一头
+        const next = at < 0 ? (e.shiftKey ? list.length - 1 : 0) : e.shiftKey && at === 0 ? list.length - 1 : !e.shiftKey && at === list.length - 1 ? 0 : at;
+        if (next !== at) {
+          e.preventDefault();
+          list[next].focus();
+        }
+      }
     };
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, []);
+    return () => {
+      const i = dialogStack.indexOf(entry);
+      if (i >= 0) dialogStack.splice(i, 1);
+      window.removeEventListener('keydown', onKey, true);
+      // 关掉以后把焦点还回去(那个元素还在页面上、也没有别的窗口开着)
+      if (before?.isConnected && !dialogStack.length) before.focus();
+    };
+  }, [nodeRef]);
 }
 
 export function Dialog({
@@ -251,7 +298,8 @@ export function Dialog({
   /** 就地放,窗口才盖不住顶上的提示条 */
   inPlace?: boolean;
 }) {
-  useEscape(() => onClose?.());
+  const dlgRef = useRef<HTMLDivElement>(null);
+  useDialogLayer(dlgRef, onClose);
   const stop = (e: { stopPropagation(): void }) => e.stopPropagation();
   const body = (
     <div
@@ -263,7 +311,7 @@ export function Dialog({
       onClick={stop}
       onWheel={stop}
     >
-      <div className={`acct-dlg${phone ? ' sheet' : ''}${className ? ` ${className}` : ''}`} role="dialog" aria-modal="true" aria-label={label} data-testid={testId} style={phone ? undefined : { width }}>
+      <div ref={dlgRef} tabIndex={-1} className={`acct-dlg${phone ? ' sheet' : ''}${className ? ` ${className}` : ''}`} role="dialog" aria-modal="true" aria-label={label} data-testid={testId} style={phone ? undefined : { width }}>
         {phone && <div className="acct-grip" aria-hidden="true" />}
         {head ?? (
           <div className="acct-head">

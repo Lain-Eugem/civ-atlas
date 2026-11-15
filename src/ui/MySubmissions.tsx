@@ -75,8 +75,8 @@ export function MySubmissions({ phone, scrollTo }: { phone: boolean; scrollTo: b
   const on = useSubmitOn(true);
   const [list, setList] = useState<Submission[] | null>(null);
   const [limits, setLimits] = useState<SubmitLimits | null>(null);
-  /** 正在确认撤回 / 撤下的那一行 */
-  const [asking, setAsking] = useState<{ id: number; what: 'cancel' | 'take' } | null>(null);
+  /** 正在确认撤回 / 撤下的那一行;failed = 这次没成的原因(留在确认里给「重试」) */
+  const [asking, setAsking] = useState<{ id: number; what: 'cancel' | 'take'; failed?: string } | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [errs, setErrs] = useState<Record<number, string>>({});
   const head = useRef<HTMLDivElement>(null);
@@ -123,21 +123,25 @@ export function MySubmissions({ phone, scrollTo }: { phone: boolean; scrollTo: b
   const act = (s: Submission, what: 'cancel' | 'take') => {
     setBusy(s.id);
     setErrs(({ [s.id]: _drop, ...rest }) => rest);
+    setAsking((a) => (a?.id === s.id ? { ...a, failed: undefined } : a));
     const done =
       what === 'cancel'
         ? cancelSubmission(s.id).then(() => setList((l) => (l ?? []).filter((x) => x.id !== s.id)))
         : takedownSubmission(s.id).then((got) => setList((l) => (l ?? []).map((x) => (x.id === s.id ? { ...x, ...got, updatedAt: got.updatedAt ?? new Date().toISOString() } : x))));
     void done
-      .then(() => load().catch(() => {}))
+      .then(() => {
+        void load().catch(() => {});
+        setAsking(null);
+      })
       .catch((e: unknown) => {
-        setErrs((m) => ({ ...m, [s.id]: failText(e) }));
+        const why = failText(e);
+        setErrs((m) => ({ ...m, [s.id]: why }));
+        // 没成:留在确认里,把原因写在行里、按钮换成「重试」
+        setAsking((a) => (a?.id === s.id ? { ...a, failed: why } : a));
         // 状态在别处变了(审完了、已经撤下了):照服务器的重新列
         if (e instanceof ServerError && e.code === 'conflict') void load().catch(() => {});
       })
-      .finally(() => {
-        setBusy(null);
-        setAsking(null);
-      });
+      .finally(() => setBusy(null));
   };
   const look = (workId: string) => {
     closeAccountPanel();
@@ -167,21 +171,24 @@ export function MySubmissions({ phone, scrollTo }: { phone: boolean; scrollTo: b
         {shown.map((s) => {
           const w = rowWords(s, phone);
           const thumb = submitThumb(s);
-          const ask = asking?.id === s.id ? asking.what : null;
+          const askRow = asking?.id === s.id ? asking : null;
+          const ask = askRow?.what ?? null;
           const err = errs[s.id];
           const off = busy === s.id;
+          const confirm =
+            ask === 'take'
+              ? s.kind === 'plugin'
+                ? `从作品墙撤下「${s.title}」？作品墙上马上就看不到了，已经装了的人照常能用；想再上墙要投新的一版、重新审。`
+                : `从作品墙撤下「${s.title}」？作品墙上马上就看不到了。别人已经另存的在他们自己的浏览器里，删不掉；想再上墙要重新投、重新审。`
+              : '撤回这件投稿？还没审完，撤回就不审了，今天用掉的次数不退。';
           return (
-            <div className={`acct-gr${ask ? ' sub-ask' : ''}`} key={s.id} data-sub={s.id} data-status={s.status}>
+            <div className={`acct-gr${askRow ? ' sub-ask' : ''}`} key={s.id} data-sub={s.id} data-status={s.status}>
               <span className={`th2${s.kind === 'plugin' ? ' sub-pi' : ''}`} style={thumb ? { backgroundImage: `url(${JSON.stringify(thumb)})` } : undefined} />
               <span className="main">
                 <b>{s.title}</b>
-                {ask ? (
-                  <small>
-                    {ask === 'take'
-                      ? s.kind === 'plugin'
-                        ? `从作品墙撤下「${s.title}」？作品墙上马上就看不到了，已经装了的人照常能用；想再上墙要投新的一版、重新审。`
-                        : `从作品墙撤下「${s.title}」？作品墙上马上就看不到了。别人已经另存的在他们自己的浏览器里，删不掉；想再上墙要重新投、重新审。`
-                      : '撤回这件投稿？还没审完，撤回就不审了，今天用掉的次数不退。'}
+                {askRow ? (
+                  <small className={askRow.failed ? 'sub-wrap sub-err' : undefined}>
+                    {askRow.failed ? `没成：${askRow.failed}` : off ? '正在办…' : confirm}
                   </small>
                 ) : err ? (
                   <small className="sub-wrap sub-err">{err}</small>
@@ -192,13 +199,13 @@ export function MySubmissions({ phone, scrollTo }: { phone: boolean; scrollTo: b
                   </small>
                 )}
               </span>
-              {ask ? (
+              {askRow ? (
                 <span className="sub-acts">
                   <button className="mini" data-act="sub-keep" disabled={off} onClick={() => setAsking(null)}>
                     取消
                   </button>
-                  <button className="mini red" data-act={ask === 'take' ? 'sub-take-yes' : 'sub-cancel-yes'} disabled={off} onClick={() => act(s, ask)}>
-                    {ask === 'take' ? '撤下' : '撤回'}
+                  <button className="mini red" data-act={ask === 'take' ? 'sub-take-yes' : 'sub-cancel-yes'} disabled={off} onClick={() => act(s, askRow.what)}>
+                    {off ? '正在办…' : askRow.failed ? '重试' : ask === 'take' ? '撤下' : '撤回'}
                   </button>
                 </span>
               ) : (

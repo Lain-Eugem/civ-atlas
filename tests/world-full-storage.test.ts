@@ -1016,7 +1016,7 @@ describe('不让清的记号(worldHolds)', () => {
 });
 
 describe('提示条没了要告诉一声(onGone)', () => {
-  it('到时收起、被关掉、被同一来源的新提示换掉都算;换成别的来源的不算;只调一次', async () => {
+  it('到时收起、被关掉都算;换成别的来源的不算;被同来源新提示盖住时收尾接给新提示;只调一次', async () => {
     let gone = 0;
     showToast({ id: 'a', kind: 'ok', text: '一', ttl: 10, onGone: () => gone++ });
     await new Promise((r) => setTimeout(r, 30));
@@ -1028,8 +1028,17 @@ describe('提示条没了要告诉一声(onGone)', () => {
     showToast({ id: 'a', kind: 'ok', text: '三', onGone: () => gone++ });
     showToast({ id: 'b', kind: 'warn', text: '别的' });
     expect(gone).toBe(2);
+    // 新提示没写 onGone:旧收尾接给它,「撤销」这类机会不因一次同来源替换提前消失
     showToast({ id: 'a', kind: 'ok', text: '四' });
-    expect(gone).toBe(3);
+    expect(gone).toBe(2);
     expect(peekToast('a')?.text).toBe('四');
+    clearToast('a');
+    expect(gone).toBe(3);
+    // 新提示显式写了 onGone = 调用方明确接管这个来源,旧提示就地收尾
+    showToast({ id: 'a', kind: 'ok', text: '五', onGone: () => gone++ });
+    showToast({ id: 'a', kind: 'ok', text: '六', onGone: () => gone++ });
+    expect(gone).toBe(4);
+    clearToast('a');
+    expect(gone).toBe(5);
   });
 });

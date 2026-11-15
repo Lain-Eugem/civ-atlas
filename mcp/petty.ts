@@ -90,9 +90,12 @@ export async function pettySetup(s: Session, input: PettySetupInput): Promise<{ 
       });
   const config: PettyConfig = { mock, profile, maxQuestions, budget, queue: queueOpts, client };
   const prev = runtimes.get(s.id);
-  const queue = prev?.queue ?? new PettyQueue(queueOpts);
+  // 重配要保留已跑过的回合历史，不能被清空；但让旧的熔断状态失效：新建队列既应用最新
+  // queue 参数，又从干净状态开始（tripped / consecutiveFailures 归零），避免旧熔断继续挡住后续回合。
+  const queue = new PettyQueue(queueOpts);
+  prev?.queue.close();
   runtimes.set(s.id, { config, queue });
-  s.petty = { config: configView(config), rounds: [] };
+  s.petty = { config: configView(config), rounds: s.petty?.rounds ?? [] };
   let probe: { ok: boolean; ms: number; error?: string } | null = null;
   if (input.probe === true) probe = await probePetty(s);
   return { sessionId: s.id, petty: { ...pettyStatus(s), probe } as PettyStatus & { probe: typeof probe } };
@@ -216,9 +219,17 @@ function polityBriefs(s: Session): PolityBrief[] {
     const p = civ.polity[r];
     if (p >= 0) sizes.set(p, (sizes.get(p) ?? 0) + 1);
   }
-  const atWar = new Set<number>();
+  // 按战争编号重建"当前在战"状态：war 宣战把攻方(a)/守方(b)都登记，peace 议和结束该编号。
+  // 这样已议和的国家不会一直被当成在打仗，军事类小事件的触发在回放里也能逐位一致。
+  const activeWars = new Map<number, [number, number]>();
   for (const a of civ.annals) {
-    if (a.kind === 'war' && a.a >= 0) atWar.add(a.a);
+    if (a.kind === 'war' && a.war >= 0 && a.a >= 0) activeWars.set(a.war, [a.a, a.b]);
+    else if (a.kind === 'peace' && a.war >= 0) activeWars.delete(a.war);
+  }
+  const atWar = new Set<number>();
+  for (const [x, y] of activeWars.values()) {
+    if (x >= 0) atWar.add(x);
+    if (y >= 0) atWar.add(y);
   }
   const out: PolityBrief[] = [];
   for (const [id, size] of [...sizes.entries()].sort((x, y) => y[1] - x[1] || x[0] - y[0])) {
@@ -454,6 +465,21 @@ function degradeOption(mode: PettyMode, roll: number): string | null {
   return roll < 0.15 ? options[0].key : null;
 }
 
+/**
+ * 事件级固定抽签键：把 README 约定的 `petty:<事件ID>:<年份>:<国家ID>` 折成稳定的 32 位盐。
+ * 抽签只认事件本身，不认它在哪一批、第几个被处理（旧代码用 decisions.length % 3 会随
+ * 降级/处理顺序漂移），保证同一串决策回放逐位一致。purpose 区分抽样 / mock 答案 / 降级等用途。
+ */
+function eventSalt(eventId: string, year: number, polityId: number, purpose: number): number {
+  const key = `petty:${eventId}:${year}:${polityId}:${purpose}`;
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
 // ---------------------------------------------------------------------------
 // 回合执行
 // ---------------------------------------------------------------------------
@@ -546,21 +572,22 @@ export async function settlePetty(s: Session, opts: { years?: number } = {}): Pr
       batches.push({ priority: group.priority, questions: 0, tokens: 0, overBudget: false, dropped: group.evs.length });
       continue;
     }
-    const planned = group.evs.filter((e) => plan.included.some((q) => q.key === e.id));
+    const includedIds = new Set(plan.included.map((q) => q.key));
+    const planned = group.evs.filter((e) => includedIds.has(e.id));
+    const droppedEvents = group.evs.filter((e) => !includedIds.has(e.id));
     batches.push({
       priority: group.priority,
       questions: planned.length,
       tokens: plan.tokens.total,
       overBudget: plan.tokens.overBudget,
-      dropped: group.evs.length - planned.length,
+      dropped: droppedEvents.length,
     });
-    if (!planned.length) {
-      for (const e of group.evs) {
-        fallbackCount++;
-        decisions.push(degradeDecision(s, e, 'budget'));
-      }
-      continue;
+    // 预算/问题数上限丢弃的事件不能静默消失：一律走引擎确定性降级并计入 fallback。
+    for (const e of droppedEvents) {
+      fallbackCount++;
+      decisions.push(degradeDecision(s, e, 'budget'));
     }
+    if (!planned.length) continue;
 
     const questions: Record<string, JevQuestion> = {};
     for (const e of planned) questions[e.id] = e.question;
@@ -569,7 +596,7 @@ export async function settlePetty(s: Session, opts: { years?: number } = {}): Pr
     let source: 'jev' | 'mock' = 'mock';
     if (cfg.mock) {
       answerMap = {};
-      for (const e of planned) answerMap[e.id] = mockAnswer(e, pettyRoll(s.civ.seed, fromYear, e.polityId, 2000 + PETTY_PRIORITY_NUM[e.mode.priority]));
+      for (const e of planned) answerMap[e.id] = mockAnswer(e, pettyRoll(s.civ.seed, e.year, e.polityId, eventSalt(e.id, e.year, e.polityId, 2)));
     } else {
       try {
         const reply = await queue.enqueue(
@@ -590,7 +617,7 @@ export async function settlePetty(s: Session, opts: { years?: number } = {}): Pr
     for (const ev of planned) {
       const answer = answerMap?.[ev.id];
       const weights = weightsFor(ev.mode, answer);
-      const roll = pettyRoll(s.civ.seed, fromYear + (decisions.length % 3), ev.polityId, 3000 + PETTY_PRIORITY_NUM[ev.mode.priority]);
+      const roll = pettyRoll(s.civ.seed, ev.year, ev.polityId, eventSalt(ev.id, ev.year, ev.polityId, 1));
       const optionKey = Object.keys(weights).length ? pickByWeight(Object.entries(weights), roll) : null;
       if (optionKey === null) {
         fallbackCount++;
@@ -702,7 +729,7 @@ function mockAnswer(ev: PettyEvent, roll: number): Record<string, unknown> {
 }
 
 function degradeDecision(s: Session, ev: PettyEvent, why: string): PettyDecisionResult {
-  const roll = pettyRoll(s.civ.seed, ev.year, ev.polityId, 4000 + PETTY_PRIORITY_NUM[ev.mode.priority]);
+  const roll = pettyRoll(s.civ.seed, ev.year, ev.polityId, eventSalt(ev.id, ev.year, ev.polityId, 3));
   const optionKey = degradeOption(ev.mode, roll);
   const { effect, optionLabel } = effectMemory(ev.modeId, optionKey);
   const { command, note } = optionKey !== null ? optionToCommand(s, ev, optionKey) : { command: null, note: null };

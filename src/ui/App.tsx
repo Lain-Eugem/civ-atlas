@@ -336,18 +336,15 @@ export { startGalleryHelper } from './galleryHelper';
 
 /** fromHome:打开网站时先出来的首页(HomeShell.tsx)上点了要离开首页的事,挂上以后接着做(见 Boot.tsx) */
 /**
- * 界面渲染时抛错:开着的世界是新路读的,记下来、刷新页面重开,这次走旧的路(openGuard.ts);别的错和没有这一层一样(整页没了)
+ * 界面渲染时抛错:开着的世界是新路读的,记下来、刷新页面重开,这次走旧的路(openGuard.ts);
+ * 别的错不在这里兜着,冒到最外面那层通用回退页(main.tsx 的 AppErrorBoundary),给人重新加载 / 回我的世界 / 复制出错信息三条路。
  */
-class OpenCrashGuard extends Component<{ children: ReactNode }, { failed: boolean }> {
-  state = { failed: false };
-  static getDerivedStateFromError() {
-    return { failed: true };
-  }
+class OpenCrashGuard extends Component<{ children: ReactNode }> {
   componentDidCatch() {
     if (reportOpenCrash()) location.reload();
   }
   render() {
-    return this.state.failed ? null : this.props.children;
+    return this.props.children;
   }
 }
 

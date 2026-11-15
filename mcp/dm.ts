@@ -122,7 +122,7 @@ export async function dmSetup(s: Session, input: DmSetupInput = {}): Promise<DmS
       provider: providerName,
       baseUrl,
       model,
-      apiKey: input.apiKey ?? envKey,
+      apiKey: input.apiKey && input.apiKey.trim() ? input.apiKey : envKey && envKey.trim() ? envKey : undefined,
       temperature: input.temperature,
       timeoutMs: input.timeoutMs,
     });

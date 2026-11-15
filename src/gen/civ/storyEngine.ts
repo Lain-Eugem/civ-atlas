@@ -15,7 +15,7 @@ import { type Intervention } from '../edits';
 import { Layer, type Year } from './types';
 import type { CivSim } from './engine/sim';
 import type { InterventionModel } from './interventions';
-import { strikeBoost, type BoostIv } from './boost';
+import { DEV_BOOST_MUL, strikeBoost, type BoostIv } from './boost';
 import { capacityAt, portAt } from './growth';
 
 export type StoryIv = Extract<Intervention, { kind: 'story' }>;
@@ -59,8 +59,8 @@ export function strikeStory(sim: CivSim, iv: InterventionModel, v: StoryIv, i: n
         me = pol;
       }
       if (pol < 0) continue;
-      const boost: BoostIv = { kind: 'boost', a: v.a!, from: v.from, mul: 3, until: v.from + e.years } as BoostIv;
-      strikeBoost(sim, iv, boost, i, pol, t);
+      const boost: BoostIv = { kind: 'boost', a: v.a!, from: v.from, mul: DEV_BOOST_MUL, until: v.from + e.years } as BoostIv;
+      strikeBoost(sim, iv, boost, i, pol, t, boost.until);
       applied++;
       continue;
     }

@@ -141,7 +141,8 @@ export function jevSettings(input: JevSettingsInput = {}): JevSettings {
   const model = (input.model ?? env('JEV_MODEL') ?? DEFAULT_MODEL).trim();
   if (!model) throw new JevError('config', '缺少 model（官方默认 typesafe/jev-1.14.0）');
   const timeoutMs = clampNum(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, 100, 600_000, 'timeoutMs');
-  const apiKey = input.apiKey ?? env('JEV_API_KEY') ?? env('DEFAPI_API_KEY');
+  // 空串/纯空白的 apiKey 视为"没给"，不能挡住环境变量回退。
+  const apiKey = (input.apiKey && input.apiKey.trim() ? input.apiKey.trim() : undefined) ?? env('JEV_API_KEY') ?? env('DEFAPI_API_KEY');
   if (!apiKey) throw new JevError('config', '没有 API Key：传 apiKey，或设置环境变量 JEV_API_KEY（defapi.org 的 Key）');
   return { baseUrl, model, apiKey, timeoutMs };
 }
@@ -200,7 +201,18 @@ export function checkQuestions(questions: JevQuestions): void {
   }
 }
 
-/** 把响应里的 answers 收敛成严格形状；形状不对抛 response 错误（避免把垃圾概率带进引擎） */
+/** choice 的合法选项 key = criteria 的键；score 的合法档位 key = '0'..'n-1'（criteria 下标）。 */
+function allowedKeys(q: JevQuestion): Set<string> {
+  if (q.type === 'choice') return new Set(Object.keys(q.criteria ?? {}));
+  if (q.type === 'score') return new Set(q.criteria.map((_, i) => String(i)));
+  return new Set<string>();
+}
+
+/**
+ * 把响应里的 answers 收敛成严格形状；形状不对抛 response 错误（避免把垃圾概率带进引擎）。
+ * 未知选项白名单：choice 必须在问题 criteria 声明过的选项里；probabilities / legend 里没声明过的
+ * key 一律过滤，不让模型自造的无关选项把无效概率/档位带进引擎抽样。
+ */
 function readAnswers(v: unknown, asked: JevQuestions): Record<string, JevAnswer> {
   const raw = asRecord(v);
   if (!raw) throw new JevError('response', '响应缺 answers 对象');
@@ -211,18 +223,20 @@ function readAnswers(v: unknown, asked: JevQuestions): Record<string, JevAnswer>
     const type = asked[key].type;
     if (a.type !== type) throw new JevError('response', `问题 ${key} 的答案类型 ${String(a.type)} 与问题类型 ${type} 不一致`);
     const ans: JevAnswer = { type };
+    const allowed = allowedKeys(asked[key]);
     if (type === 'noul') {
       const p = asNumber(a.noul);
       if (p === undefined || p < 0 || p > 1) throw new JevError('response', `问题 ${key} 的 noul 概率不在 0..1`);
       ans.noul = p;
     } else if (type === 'choice') {
-      const choice = typeof a.choice === 'string' ? a.choice : undefined;
-      if (!choice) throw new JevError('response', `问题 ${key}（choice）缺 choice`);
+      const choice = typeof a.choice === 'string' && allowed.has(a.choice) ? a.choice : undefined;
+      if (!choice) throw new JevError('response', `问题 ${key}（choice）的 choice 不在选项白名单内`);
       ans.choice = choice;
       const probs = asRecord(a.probabilities);
       if (probs) {
         const dist: Record<string, number> = {};
         for (const [k, vv] of Object.entries(probs)) {
+          if (!allowed.has(k)) continue;
           const n = asNumber(vv);
           if (n === undefined) throw new JevError('response', `问题 ${key} 的概率 ${k} 不是数字`);
           dist[k] = n;
@@ -236,6 +250,7 @@ function readAnswers(v: unknown, asked: JevQuestions): Record<string, JevAnswer>
       if (!probs) throw new JevError('response', `问题 ${key}（score）缺 probabilities`);
       const dist: Record<string, number> = {};
       for (const [k, vv] of Object.entries(probs)) {
+        if (!allowed.has(k)) continue;
         const n = asNumber(vv);
         if (n === undefined) throw new JevError('response', `问题 ${key} 的概率 ${k} 不是数字`);
         dist[k] = n;
@@ -246,7 +261,10 @@ function readAnswers(v: unknown, asked: JevQuestions): Record<string, JevAnswer>
       const legend = asRecord(a.legend);
       if (legend) {
         const lg: Record<string, string> = {};
-        for (const [k, vv] of Object.entries(legend)) lg[k] = String(vv);
+        for (const [k, vv] of Object.entries(legend)) {
+          if (!allowed.has(k)) continue;
+          lg[k] = String(vv);
+        }
         ans.legend = lg;
       }
       const conf = asNumber(a.confidence);
@@ -287,24 +305,30 @@ export async function askJev(
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), s.timeoutMs);
   const onAbort = () => ctrl.abort();
+  // 外部 signal(队列超时/关闭)可能在绑监听前就已 abort，先同步一次，避免漏掉。
+  if (opts.signal?.aborted) ctrl.abort();
   opts.signal?.addEventListener('abort', onAbort, { once: true });
   let res: Response;
+  let text: string;
   try {
+    // fetch 拿到 headers 不等于拿到 body：服务端慢速 drip / 半开连接时 res.text() 会一直挂起。
+    // 因此把 fetch 和 res.text() 放在同一个 AbortSignal 覆盖下，且定时器/外部 signal 解绑都推迟到
+    // body 读完(或读取失败)之后——内部超时或队列 abort 才能真正中断响应体读取、释放队列槽位与连接。
     res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${s.apiKey}` },
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
+    text = await res.text();
   } catch (e) {
-    if (ctrl.signal.aborted) throw new JevError('timeout', `Jev 请求超时（${s.timeoutMs}ms）`);
+    if (ctrl.signal.aborted) throw new JevError('timeout', `Jev 请求或响应体读取超时（${s.timeoutMs}ms）`);
     throw new JevError('network', `Jev 请求失败：${e instanceof Error ? e.message : String(e)}`);
   } finally {
+    // body 读完后才清定时器、解绑外部 signal；下面的解析不再涉及网络 I/O，错误分类保持不变。
     clearTimeout(timer);
     opts.signal?.removeEventListener('abort', onAbort);
   }
-
-  const text = await res.text();
   if (!res.ok) {
     let message = text.slice(0, 500);
     let code: number | undefined;

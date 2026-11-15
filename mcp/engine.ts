@@ -12,7 +12,7 @@
  */
 import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DEFAULT_PARAMS, generateWorld, type World, type WorldParams } from '../src/gen/world';
 import { DEFAULT_CIV_PARAMS } from '../src/gen/civ';
 import { playCiv, playTurn } from '../src/gen/civ/play';
@@ -50,13 +50,21 @@ export interface WorldCreateInput {
   params?: Partial<WorldParams>;
 }
 
+/** 注册表容量上限(兜底:长时间反复开会话/加载插件时不让内存无限增长) */
+const WORLDS_MAX = 64;
+const SESSIONS_MAX = 256;
 const worlds = new Map<string, WorldRecord>();
 let sessionSeq = 0;
-
-/** 世界 id:由 seed + 全部生成参数算出,同一个世界永远同一个 id */
+/** 世界 id:由 seed + 全部生成参数算出,同一个世界永远同一个 id;按参数串缓存,避免每个状态快照都重算 */
+const worldIdCache = new Map<string, string>();
 export function worldIdOf(params: WorldParams): string {
-  const h = createHash('sha1').update(JSON.stringify(params)).digest('hex').slice(0, 10);
-  return `w-${params.seed}-${h}`;
+  const key = JSON.stringify(params);
+  const hit = worldIdCache.get(key);
+  if (hit !== undefined) return hit;
+  const h = createHash('sha1').update(key).digest('hex').slice(0, 10);
+  const id = `w-${params.seed}-${h}`;
+  worldIdCache.set(key, id);
+  return id;
 }
 
 /** 新建一个世界(纯计算,约 0.5–3 秒,取决于 cells) */
@@ -69,6 +77,12 @@ export function createWorld(input: WorldCreateInput): WorldRecord {
   const started = Date.now();
   const world = generateWorld(params);
   const rec: WorldRecord = { id: worldIdOf(params), world, params, generatedMs: Date.now() - started };
+  // 容量保护:超出上限时淘汰最早创建的世界(已经打开的会话仍持有自己的 world 引用,不受影响)
+  while (worlds.size >= WORLDS_MAX) {
+    const oldest = worlds.keys().next().value;
+    if (oldest === undefined) break;
+    worlds.delete(oldest);
+  }
   worlds.set(rec.id, rec);
   return rec;
 }
@@ -302,9 +316,48 @@ export interface Session {
   pendingStartSetup?: StartSetupInput;
   /** 已经应用过的开局国家设置(一次性;没设置过 = 没有) */
   startSetup?: StartSetupState;
+  /** 幂等键:上一次 turnStep 的 idempotencyKey(不带 key 的回合为 undefined) */
+  lastRoundKey?: string;
+  /** 上一次 turnStep 的结果(同 key 重试时直接回放浅拷贝) */
+  lastRoundResult?: TurnResult;
 }
 
 const sessions = new Map<string, Session>();
+
+/**
+ * 串行锁(跨组契约):异步操作排队执行,避免并发推演互相踩状态。两种调用形态:
+ * - withSessionLock(fn)            全局一把锁(查看器 /api/* 所有写操作串行,viewer.ts 的 withPostLock 用这个)
+ * - withSessionLock(sessionId, fn) 按会话分锁(MCP 工具层,不同会话互不阻塞)
+ * 前一个调用失败也不会卡住队列;队列空了就把这条链清掉,不留内存残渣。
+ */
+const sessionTails = new Map<string, Promise<void>>();
+export function withSessionLock<T>(fn: () => T | Promise<T>): Promise<T>;
+export function withSessionLock<T>(sessionId: string, fn: () => T | Promise<T>): Promise<T>;
+export function withSessionLock<T>(
+  keyOrFn: string | (() => T | Promise<T>),
+  maybeFn?: () => T | Promise<T>,
+): Promise<T> {
+  const key = typeof keyOrFn === 'string' ? keyOrFn : '__global__';
+  const fn = typeof keyOrFn === 'string' ? maybeFn! : keyOrFn;
+  const prev = sessionTails.get(key) ?? Promise.resolve();
+  const task = prev.then(fn, fn);
+  const tail: Promise<void> = task.then(() => undefined, () => undefined);
+  sessionTails.set(key, tail);
+  void tail.then(() => {
+    if (sessionTails.get(key) === tail) sessionTails.delete(key);
+  });
+  return task;
+}
+
+/** 把工具/推演错误写进会话日志目录(errors.jsonl);日志失败不盖掉原始错误 */
+export function logError(s: Session, context: string, err: unknown): void {
+  const line = JSON.stringify({ at: Date.now(), context, error: err instanceof Error ? err.message : String(err) });
+  try {
+    appendFileSync(join(s.logDir, 'errors.jsonl'), line + '\n');
+  } catch {
+    // 日志写失败不能影响主流程
+  }
+}
 
 function runsRoot(): string {
   const dir = join(process.cwd(), 'mcp', '.runs');
@@ -317,6 +370,7 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
   const startYear = Math.round(clampNum(input.startYear, 1, 60000, 'startYear'));
   const stepYears = Math.round(clampNum(input.stepYears ?? 1, 1, 1000, 'stepYears'));
   const maxRounds = Math.round(clampNum(input.maxRounds ?? 1, 1, 200, 'maxRounds'));
+  // endYear 只做范围夹取,不改写用户设定的结束年;「推到 endYear 就停」由 turnStep 里夹 years 实现
   const endYear = input.endYear === undefined ? undefined : Math.round(clampNum(input.endYear, startYear + 1, 65535, 'endYear'));
   const mode: SessionMode = input.mode ?? 'auto';
   if (mode !== 'auto' && mode !== 'monarch') throw new Error(`mode 只能是 "auto"(内置规则自动推演) 或 "monarch"(外部君主接管),收到 ${String(mode)}`);
@@ -401,6 +455,12 @@ export function openSession(input: SessionOpenInput): { session: Session; summar
     nationControl: new Map(),
     ...(setup ? { pendingStartSetup: setup } : {}),
   };
+  // 容量保护:超出上限时淘汰最早创建的会话(与 worlds 同一套兜底)
+  while (sessions.size >= SESSIONS_MAX) {
+    const oldest = sessions.keys().next().value;
+    if (oldest === undefined) break;
+    sessions.delete(oldest);
+  }
   sessions.set(id, session);
   writeFileSync(
     join(logDir, 'session.json'),
@@ -439,6 +499,20 @@ export function getSession(id: string): Session {
 
 export function listSessions(): SessionSummary[] {
   return [...sessions.values()].map((s) => sessionSummary(s));
+}
+
+/** 删除会话(跨组契约:查看器清理会话的入口);顺手卸掉官方插件与该会话的锁链 */
+export function deleteSession(id: string): boolean {
+  const s = sessions.get(id);
+  if (s) {
+    try {
+      s.pluginDispose?.();
+    } catch {
+      // 卸载失败不挡删除
+    }
+    sessionTails.delete(id);
+  }
+  return sessions.delete(id);
 }
 
 /* ------------------------------------------------------------------ *
@@ -505,7 +579,8 @@ export interface SessionSummary {
   pendingStartSetup?: boolean;
 }
 
-export function sessionSummary(s: Session): SessionSummary {
+/** fingerprint 可由调用方先算好传进来(缓存指纹),避免同一次调用里重复 hash 整张归属表 */
+export function sessionSummary(s: Session, fingerprint?: string): SessionSummary {
   return {
     sessionId: s.id,
     mode: s.mode,
@@ -521,7 +596,7 @@ export function sessionSummary(s: Session): SessionSummary {
     world: { worldId: worldIdOf(s.worldParams), seed: s.worldParams.seed, cells: s.worldParams.cells },
     polities: aliveCount(s.civ, s.play.year),
     rivers: riverSummary(s.world, s.civ),
-    fingerprint: civHash(s.civ),
+    fingerprint: fingerprint ?? civHash(s.civ),
     logDir: s.logDir,
     ...(s.fields?.length ? { fields: s.fields.map((f) => f.id) } : {}),
     ...(s.plugins?.length ? { plugins: s.plugins.map((p) => p.id) } : {}),
@@ -694,8 +769,12 @@ export function layerViews(s: Session): LayerView[] {
     let sum = 0;
     let k = 0;
     if (last) {
-      for (const v of last) {
+      const of = L.unit === 'tile' ? s.civ.regions?.of : undefined;
+      for (let i = 0; i < last.length; i++) {
+        const v = last[i]!;
         if (!Number.isFinite(v)) continue;
+        // 按地块记的场跳过水面(of[i] < 0 = 海/湖),和 magicView 的统计口径一致
+        if (of && of[i]! < 0) continue;
         if (v < min) min = v;
         if (v > max) max = v;
         sum += v;
@@ -734,6 +813,8 @@ export function fieldViews(s: Session): FieldView[] {
 
 export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number } = {}): Record<string, unknown> {
   const year = s.play.year;
+  // 算一次指纹,下面的 session 摘要与本返回值共用(缓存指纹:同一次调用不再 hash 两遍)
+  const fingerprint = civHash(s.civ);
   const size = sizesNow(s.civ);
   const alive = s.civ.polities
     .filter((p) => polityAlive(p, year) && (size.get(p.id) ?? 0) > 0)
@@ -741,7 +822,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     .sort((a, b) => b.size - a.size || a.id - b.id);
   const chronicle = opts.chronicle ? chronicleGet(s, { limit: opts.limit ?? 40 }) : undefined;
   return {
-    session: sessionSummary(s),
+    session: sessionSummary(s, fingerprint),
     year,
     stepYears: s.stepYears,
     rounds: s.rounds,
@@ -750,7 +831,7 @@ export function stateGet(s: Session, opts: { chronicle?: boolean; limit?: number
     rivers: riverReport(s.world, s.civ, year),
     commandQueue: s.queue.length,
     commands: s.play.commands.map((v) => ({ kind: v.kind, from: v.from, time: commandTime(v), ...restOf(v) })),
-    fingerprint: civHash(s.civ),
+    fingerprint,
     magic: magicView(s),
     fields: fieldViews(s),
     layers: layerViews(s),
@@ -805,29 +886,68 @@ export interface TurnResult {
   events: EventView[];
   finished: boolean;
   fingerprint: string;
+  /** 回合日志落盘失败的错误信息(引擎已推进,仅提示;不抛错) */
+  logError?: string;
 }
 
-/** 把队列里的命令交给引擎,再推 stepYears 年 */
-export function turnStep(s: Session, opts: { years?: number; orders?: readonly unknown[] } = {}): TurnResult {
+export interface TurnStepOptions {
+  years?: number;
+  orders?: readonly unknown[];
+  idempotencyKey?: string;
+  onLogError?: (context: string, err: unknown) => void;
+}
+
+/**
+ * 把队列里的命令交给引擎,再推 stepYears 年。
+ * 幂等键命中时直接回放上一回合结果;推演失败写 errors.jsonl 并可选回调后抛出;
+ * 回合日志落盘失败不抛错(引擎已推进),只把错误信息放进 TurnResult.logError。
+ */
+export function turnStep(s: Session, opts: TurnStepOptions = {}): TurnResult {
+  const key = typeof opts.idempotencyKey === 'string' && opts.idempotencyKey.trim() !== '' ? opts.idempotencyKey : undefined;
+  if (key !== undefined && s.lastRoundKey === key && s.lastRoundResult) {
+    return { ...s.lastRoundResult };
+  }
+  try {
+    return runTurnStep(s, opts, key);
+  } catch (e) {
+    // 只有推演本身失败才抛出;日志 / 回调失败都不盖掉原始错误
+    logError(s, 'turnStep', e);
+    try {
+      opts.onLogError?.('turnStep', e);
+    } catch {
+      // 回调失败不影响主流程
+    }
+    throw e;
+  }
+}
+
+/** 真正跑一回合(被 turnStep 的幂等 / 日志外壳包住) */
+function runTurnStep(s: Session, opts: TurnStepOptions, key: string | undefined): TurnResult {
   if (isFinished(s)) throw new Error(`会话 ${s.id} 已经结束(第 ${s.play.year} 年,${s.rounds}/${s.maxRounds} 回合)`);
   if (s.pendingStartSetup) {
     throw new Error('开局国家设置还没应用:先调用 applyStartSetup(或 POST /api/session/start-setup)再推演');
   }
+  // 干预数量核对:清洗阶段的拒收也并入结果,保证「输入 = 接纳(orders) + 拒收(rejected)」,不再静默丢掉
+  const cleanRejected: unknown[] = [];
   // DM 对话框里直接下的硬命令(上帝视角,命令里已显式点名国家):回合开始时先入队(最多 5 条),与其它命令一起交给引擎
   const playerCmds = drainPlayerCommands(s);
   if (playerCmds.length) {
     const cleanedPlayer = cleanOrders(s.play, playerCmds);
     s.queue.push(...cleanedPlayer.commands);
+    cleanRejected.push(...cleanedPlayer.rejected);
   }
   if (opts.orders && opts.orders.length) {
     const cleaned = cleanOrders(s.play, opts.orders);
     s.queue.push(...cleaned.commands);
+    cleanRejected.push(...cleaned.rejected);
   }
   const years = Math.round(clampNum(opts.years ?? s.stepYears, 1, 1000, 'years'));
+  // 到 endYear 就停:最后一回合把本回合年数夹到剩余年份,不越过用户设定的结束年
+  const capped = s.endYear === undefined ? years : Math.max(1, Math.min(years, s.endYear - s.play.year));
   const before = sizesNow(s.civ);
   const fromYear = s.play.year;
   const orders = [...s.queue];
-  const step = playTurn(s.world, s.civ, s.civParams, s.play, orders, years);
+  const step = playTurn(s.world, s.civ, s.civParams, s.play, orders, capped);
   s.civ = step.civ;
   s.play = step.play;
   s.queue = [];
@@ -849,25 +969,44 @@ export function turnStep(s: Session, opts: { years?: number; orders?: readonly u
     .filter((e) => {
       const start = Math.floor(e.year);
       const end = Math.floor(e.end);
-      return (start >= fromYear && start <= toYear) || (end >= fromYear && end <= toYear);
+      // 区间相交即可:长事件可能横跨整个回合(两端都不在 [fromYear,toYear] 内),旧的"只看端点"会漏掉
+      return start <= toYear && end >= fromYear;
     })
     .map(eventView);
+  const rejected = [...cleanRejected, ...step.rejected];
   const result: TurnResult = {
     sessionId: s.id,
     round: s.rounds,
     fromYear,
     toYear,
-    years,
+    years: capped,
     orders: orders.length,
-    rejected: step.rejected,
+    rejected,
     polities,
     events,
     finished: isFinished(s),
     fingerprint: civHash(s.civ),
   };
+  // 日志落盘失败不能中断主流程:引擎已推进,不能返回 500 让调用方重试再推一年。
+  // 把错误信息挂到 result.logError 带回去;errors.jsonl 另记,同样不抛错。
+  const logParts: string[] = [];
   const logPath = join(s.logDir, `round-${String(s.rounds).padStart(4, '0')}.json`);
-  writeFileSync(logPath, JSON.stringify({ result, orders }, null, 2));
-  appendFileSync(join(s.logDir, 'rounds.jsonl'), JSON.stringify({ round: s.rounds, fromYear, toYear, orders, rejected: step.rejected, fingerprint: result.fingerprint }) + '\n');
+  try {
+    writeFileSync(logPath, JSON.stringify({ result, orders, idempotencyKey: key ?? null }, null, 2));
+  } catch (e) {
+    logParts.push(`round.json:${e instanceof Error ? e.message : String(e)}`);
+    logError(s, 'writeRoundLog', e);
+  }
+  try {
+    appendFileSync(join(s.logDir, 'rounds.jsonl'), JSON.stringify({ round: s.rounds, fromYear, toYear, orders, rejected, fingerprint: result.fingerprint, idempotencyKey: key ?? null }) + '\n');
+  } catch (e) {
+    logParts.push(`rounds.jsonl:${e instanceof Error ? e.message : String(e)}`);
+    logError(s, 'writeRoundsJsonl', e);
+  }
+  if (logParts.length) result.logError = logParts.join('; ');
+  // 幂等记账:结果留给同 key 的重试直接回放;不带 key 时清掉旧键,避免过期结果被误命中
+  s.lastRoundKey = key;
+  s.lastRoundResult = result;
   return result;
 }
 
@@ -890,8 +1029,21 @@ export function chronicleGet(
   return { year: s.play.year, total: all.length, entries: list };
 }
 
+/** 导出路径边界(跨组契约):用户给的路径必须落在进程工作目录内,防止 ../ 或 cwd 外绝对路径写到仓库外 */
+function exportPathOf(s: Session, path?: unknown): string {
+  if (path === undefined) return join(s.logDir, 'export.json');
+  if (typeof path !== 'string' || path.trim() === '') throw new Error('导出路径必须是非空字符串');
+  const root = resolve(process.cwd());
+  const target = resolve(root, path);
+  const rel = relative(root, target);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`导出路径必须落在进程工作目录内(${root}):${path}`);
+  }
+  return target;
+}
+
 export function exportSession(s: Session, path?: string): { path: string; bytes: number } {
-  const out = path ?? join(s.logDir, 'export.json');
+  const out = exportPathOf(s, path);
   const payload = {
     format: 'civ-atlas-mcp-session-v1',
     exportedAt: new Date().toISOString(),
@@ -903,6 +1055,7 @@ export function exportSession(s: Session, path?: string): { path: string; bytes:
     chronicle: chronicleGet(s, { limit: 500 }).entries,
   };
   const text = JSON.stringify(payload, null, 2);
+  mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, text);
   return { path: out, bytes: Buffer.byteLength(text) };
 }

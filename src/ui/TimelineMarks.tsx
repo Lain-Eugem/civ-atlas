@@ -62,6 +62,22 @@ const MARK_ROW = 22;
 /** 按下后移动超过这么多(像素)算拖动 */
 const DRAG_SLOP = 3;
 
+/** 提示 / 手机卡片里能点的一行:也让键盘 Tab 到得了、能用回车 / 空格点(时间轴上的东西不能只认鼠标) */
+function rowKey() {
+  return {
+    role: 'button' as const,
+    tabIndex: 0,
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        e.stopPropagation();
+        // 走元素自己的 onClick:和鼠标点同一条路,不用再写一遍
+        (e.currentTarget as HTMLElement).click();
+      }
+    },
+  };
+}
+
 /** 导出回放视频时:时间轴上选的一段(两头的把手拖着改) */
 export interface TimelineRange {
   from: number;
@@ -566,6 +582,7 @@ export const TimelineMarks = memo(function TimelineMarks({ entries, end, dock, y
       className={`tb-track${tip ? ' hot' : ''}${range ? ' film' : ''}${range?.locked ? ' locked' : ''}`}
       role="slider"
       tabIndex={0}
+      aria-orientation="horizontal"
       aria-label="年份"
       aria-valuemin={range ? range.from : 0}
       aria-valuemax={range ? range.to : top}
@@ -624,6 +641,7 @@ export const TimelineMarks = memo(function TimelineMarks({ entries, end, dock, y
           ref={tipRef}
           className="up-tip"
           style={{ visibility: 'hidden' }}
+          {...rowKey()}
           onPointerDown={(e) => e.stopPropagation()}
           onPointerEnter={keep}
           onPointerLeave={() => !tip.pinned && hideSoon(220)}
@@ -648,6 +666,7 @@ export const TimelineMarks = memo(function TimelineMarks({ entries, end, dock, y
               <div
                 className={`tb-tip-row${e === tip.lead ? ' lead' : ''}`}
                 data-ev={evType(e)}
+                {...rowKey()}
                 onClick={() => {
                   pickChronicleEntry(e);
                   setTip({ ...tip, lead: e });
@@ -662,6 +681,7 @@ export const TimelineMarks = memo(function TimelineMarks({ entries, end, dock, y
                   key={`c${c.id}`}
                   className={`tb-tip-row sub${c === tip.lead ? ' lead' : ''}`}
                   data-ev={evType(c)}
+                  {...rowKey()}
                   onClick={() => {
                     pickChronicleEntry(c);
                     setTip({ ...tip, lead: c });
@@ -696,13 +716,13 @@ export const TimelineMarks = memo(function TimelineMarks({ entries, end, dock, y
             >
               {card.items.map((e) => (
                 <Fragment key={e.id}>
-                  <div className={`tb-card-row${e === cardCur ? ' cur' : ''}`} data-ev={evType(e)} data-year={Math.floor(e.year)} onClick={() => goRow(e)}>
+                  <div {...rowKey()} className={`tb-card-row${e === cardCur ? ' cur' : ''}`} data-ev={evType(e)} data-year={Math.floor(e.year)} onClick={() => goRow(e)}>
                     <span className="tb-card-y">{yearShort(e.year, era)}</span>
                     <b className="tb-ev">{evLabel(e)}</b>
                     <span className="tb-card-x2">{eraText(evText(e), era)}</span>
                   </div>
                   {subRows(e).map((c) => (
-                    <div key={`c${c.id}`} className={`tb-card-row sub${c === cardCur ? ' cur' : ''}`} data-ev={evType(c)} onClick={() => goRow(c)}>
+                    <div {...rowKey()} key={`c${c.id}`} className={`tb-card-row sub${c === cardCur ? ' cur' : ''}`} data-ev={evType(c)} onClick={() => goRow(c)}>
                       <b className="tb-ev">{evLabel(c)}</b>
                       <span className="tb-card-x2">{eraText(evText(c), era)}</span>
                     </div>

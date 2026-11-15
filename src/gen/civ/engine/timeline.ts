@@ -41,7 +41,11 @@ export const ownersAt: OwnersAt = (civ: Civ, year: Year, out?: Owners): Owners =
   const cp = lo > 0 ? cps[lo - 1] : null;
   let from = 0;
   if (cp) {
-    // 地形大事以前那一段的州比检查点少(大事里新划出的州排在后面,那时还不存在):只取前面这些
+    // 地形大事以前那一段的州比检查点少(大事里新划出的州排在后面,那时还不存在):只取前面这些。
+    // 检查点没盖到的尾部州先清成无主(-1),和 ownersFromScratch 逐位一致:否则新建 out 的全 0、
+    // 或复用 out 时上一次查询留下的旧值,会被当成"这一州有主/有文化",尾部归属就错了
+    out.culture.fill(-1);
+    out.polity.fill(-1);
     out.culture.set(cp.culture.length > R ? cp.culture.subarray(0, R) : cp.culture);
     out.polity.set(cp.polity.length > R ? cp.polity.subarray(0, R) : cp.polity);
     from = logIndexAfter(civ.log, cp.year);

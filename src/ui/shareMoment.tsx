@@ -175,8 +175,20 @@ export function shareCopiedToast(r: ShareCopy, at: MomentNow | null): void {
 }
 
 /**
+ * 复制没成时统一的说法:提示条上一个「复制」按钮再试一次,还不行就请到「存档」里手动复制 / 存成文件。
+ * 国家卡片、快捷键 5 都走这一套(存档菜单还多给一个能选中链接的输入框),不各写各的出错文案。
+ */
+function retryLinkToast(r: ShareCopy, at: MomentNow | null): void {
+  const again = () =>
+    void copyText(r.url).then((ok) =>
+      ok ? shareCopiedToast({ ...r, copied: true }, at) : notify({ kind: 'error', text: '这个浏览器不让网页复制', more: ['请到「存档」里手动复制配方链接，或者存成文件发给对方'] }),
+    );
+  notify({ kind: 'warn', text: '配方链接做好了，还没复制', more: ['点「复制」再试一次，或到「存档」里手动复制'], action: { label: '复制', act: 'share-copy-again', onClick: again } });
+}
+
+/**
  * 国家卡片「更多」里的「复制配方链接」:总是带上这一刻(选中的就是这个国家)。
- * 剪贴板用不了(做链接时等久了,有的浏览器就不让复制了):提示条上一个「复制」按钮,点一下再复制一次
+ * 剪贴板用不了(做链接时等久了,有的浏览器就不让复制了):和别的入口一样给一个能再试一次的提示。
  */
 export async function copyMomentLink(): Promise<void> {
   const plain = currentSave();
@@ -189,9 +201,12 @@ export async function copyMomentLink(): Promise<void> {
   const r = await copyShareLink(at?.moment ?? null);
   if (!r) return;
   if (r.copied) return shareCopiedToast(r, at);
-  const again = () =>
-    void copyText(r.url).then((ok) =>
-      ok ? shareCopiedToast({ ...r, copied: true }, at) : notify({ kind: 'error', text: '这个浏览器不让网页复制', more: ['请到「存档」里复制配方链接，或者存成文件发给对方'] }),
-    );
-  notify({ kind: 'warn', text: '配方链接做好了，还没复制', more: ['点「复制」再试一次'], action: { label: '复制', act: 'share-copy-again', onClick: again } });
+  retryLinkToast(r, at);
 }
+
+/**
+ * 快捷键 5 / 别的统一入口:复制当前世界的配方链接。
+ * 和国家卡片「复制配方链接」完全同一套(先看地图带不带得进、再 copyShareLink 生成复制、
+ * shareCopiedToast 报成功、retryLinkToast 管失败),不另写一份生成和出错的说法。
+ */
+export const copyCurrentLink = copyMomentLink;

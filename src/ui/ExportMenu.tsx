@@ -77,6 +77,8 @@ interface Status {
   more?: string;
   /** 高度图的 .txt 说明:导出后点一下再下载(一次点击连下两个文件,浏览器会拦) */
   note?: { name: string; text: string };
+  /** 出错时:提示条上的「重试」再导一次这一趟 */
+  retry?: () => void;
 }
 
 /** 调试 / 冒烟测试用:最近一次导出的结果 */
@@ -120,6 +122,8 @@ function paramsText(p: WorldParams, endYear?: number, civSeed?: number): string 
 }
 
 function download(blob: Blob, name: string) {
+  if (cancelled) return;
+  lastResult = { blob, name };
   const url = URL.createObjectURL(blob);
   const a = Object.assign(document.createElement('a'), { href: url, download: name });
   document.body.appendChild(a);
@@ -132,10 +136,12 @@ function download(blob: Blob, name: string) {
 function runWorker(req: ExportRequest): Promise<ExportResponse> {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('../exportWorker.ts', import.meta.url), { type: 'module' });
+    activeWorker = w;
     const idle = diagDoing('导出图片');
     const done = () => {
       idle();
       w.terminate();
+      if (activeWorker === w) activeWorker = null;
     };
     w.onmessage = (e: MessageEvent<ExportResponse>) => {
       done();
@@ -168,21 +174,45 @@ function toBlob(cv: HTMLCanvasElement, format: ImageFormat = 'png'): Promise<Blo
 let status: Status | null = null;
 const statusSubs = new Set<() => void>();
 let okTimer: ReturnType<typeof setTimeout> | undefined;
+/** 这一趟被取消了:迟到的成功 / 失败提示都别再弹,文件也别下 */
+let cancelled = false;
+/** 这趟开的后台线程(取消时直接关掉) */
+let activeWorker: Worker | null = null;
+/** 最近一次导出的文件:提示条上的「再次下载」用 */
+let lastResult: { blob: Blob; name: string } | null = null;
+
+/** 「取消」:关掉线程、收起提示,这一趟的结果就不算了 */
+function cancelExport() {
+  cancelled = true;
+  activeWorker?.terminate();
+  activeWorker = null;
+  setStatus(null);
+}
 
 function setStatus(next: Status | null) {
+  // 取消以后这一趟迟到的结果(成功 / 失败)都别再弹,也别盖住收起后的提示条
+  if (cancelled && next) return;
   status = next;
   clearTimeout(okTimer);
   // 成功的提示过一会儿自己消失(带"下载说明"的留着,等用户点)
   if (next?.kind === 'ok' && !next.note) okTimer = setTimeout(() => setStatus(null), 7000);
   if (!next) clearToast('export');
   else {
+    // 进度条给「取消」、出错给「重试」、做完给「再次下载」;高度图还有「下载说明」
+    const acts: { label: string; act?: string; onClick: () => void }[] = [];
+    if (next.kind === 'busy') acts.push({ label: '取消', act: 'export-cancel', onClick: cancelExport });
+    else if (next.kind === 'error' && next.retry) acts.push({ label: '重试', act: 'export-retry', onClick: next.retry });
+    else if (next.kind === 'ok' && lastResult) {
+      acts.push({ label: '再次下载', act: 'export-again', onClick: () => lastResult && download(lastResult.blob, lastResult.name) });
+    }
     const note = next.note;
+    if (note) acts.push({ label: '下载说明', act: 'export-note', onClick: () => download(new Blob([note.text], { type: 'text/plain;charset=utf-8' }), note.name) });
     showToast({
       id: 'export',
       kind: next.kind === 'busy' ? 'progress' : next.kind,
       text: next.text,
       more: next.more ? [next.more] : undefined,
-      action: note ? { label: '下载说明', onClick: () => download(new Blob([note.text], { type: 'text/plain;charset=utf-8' }), note.name) } : undefined,
+      actions: acts.length ? acts : undefined,
       ttl: next.kind === 'ok' && !note ? 7000 : 0,
       dismissible: next.kind !== 'busy',
     });
@@ -390,6 +420,8 @@ export function ExportMenu({ data, civ: shown, plain, style, layer, look = 'clas
 
   const run = async (job: Job) => {
     if (!data || status?.kind === 'busy') return;
+    // 新的一趟:之前的「取消」作废,结果照常报
+    cancelled = false;
     setOpen(false);
     const { world, raster } = data;
     const seedN = world.params.seed;
@@ -513,8 +545,9 @@ export function ExportMenu({ data, civ: shown, plain, style, layer, look = 'clas
       }
       (window as unknown as { __wfExport?: ExportDebug }).__wfExport = dbg;
     } catch (e) {
+      if (cancelled) return;
       console.error('导出失败', e);
-      setStatus({ kind: 'error', text: '导出失败', more: explain(e, scale) });
+      setStatus({ kind: 'error', text: '导出失败', more: explain(e, scale), retry: () => void run(job) });
     }
   };
 

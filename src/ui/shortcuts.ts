@@ -4,7 +4,8 @@
  *   空格        播放 / 暂停历史
  *   ← →         往前 / 往后 10 年,按住 Shift 100 年
  *   + −         放大 / 缩小地图(和右下的 + − 一样)
- *   1 2 3 4 5   右上图层按钮的第 1–5 个:政区 / 民族 / 信仰 / 地形 / 实景(新建世界时:地形 / 实景 / 高程)
+ *   1 2 3 4     填色:国家 / 民族 / 信仰 / 不填(新建世界时 1–3:地形 / 实景 / 高程)
+ *   5           复制这个世界的配方链接(和存档菜单、国家卡片同一套,见 shareMoment.tsx 的 copyCurrentLink)
  *   /           光标跳进搜索框
  *   ⌘Z / ⇧⌘Z    撤销 / 重做最近一次修改(Windows 上是 Ctrl + Z / Ctrl + Shift + Z,Ctrl + Y 也是重做)
  *   ⌘S          打开「存档」菜单(世界本来就自动存着;不弹浏览器自己的"存储网页")
@@ -195,6 +196,7 @@ export const SHORTCUT_GROUPS: readonly { title: string; rows: readonly { text: s
     title: '世界',
     rows: [
       { text: '搜索', keys: ['search'] },
+      { text: '复制这个世界的配方链接', keys: ['layer5'] },
       { text: '撤销 / 重做', keys: ['undo', 'redo'] },
       { text: '存档', keys: ['save'] },
       { text: '快捷键一览', keys: ['help'] },

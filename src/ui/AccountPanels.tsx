@@ -95,35 +95,54 @@ function AccountDialog({ phone, to, onClose }: { phone: boolean; to?: 'submissio
   const aiOn = useAiOn();
   useSavesVersion();
   const [trashList, setTrashList] = useState<TrashEntry[] | null>(null);
+  /** null = 还在读;[] = 读好了、一个都没有 */
   const [shares, setShares] = useState<ShareInfo[] | null>(null);
   const [stopped, setStopped] = useState<StoppedShare[]>([]);
+  /** 分享列表没读到(断网、服务器出错):给一条能重试的行,不假装是空的 */
+  const [shareErr, setShareErr] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
-  /** 暂停中的那一行点了「停止分享」:在这一行里确认 */
-  const [asking, setAsking] = useState<string | null>(null);
+  /** 正在确认「停止分享」的那一行:哪一条、这次失败的原因(失败时留在确认里给「重试」) */
+  const [asking, setAsking] = useState<{ code: string; failed?: string } | null>(null);
+  /** 正在停分享:确认里的按钮先置灰,免得连点两次 */
+  const [stopping, setStopping] = useState(false);
   const [err, setErr] = useState('');
   const phoneOn = usePhoneRequired();
   const bound = usePhone();
   const ban = useSubmitBan();
-  const refreshShares = () =>
+  /** 读分享列表(三态:null 正在读 / 读好了的内容 / 没读到 shareErr) */
+  const loadShares = (live: () => boolean = () => true) =>
     listAllShares().then(
       (r) => {
+        if (!live()) return;
         setShares(r.shares);
         setStopped(r.stopped);
+        setShareErr(false);
       },
-      () => setShares((l) => l ?? []),
+      () => {
+        if (!live()) return;
+        setShares([]);
+        setShareErr(true);
+      },
     );
+  const refreshShares = () => void loadShares();
+  /** 停这一条:成功就从列表里去掉;没成留着确认,把原因写在行里、按钮换成「重试」 */
+  const stopOne = (sh: ShareInfo) => {
+    if (stopping) return;
+    setStopping(true);
+    void stopShare(sh.worldId)
+      .then(() => {
+        setShares((l) => (l ?? []).filter((x) => x.code !== sh.code));
+        setAsking(null);
+      })
+      .catch((e) => setAsking({ code: sh.code, failed: errText(e) }))
+      .finally(() => setStopping(false));
+  };
   useEffect(() => {
     let live = true;
     void listTrash()
       .then((t) => live && setTrashList(t))
       .catch(() => {});
-    void listAllShares()
-      .then((r) => {
-        if (!live) return;
-        setShares(r.shares);
-        setStopped(r.stopped);
-      })
-      .catch(() => live && setShares([]));
+    void loadShares(() => live);
     void refreshMe().catch(() => {});
     void refreshOfficialAccount();
     return () => {
@@ -201,103 +220,112 @@ function AccountDialog({ phone, to, onClose }: { phone: boolean; to?: 'submissio
             }}
           />
         )}
-        {(!!shares?.length || !!stopped.length) && (
-          <>
-            <div className="acct-gh">
-              分享出去的世界<small>拿到链接的人能看，不能改</small>
-            </div>
-            <div className="acct-grp" data-testid="share-list">
-              {stopped.map((sh) => (
-                <div className="acct-gr" key={sh.code} data-code={sh.code}>
+        <>
+          <div className="acct-gh">
+            分享出去的世界<small>拿到链接的人能看，不能改</small>
+          </div>
+          <div className="acct-grp" data-testid="share-list">
+            {shares === null && (
+              <div className="acct-gr">
+                <span className="main">
+                  <b>正在读分享列表…</b>
+                </span>
+              </div>
+            )}
+            {shareErr && (
+              <div className="acct-gr">
+                <span className="main">
+                  <b>没读到分享列表</b>
+                  <small>联网以后再试</small>
+                </span>
+                <button className="mini" data-act="share-list-retry" onClick={() => void loadShares()}>
+                  重试
+                </button>
+              </div>
+            )}
+            {shares !== null && !shareErr && !shares.length && !stopped.length && (
+              <div className="acct-gr">
+                <span className="main">
+                  <b>还没分享过世界</b>
+                  <small>在世界的「存档」里点「分享…」就有了</small>
+                </span>
+              </div>
+            )}
+            {stopped.map((sh) => (
+              <div className="acct-gr" key={sh.code} data-code={sh.code}>
+                <ShareThumb worldId={sh.worldId} />
+                <span className="main">
+                  <b>{sh.title || '未命名世界'}</b>
+                  <small className="err" style={{ whiteSpace: 'normal' }}>
+                    停掉了：{sh.reason}
+                  </small>
+                </span>
+                <button
+                  className="mini"
+                  data-act="share-stopped-seen"
+                  onClick={() =>
+                    void seenStoppedShare(sh.code)
+                      .then(() => setStopped((l) => l.filter((x) => x.code !== sh.code)))
+                      .catch((e) => setErr(errText(e)))
+                  }
+                >
+                  知道了
+                </button>
+              </div>
+            ))}
+            {(shares ?? []).map((sh) => {
+              const ask = asking?.code === sh.code;
+              const fail = asking?.failed;
+              const confirm = sh.paused ? '停掉这个链接？停掉以后，要等我们看过，这个世界才能再开新链接。' : '停掉这个链接？发出去的链接马上打不开了。';
+              const msg = ask
+                ? fail
+                  ? `没停成：${fail}`
+                  : stopping
+                    ? '正在停…'
+                    : confirm
+                : sh.paused
+                  ? pausedLine(sh.paused.by)
+                  : `${day(sh.createdAt)}开始分享，打开过 ${sh.opens} 次`;
+              return (
+                <div className={`acct-gr${ask ? ' sub-ask' : ''}`} key={sh.code} data-code={sh.code}>
                   <ShareThumb worldId={sh.worldId} />
                   <span className="main">
                     <b>{sh.title || '未命名世界'}</b>
-                    <small className="err" style={{ whiteSpace: 'normal' }}>
-                      停掉了：{sh.reason}
+                    <small className={ask ? (fail ? 'err' : undefined) : sh.paused ? 'warn' : undefined} style={{ whiteSpace: 'normal' }}>
+                      {msg}
                     </small>
                   </span>
-                  <button
-                    className="mini"
-                    data-act="share-stopped-seen"
-                    onClick={() =>
-                      void seenStoppedShare(sh.code)
-                        .then(() => setStopped((l) => l.filter((x) => x.code !== sh.code)))
-                        .catch((e) => setErr(errText(e)))
-                    }
-                  >
-                    知道了
-                  </button>
-                </div>
-              ))}
-              {(shares ?? []).map((sh) => {
-                if (sh.paused)
-                  return (
-                    <div className={`acct-gr${asking === sh.code ? ' sub-ask' : ''}`} key={sh.code} data-code={sh.code}>
-                      <ShareThumb worldId={sh.worldId} />
-                      <span className="main">
-                        <b>{sh.title || '未命名世界'}</b>
-                        <small className={asking === sh.code ? undefined : 'warn'} style={{ whiteSpace: 'normal' }}>
-                          {asking === sh.code ? '停掉这个链接？停掉以后，要等我们看过，这个世界才能再开新链接。' : pausedLine(sh.paused.by)}
-                        </small>
-                      </span>
-                      {asking === sh.code ? (
-                        <span className="sub-acts">
-                          <button className="mini" data-act="share-stop-keep" onClick={() => setAsking(null)}>
-                            取消
-                          </button>
-                          <button
-                            className="mini red"
-                            data-act="share-stop-yes"
-                            onClick={() =>
-                              void stopShare(sh.worldId)
-                                .then(() => setShares((l) => (l ?? []).filter((x) => x.code !== sh.code)))
-                                .catch((e) => setErr(errText(e)))
-                                .finally(() => setAsking(null))
-                            }
-                          >
-                            停止分享
-                          </button>
-                        </span>
-                      ) : (
-                        <button className="mini red" data-act="share-stop" onClick={() => setAsking(sh.code)}>
-                          停止分享
+                  {ask ? (
+                    <span className="sub-acts">
+                      <button className="mini" data-act="share-stop-keep" disabled={stopping} onClick={() => setAsking(null)}>
+                        取消
+                      </button>
+                      <button className="mini red" data-act="share-stop-yes" disabled={stopping} onClick={() => stopOne(sh)}>
+                        {stopping ? '正在停…' : fail ? '重试' : '停止分享'}
+                      </button>
+                    </span>
+                  ) : (
+                    <>
+                      {!sh.paused && (
+                        <button
+                          className="mini"
+                          onClick={() =>
+                            void copyText(shortLink(sh.code)).then((ok) => (ok ? setCopied(sh.code) : setErr(`没能自动复制，请手动复制：${shortLink(sh.code)}`)))
+                          }
+                        >
+                          {copied === sh.code ? '已复制' : '复制链接'}
                         </button>
                       )}
-                    </div>
-                  );
-                return (
-                  <div className="acct-gr" key={sh.code} data-code={sh.code}>
-                    <ShareThumb worldId={sh.worldId} />
-                    <span className="main">
-                      <b>{sh.title || '未命名世界'}</b>
-                      <small>
-                        {day(sh.createdAt)}开始分享，打开过 {sh.opens} 次
-                      </small>
-                    </span>
-                    <button
-                      className="mini"
-                      onClick={() =>
-                        void copyText(shortLink(sh.code)).then((ok) => (ok ? setCopied(sh.code) : setErr(`没能自动复制，请手动复制：${shortLink(sh.code)}`)))
-                      }
-                    >
-                      {copied === sh.code ? '已复制' : '复制链接'}
-                    </button>
-                    <button
-                      className="mini red"
-                      onClick={() =>
-                        void stopShare(sh.worldId)
-                          .then(() => setShares((l) => (l ?? []).filter((x) => x.code !== sh.code)))
-                          .catch((e) => setErr(errText(e)))
-                      }
-                    >
-                      停止分享
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
+                      <button className="mini red" data-act="share-stop" onClick={() => setAsking({ code: sh.code })}>
+                        停止分享
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
         {err && <p className="acct-err">{err}</p>}
       </div>
       <div className="acct-foot">
@@ -397,12 +425,14 @@ function FullRow({ id, info, job, note, shared, onRemoved }: { id: string; info:
       ? `正在从账号取，${pulling.total ? pairText(pulling.done, pulling.total) : ''}`
       : taking
         ? '正在从账号取'
-        : asking
-          ? asking
-          : note
-            ? [note.text, note.more].filter(Boolean).join('。')
-            : err
-              ? err
+        : err
+          ? err
+          : asking
+            ? busy
+              ? '正在删…'
+              : asking
+            : note
+              ? [note.text, note.more].filter(Boolean).join('。')
               : !here
                 ? `${uploaded}，这台设备上没有`
                 : status?.kind === 'changed'
@@ -417,13 +447,18 @@ function FullRow({ id, info, job, note, shared, onRemoved }: { id: string; info:
   };
   const doRemove = () => {
     setBusy(true);
+    setErr('');
     void flow()
       .then((m) => m.removeFromAccount(id))
-      .then(onRemoved, (e: unknown) => setErr(errText(e)))
-      .finally(() => {
-        setBusy(false);
-        setAsking(null);
-      });
+      .then(
+        () => {
+          setAsking(null);
+          onRemoved();
+        },
+        // 没删成:留在确认里,原因写在 small 里、按钮换成「重试」
+        (e: unknown) => setErr(errText(e)),
+      )
+      .finally(() => setBusy(false));
   };
   const take = () => {
     setErr('');
@@ -457,11 +492,11 @@ function FullRow({ id, info, job, note, shared, onRemoved }: { id: string; info:
         )
       ) : pulling || taking ? null : asking ? (
         <>
-          <button className="mini" data-act="full-row-keep" disabled={busy} onClick={() => setAsking(null)}>
+          <button className="mini" data-act="full-row-keep" disabled={busy} onClick={() => { setAsking(null); setErr(''); }}>
             取消
           </button>
           <button className="mini red" data-act="full-row-remove-yes" disabled={busy} onClick={doRemove}>
-            删掉
+            {busy ? '正在删…' : err ? '重试' : '删掉'}
           </button>
         </>
       ) : (

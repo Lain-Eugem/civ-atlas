@@ -8,10 +8,11 @@
  *   - 在首页右下角挂一个「多 Agent 沙盒」小胶囊,点进去就是监视台。
  */
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import type { Plugin } from 'vite';
 
 const SANDBOX_PATH = '/sandbox/';
@@ -30,23 +31,45 @@ function freePort(): Promise<number> {
   });
 }
 
-/** 产物比源码旧(或新增的服务端模块还没编出来)就要重新构建一次 */
-function needsBuild(mcpDir: string, viewerJs: string): boolean {
+/**
+ * 递归算一份源码内容指纹。tsconfig.build.json 的输入是 mcp 与 src 两棵树下的 .ts/.tsx
+ * (rootDir 是仓库根,src 下的引擎/渲染模块也在编译输入里)。之前的写法只扫 mcp 顶层的 .ts、
+ * 还拿 mtime 和产物比,会漏掉:改了 src/gen、src/render 的模块不触发重建(查看器一直用旧代码)、
+ * 子目录里新增的 .ts、以及 git checkout / 复制文件改了内容但 mtime 没变的情况。
+ * 用内容 hash 递归扫这两棵树就都骗不过去;mcp/viewer 下的静态 .js 是直出、不算编译输入,不扫。
+ */
+function sourceFingerprint(root: string): string {
+  const h = createHash('sha1');
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(ts|tsx)$/.test(e.name)) {
+        h.update(relative(root, p).replace(/\\/g, '/'));
+        h.update(readFileSync(p));
+        h.update('\0');
+      }
+    }
+  };
+  for (const dir of [join(root, 'mcp'), join(root, 'src')]) if (existsSync(dir)) walk(dir);
+  return h.digest('hex');
+}
+
+/** 产物缺了、或源码指纹和上次构建时对不上(含老构建没记过指纹),就重新构建一次 */
+function needsBuild(root: string, mcpDir: string, viewerJs: string): boolean {
   if (!existsSync(viewerJs)) return true;
   if (!existsSync(join(mcpDir, '.build', 'mcp', 'terrain.js'))) return true;
-  const built = statSync(viewerJs).mtimeMs;
-  for (const name of readdirSync(mcpDir)) {
-    if (!name.endsWith('.ts')) continue;
-    if (statSync(join(mcpDir, name)).mtimeMs > built + 1000) return true;
-  }
-  return false;
+  const stamp = join(mcpDir, '.build', 'source.fingerprint');
+  if (!existsSync(stamp)) return true;
+  return readFileSync(stamp, 'utf8').trim() !== sourceFingerprint(root);
 }
 
 /** mcp/.build 缺了或旧了就先构建一次(和 mcp/build.ps1 等价,不依赖 PowerShell) */
 function ensureViewerBuild(root: string): string {
   const mcpDir = join(root, 'mcp');
   const viewerJs = join(mcpDir, '.build', 'mcp', 'viewer.js');
-  if (needsBuild(mcpDir, viewerJs)) {
+  if (needsBuild(root, mcpDir, viewerJs)) {
     const tsc = join(root, 'node_modules', 'typescript', 'bin', 'tsc');
     if (!existsSync(tsc)) throw new Error('没找到 typescript:先在仓库根目录跑 pnpm install');
     console.log('\n[沙盒] 第一次打开监视台,先构建 MCP 层(等价于 mcp/build.ps1)…');
@@ -65,6 +88,8 @@ function ensureViewerBuild(root: string): string {
     }
     writeFileSync(join(mcpDir, '.build', 'package.json'), '{"type":"commonjs"}');
     if (!existsSync(viewerJs)) throw new Error('构建完了但没有 mcp/.build/mcp/viewer.js,看上面的 tsc 报错');
+    // 记下这次构建对应的源码指纹:下次启动比一比就知道源码有没有动过。
+    writeFileSync(join(mcpDir, '.build', 'source.fingerprint'), sourceFingerprint(root));
   }
   // 每次启动都跑一遍(幂等、毫秒级):老构建里主站渲染模块的 import.meta.env 也要补上,
   // 否则 Node 加载 render/fantasy.ts 时会直接语法错误。细节见 mcp/build-compat.cjs
@@ -114,13 +139,22 @@ a{color:#007aff;text-decoration:none}
 
 /** 把请求转给监视台进程 */
 function forward(port: number, req: IncomingMessage, res: ServerResponse, path: string, isApi: boolean): void {
+  // 这是 dev server 替浏览器转发的服务端请求,不该再把浏览器的跨源标记带给上游:
+  // Host 已被改写成 127.0.0.1:<port>,若仍带着 5188 的 Origin,监视台的本机来源校验会判成
+  // 「Origin 与 Host 不匹配」,把 POST /api/world 等所有写操作挡成 403。
+  const headers = { ...req.headers, host: `127.0.0.1:${port}` };
+  if (headers.origin) headers.origin = `http://127.0.0.1:${port}`;
+  delete headers['sec-fetch-site'];
+  delete headers['sec-fetch-mode'];
+  delete headers['sec-fetch-dest'];
+  delete headers.referer;
   const upstream = httpRequest(
     {
       host: '127.0.0.1',
       port,
       path,
       method: req.method,
-      headers: { ...req.headers, host: `127.0.0.1:${port}` },
+      headers,
     },
     (upRes) => {
       if (res.headersSent) return;
@@ -128,7 +162,18 @@ function forward(port: number, req: IncomingMessage, res: ServerResponse, path: 
       upRes.pipe(res);
     },
   );
-  upstream.setTimeout(180_000, () => upstream.destroy(new Error('监视台响应超时')));
+  upstream.setTimeout(180_000, () => {
+    upstream.destroy();
+    // 超时要自己把响应收掉:destroy() 不带 error 不会走下面的 error 分支,
+    // 光断上游会让浏览器一直挂着等。
+    if (!res.writableEnded) {
+      if (isApi) sendJson(res, 504, { error: '沙盒监视台响应超时' });
+      else if (!res.headersSent) {
+        res.writeHead(504, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(page('沙盒监视台响应超时', '这次请求等太久被断开了,可以直接刷新重试。'));
+      } else res.end();
+    }
+  });
   upstream.on('error', () => {
     if (isApi) sendJson(res, 502, { error: '沙盒监视台还没就绪,稍等几秒再试' });
     else if (!res.headersSent) {
@@ -161,32 +206,45 @@ export function sandboxViewerPlugin(): Plugin {
   async function start(): Promise<void> {
     const viewerJs = ensureViewerBuild(root);
     port = await freePort();
-    child = spawn(process.execPath, [viewerJs, '--port', String(port)], {
-      cwd: root,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    });
-    child.stdout?.on('data', (d: Buffer) => process.stdout.write(`[沙盒] ${d.toString()}`));
-    child.stderr?.on('data', (d: Buffer) => process.stderr.write(`[沙盒] ${d.toString()}`));
-    child.on('exit', (code) => {
-      child = null;
-      if (stopping) return;
-      // 下次再打开 /sandbox/ 时重新起一个,而不是一直转给一个已经没有的端口
-      ready = null;
-      console.log(`\n[沙盒] 监视台进程已退出(code ${code ?? '?'});再打开 /sandbox/ 会重新起一个。`);
-    });
+    try {
+      child = spawn(process.execPath, [viewerJs, '--port', String(port)], {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+      });
+      child.stdout?.on('data', (d: Buffer) => process.stdout.write(`[沙盒] ${d.toString()}`));
+      child.stderr?.on('data', (d: Buffer) => process.stderr.write(`[沙盒] ${d.toString()}`));
+      child.on('exit', (code) => {
+        const mine = child;
+        child = null;
+        // 主动清理(下面的 catch)是先把 child 置 null 再 kill,这时 mine 为 null:安静退出,
+        // 不打印「已退出、再打开会重起」这种启动失败场景下的误导日志。
+        if (stopping || mine === null) return;
+        // 下次再打开 /sandbox/ 时重新起一个,而不是一直转给一个已经没有的端口
+        ready = null;
+        console.log(`\n[沙盒] 监视台进程已退出(code ${code ?? '?'});再打开 /sandbox/ 会重新起一个。`);
+      });
 
-    const t0 = Date.now();
-    while (Date.now() - t0 < READY_TIMEOUT) {
-      if (await ping(port)) {
-        const sitePort = process.env.CIV_DEV_PORT || '5188';
-        console.log(`[沙盒] 监视台已就绪 → http://127.0.0.1:${sitePort}${SANDBOX_PATH}  (内部端口 ${port})`);
-        return;
+      const t0 = Date.now();
+      while (Date.now() - t0 < READY_TIMEOUT) {
+        if (await ping(port)) {
+          const sitePort = process.env.CIV_DEV_PORT || '5188';
+          console.log(`[沙盒] 监视台已就绪 → http://127.0.0.1:${sitePort}${SANDBOX_PATH}  (内部端口 ${port})`);
+          return;
+        }
+        if (!child) throw new Error('监视台进程启动后立刻退出了,看上面的 [沙盒] 日志');
+        await new Promise((r) => setTimeout(r, 160));
       }
-      if (!child) throw new Error('监视台进程启动后立刻退出了,看上面的 [沙盒] 日志');
-      await new Promise((r) => setTimeout(r, 160));
+      throw new Error('监视台 25 秒内没有就绪');
+    } catch (e) {
+      // 启动失败或等就绪超时:把刚起的进程收掉。否则它会一直占着内部端口,
+      // 下次打开 /sandbox/ 又起一个,孤儿越积越多(Windows 上尤其明显)。
+      const orphan = child;
+      child = null;
+      port = 0;
+      orphan?.kill();
+      throw e;
     }
-    throw new Error('监视台 25 秒内没有就绪');
   }
 
   function ensure(): Promise<void> {

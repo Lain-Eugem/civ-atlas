@@ -204,7 +204,9 @@ export class ShardSequencer implements TestSequencer {
   }
 
   shard(files: WorkspaceSpec[]): WorkspaceSpec[] {
-    const { index, count } = this.ctx.config.shard!;
+    // 不分片跑时 vitest 的 resolved.shard 是 undefined(只有传 --shard 才赋值),
+    // 给个 1/1 兜底:既不会解构 undefined 抛错,也保证全部文件仍归这一份。
+    const { index, count } = this.ctx.config.shard ?? { index: 1, count: 1 };
     const load = new Array<number>(count).fill(0);
     const mine: WorkspaceSpec[] = [];
     for (const spec of this.slowFirst(files)) {

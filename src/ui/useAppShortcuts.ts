@@ -22,6 +22,7 @@ import { FILL_KEYS, type BaseId, type FillId, type MapLayer, type SatLook } from
 import { undoTerrainOp } from './editsStore';
 import { redoLastEdit, undoLastEdit } from './undo';
 import { openSaveMenu } from './SaveMenu';
+import { copyCurrentLink } from './shareMoment';
 import { collapseSide, expandSide, getSide } from './sideStore';
 import { openShortcuts } from './ShortcutsDialog';
 import { getTerrainTool } from './TerrainTools';
@@ -96,8 +97,7 @@ export function useAppShortcuts({ home, draft, stage, data, civ, replayOn, narro
       case 'layer1':
       case 'layer2':
       case 'layer3':
-      case 'layer4':
-      case 'layer5': {
+      case 'layer4': {
         const i = Number(a.slice(5)) - 1;
         if (draft) {
           const id = DRAFT_SEG[i];
@@ -111,6 +111,11 @@ export function useAppShortcuts({ home, draft, stage, data, civ, replayOn, narro
         applyMapView({ fill: f });
         return true;
       }
+      case 'layer5':
+        // 5:复制这个世界的配方链接(以前当"第 5 个图层",可填色只有 4 档、新建只有 3 档,按 5 什么都没做)
+        if (draft) return false;
+        void copyCurrentLink();
+        return true;
       case 'search': {
         showSide();
         const box = [...document.querySelectorAll<HTMLInputElement>('input.search-input')].find(

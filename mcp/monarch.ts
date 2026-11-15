@@ -32,8 +32,8 @@ import {
   civHash,
   nationControlOf,
   sizesNow,
-  submitOrders,
   turnStep,
+  withSessionLock,
   worldIdOf,
   type MonarchActionLog,
   type MonarchHeir,
@@ -137,7 +137,9 @@ export function setupMonarch(s: Session, input: MonarchSetupInput): MonarchSetup
     mock: !!input.mock,
     provider,
   };
-  s.monarch = { config: config as unknown as Record<string, unknown>, rounds: [] };
+  // 保留已有历史(rounds / byPolity / lifespan):重复配置只覆盖 config,不清空这一局已跑过的记录
+  const prev = s.monarch;
+  s.monarch = { ...(prev ?? {}), config: config as unknown as Record<string, unknown>, rounds: prev?.rounds ?? [] };
   s.mode = 'monarch';
   // 配了君主 = 打开「LLM 扮演」这一开关(老调用方常常先开 auto 会话再配君主,不能因此被挡住)
   s.features.llm = true;
@@ -171,6 +173,7 @@ export function monarchStatus(s: Session): Record<string, unknown> | null {
     features: { ...s.features },
     review: s.review,
     pendingPlan: !!s.pendingPlan,
+    pendingPlanId: (s.pendingPlan as MonarchPlan | undefined)?.planId ?? null,
     lifespan: s.monarch.lifespan ?? CARD_LIFESPAN_DEFAULT,
     configured: {
       polities: cfg.polities,
@@ -347,11 +350,19 @@ export interface MonarchRoundResult {
   /** 本回合的审核与渗透汇总 */
   audits?: AuditVerdict[];
   intel?: { source: 'jev' | 'rule'; resolutions: IntelResolution[]; error?: string };
+  /** 回合日志写入失败(引擎侧 / 本地两处)合并后的降级告警,不中断回合 */
+  logError?: string;
 }
 
 /** 一回合的方案(尚未推演):复核模式下先给人看,再由 monarchCommit 落地 */
 export interface MonarchPlan {
   sessionId: string;
+  /** 草稿 id:复核回传校验用,会话内唯一 */
+  planId: string;
+  /** 出草稿时的会话版本:提交时校验,防止状态被改动后提交过期草稿 */
+  baseRound: number;
+  baseYear: number;
+  fingerprint: string;
   round: number;
   fromYear: number;
   years: number;
@@ -385,6 +396,36 @@ export interface MonarchPlan {
   monarchEvents: { polityId: number; kind: string; text: string }[];
   createdAt: number;
 }
+
+/** 提交方案时的复核选项 */
+export interface MonarchCommitOptions {
+  /** 要否决的命令引用(必须命中 plan.commandRefs,否则报错) */
+  reject?: readonly { polityId: number; index: number }[];
+  /** 复核方回传的草稿 id,与当前待提交草稿不一致则拒绝 */
+  planId?: string;
+  /** 幂等键:相同会话 + 相同 key 的重复提交直接返回首次结果 */
+  idempotencyKey?: string;
+}
+
+/** 草稿序号(配合 sessionId + baseRound + 时间戳生成 planId,会话内唯一即可) */
+let planSeq = 0;
+
+/** 出草稿前的纯数据快照(不挂 plan 对象,只存 structuredClone 出来的深拷贝) */
+interface PlanSnapshot {
+  cards?: Session['cards'];
+  memory?: Session['memory'];
+  intel?: Session['intel'];
+  byPolity?: Record<string, MonarchPolityState>;
+  hadCards: boolean;
+  hadMemory: boolean;
+  hadIntel: boolean;
+  hadByPolity: boolean;
+  hadMonarch: boolean;
+}
+/** 按会话 id 存快照:同一会话同时只有一份草稿 */
+const planSnapshots = new Map<string, PlanSnapshot>();
+/** 同一会话相同 idempotencyKey 的重复提交直接返回首次结果,不重复推演 */
+const commitIdempotency = new Map<string, { key: string; result: MonarchRoundResult }>();
 
 /** 本局的 Jev 客户端:双开关里 Jev 关着 = null(审核/渗透都退化为确定性规则) */
 function jevFor(s: Session): JevSettings | null {
@@ -747,8 +788,8 @@ export interface MonarchDecisionInjection {
   commands?: unknown[];
 }
 
-/** 跑一个回合的方案:简报 → 并发 LLM/mock → 编译 → 渗透判定 → 高影响命令审核;不推演 */
-export async function monarchPlan(
+/** 生成一份草稿的实际实现(不写 s.pendingPlan,由外层 monarchPlan 统一做快照 / 回滚 / 落草稿) */
+async function buildPlan(
   s: Session,
   opts: { years?: number; decisions?: Record<number, MonarchDecisionInjection> } = {},
 ): Promise<MonarchPlan> {
@@ -964,8 +1005,14 @@ export async function monarchPlan(
   }
 
   const flat = flatten(decisions);
+  const createdAt = Date.now();
+  const planId = `mp-${s.id}-r${s.rounds}-${++planSeq}-${createdAt.toString(36)}`;
   const plan: MonarchPlan = {
     sessionId: s.id,
+    planId,
+    baseRound: s.rounds,
+    baseYear: year,
+    fingerprint: civHash(s.civ),
     round: s.rounds + 1,
     fromYear: year,
     years: planYears,
@@ -996,22 +1043,151 @@ export async function monarchPlan(
       }),
     },
     monarchEvents,
-    createdAt: Date.now(),
+    createdAt,
   };
-  s.pendingPlan = plan;
   return plan;
 }
 
-/** 提交一个已出的方案:可按 {polityId,index} 否决若干条(玩家 / DM 复核),再统一推演并写日志 */
-export async function monarchCommit(s: Session, opts: { reject?: readonly { polityId: number; index: number }[] } = {}): Promise<MonarchRoundResult> {
+/**
+ * 出一份复核草稿:先回滚上一份草稿的语义副作用(避免 AP / 后代累积),再基于干净状态生成;
+ * 生成失败也要清 pendingPlan 并回滚,不留半份状态。
+ */
+export async function monarchPlan(
+  s: Session,
+  opts: { years?: number; decisions?: Record<number, MonarchDecisionInjection> } = {},
+): Promise<MonarchPlan> {
+  cancelMonarchPlan(s);
+  snapshotForPlan(s);
+  try {
+    const plan = await buildPlan(s, opts);
+    s.pendingPlan = plan;
+    return plan;
+  } catch (e) {
+    restorePlanSnapshot(s);
+    s.pendingPlan = undefined;
+    throw e;
+  }
+}
+
+function snapshotForPlan(s: Session): void {
+  planSnapshots.set(s.id, {
+    cards: s.cards ? structuredClone(s.cards) : undefined,
+    memory: s.memory ? structuredClone(s.memory) : undefined,
+    intel: s.intel ? structuredClone(s.intel) : undefined,
+    byPolity: s.monarch?.byPolity ? structuredClone(s.monarch.byPolity) : undefined,
+    hadCards: !!s.cards,
+    hadMemory: !!s.memory,
+    hadIntel: !!s.intel,
+    hadByPolity: !!s.monarch?.byPolity,
+    hadMonarch: !!s.monarch,
+  });
+}
+
+/** 回滚到出草稿前的语义状态(卡片 / 记忆 / 情报 / AP / 后代 / 位置等),并丢掉快照 */
+function restorePlanSnapshot(s: Session): void {
+  const snap = planSnapshots.get(s.id);
+  if (!snap) return;
+  planSnapshots.delete(s.id);
+  if (snap.hadCards) s.cards = snap.cards;
+  else delete s.cards;
+  if (snap.hadMemory) s.memory = snap.memory;
+  else delete s.memory;
+  if (snap.hadIntel) s.intel = snap.intel;
+  else delete s.intel;
+  if (snap.hadMonarch) {
+    if (!s.monarch) s.monarch = { config: {}, rounds: [] };
+    if (snap.hadByPolity) s.monarch.byPolity = snap.byPolity;
+    else delete s.monarch.byPolity;
+  } else {
+    delete s.monarch;
+  }
+}
+
+/**
+ * 撤销(丢弃)当前待提交的复核草稿:清 pendingPlan 并回滚草稿生成期间的语义副作用,
+ * 不推演、不落库、不动年份/回合。viewer 的 /api/monarch/cancel 直接调用它;
+ * 返回是否真的撤销了一份草稿(plan 失败后没有草稿但快照仍会回滚,此时返回 false)。
+ */
+export function cancelMonarchPlan(s: Session): boolean {
+  const had = !!s.pendingPlan;
+  s.pendingPlan = undefined;
+  restorePlanSnapshot(s);
+  return had;
+}
+
+/**
+ * 提交一个已出的方案(复核模式):
+ *  - 校验回传 planId 与 baseRound/baseYear/fingerprint 版本,过期或不符则拒绝;
+ *  - reject 必须指向真实命令(合法性),算出 effectiveDecisions 并退还被否决命令的 AP;
+ *  - idempotencyKey 幂等;turnStep 一次性接 orders;日志写失败降级为告警不中断主流程。
+ * 整个提交在 engine 的会话级串行锁内执行,避免并发推演互相踩状态。
+ */
+export async function monarchCommit(s: Session, opts: MonarchCommitOptions = {}): Promise<MonarchRoundResult> {
+  const cached = opts.idempotencyKey ? commitIdempotency.get(s.id) : undefined;
+  if (cached && cached.key === opts.idempotencyKey) return cached.result;
+  return withSessionLock(s.id, () => commitImpl(s, opts));
+}
+
+async function commitImpl(s: Session, opts: MonarchCommitOptions): Promise<MonarchRoundResult> {
   const plan = s.pendingPlan as MonarchPlan | undefined;
   if (!plan) throw new Error('没有待提交的回合方案;先跑 civ_monarch_plan(或直接用 civ_monarch_round)');
-  const drop = new Set((opts.reject ?? []).map((r) => `${r.polityId}:${r.index}`));
+  // 草稿 id 校验:复核方回传的 planId 必须与当前待提交草稿一致(防止提交到被替换的草稿)
+  if (opts.planId !== undefined && opts.planId !== plan.planId) {
+    throw new Error(`复核回传的 planId(${opts.planId}) 与当前草稿(${plan.planId})不符;请重新 civ_monarch_plan`);
+  }
+  // 版本校验:出方案后会话状态(回合/年份/世界)不能被改动,否则草稿过期
+  const nowYear = Math.floor(s.play.year);
+  if (plan.baseRound !== s.rounds || plan.baseYear !== nowYear || plan.fingerprint !== civHash(s.civ)) {
+    throw new Error(`草稿 ${plan.planId} 已过期:出方案后会话状态发生变化(回合/年份/世界指纹),请重新 civ_monarch_plan 或 cancelMonarchPlan 撤销`);
+  }
+  // reject 合法性:每条否决引用必须能在 plan.commandRefs 里找到,否则报错(不静默忽略)
+  const validRefs = new Set<string>(plan.commandRefs.map((ref) => `${ref.polityId}:${ref.index}`));
+  const drop = new Set<string>();
+  for (const r of opts.reject ?? []) {
+    const key = `${r.polityId}:${r.index}`;
+    if (!validRefs.has(key)) throw new Error(`复核否决引用了不存在的命令 P${r.polityId}#${r.index};只能否决 plan.commandRefs 里列出的命令`);
+    drop.add(key);
+  }
   const kept = plan.commands.filter((_, i) => {
     const ref = plan.commandRefs[i]!;
     return !drop.has(`${ref.polityId}:${ref.index}`);
   });
   const dropped = plan.commandRefs.filter((ref) => drop.has(`${ref.polityId}:${ref.index}`));
+  // effectiveDecisions:把复核否决应用到决策(摘除被否命令、记 rejected),并退还该命令的 AP
+  const effectiveDecisions: MonarchDecisionRecord[] = plan.decisions.map((d) => ({ ...d, commands: [...d.commands], rejected: [...d.rejected] }));
+  const ap: MonarchPlan['ap'] = {
+    ...plan.ap,
+    byPolity: plan.ap.byPolity.map((p) => ({ ...p, log: [...p.log] })),
+  };
+  const droppedByPolity = new Map<number, Set<number>>();
+  for (const ref of dropped) {
+    const set = droppedByPolity.get(ref.polityId) ?? new Set<number>();
+    set.add(ref.index);
+    droppedByPolity.set(ref.polityId, set);
+  }
+  for (const [polityId, idxSet] of droppedByPolity) {
+    const d = effectiveDecisions.find((x) => x.polityId === polityId);
+    if (!d) continue;
+    const removed: { cmd: Intervention; index: number }[] = [];
+    d.commands.forEach((cmd, i) => { if (idxSet.has(i)) removed.push({ cmd, index: i }); });
+    let refund = 0;
+    for (const { cmd, index } of removed) {
+      refund += commandAp(s, cmd);
+      d.rejected.push({ order: { kind: String(cmd.kind), index }, reason: '玩家/DM 复核否决(该命令 AP 已退还)' });
+    }
+    d.commands = d.commands.filter((_, i) => !idxSet.has(i));
+    const apEntry = ap.byPolity.find((p) => p.polityId === polityId);
+    if (apEntry) {
+      apEntry.apSpent = Math.max(0, apEntry.apSpent - refund);
+      apEntry.remaining = Math.max(0, apEntry.apTotal - apEntry.apSpent);
+      apEntry.log.push({ action: `复核否决退还×${removed.length}`, cost: -refund, ok: true, reason: '被复核否决的命令未执行,AP 已退还' });
+    }
+    if (d.ap) {
+      const spent = Math.max(0, d.ap.apSpent - refund);
+      // MonarchDecisionRecord.ap 没有 log 字段;退还明细只记在 ap.byPolity[].log 里
+      d.ap = { ...d.ap, apSpent: spent, remaining: Math.max(0, d.ap.apTotal - spent) };
+    }
+  }
   // P5:安抚地方落地为对本国目标州的一次 boost(发展)干预,和本回合命令一起交给引擎
   const specialCommands: Intervention[] = [];
   for (const d of plan.decisions) {
@@ -1028,8 +1204,10 @@ export async function monarchCommit(s: Session, opts: { reject?: readonly { poli
     }
   }
   const engineCommands = [...kept, ...specialCommands, ...plan.pettyCommands, ...plan.dmCommands];
-  submitOrders(s, engineCommands);
-  const turn = turnStep(s, { years: plan.years });
+  // 命令一次性随 turnStep 交给引擎;幂等键用草稿 id(跨组契约:同一草稿重复提交不重复推演),不再单独 submitOrders。
+  // engine 侧写回合日志失败不中断主流程,失败信息挂在 TurnResult.logError 上带回来。
+  const turn = turnStep(s, { years: plan.years, orders: engineCommands, idempotencyKey: plan.planId });
+  const engineLogError = turn.logError;
 
   // 记忆库:本回合的引擎事实(战败/饥荒/背盟……)+ 君主自己写下的
   s.memory ??= new Map();
@@ -1095,11 +1273,12 @@ export async function monarchCommit(s: Session, opts: { reject?: readonly { poli
 
   const record: Record<string, unknown> = {
     sessionId: s.id,
+    planId: plan.planId,
     round: turn.round,
     fromYear: turn.fromYear,
     toYear: turn.toYear,
     years: turn.years,
-    decisions: plan.decisions,
+    decisions: effectiveDecisions,
     audits: plan.audits,
     audit: plan.audit,
     intel: plan.intel,
@@ -1109,37 +1288,56 @@ export async function monarchCommit(s: Session, opts: { reject?: readonly { poli
     events: turn.events,
     fingerprint: turn.fingerprint,
     briefs: plan.briefs,
-    ap: plan.ap,
+    ap,
     ...(monarchEvents.length ? { monarchEvents } : {}),
     ...(plan.petty ? { petty: plan.petty } : {}),
     ...(plan.dm ? { dm: plan.dm } : {}),
+    ...(engineLogError ? { logError: `引擎回合日志:${engineLogError}` } : {}),
   };
   s.monarch!.rounds.push(record);
   const path = join(s.logDir, `monarch-round-${String(turn.round).padStart(4, '0')}.json`);
-  writeFileSync(path, JSON.stringify(record, null, 2));
-  appendFileSync(join(s.logDir, 'monarch-rounds.jsonl'), JSON.stringify({
-    round: turn.round,
-    fromYear: turn.fromYear,
-    toYear: turn.toYear,
-    decisions: plan.decisions.map((d) => ({ polityId: d.polityId, source: d.source, commands: d.commands.length, rejected: d.rejected.length, error: d.error ?? null, cachedTokens: d.cachedTokens ?? null, ap: d.ap ?? null, actions: (d.actions ?? []).map((a) => ({ kind: a.kind, cost: a.cost, ok: a.ok })) })),
-    audits: plan.audits.map((a) => ({ polityId: a.polityId, kind: a.kind, outcome: a.outcome, source: a.source })),
-    intel: plan.intel.resolutions,
-    ap: plan.ap.byPolity.map((p) => ({ polityId: p.polityId, apTotal: p.apTotal, apSpent: p.apSpent, remaining: p.remaining })),
-    ...(monarchEvents.length ? { monarchEvents } : {}),
-    ...(plan.petty ? { petty: { source: plan.petty.source, events: plan.petty.events, decisions: plan.petty.decisions, commands: plan.petty.commands, fallback: plan.petty.fallback, error: plan.petty.error ?? null } } : {}),
-    ...(plan.dm ? { dm: { source: plan.dm.source, decisions: plan.dm.decisions.length, commands: plan.dm.commands, error: plan.dm.error ?? null } } : {}),
-    fingerprint: turn.fingerprint,
-  }) + '\n');
+  // 两处日志写分别容错:一处失败不阻断另一处,也不中断回合;失败信息各自收集
+  const localLogErrors: string[] = [];
+  try {
+    writeFileSync(path, JSON.stringify(record, null, 2));
+  } catch (e) {
+    localLogErrors.push(`monarch-round-*.json:${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    appendFileSync(join(s.logDir, 'monarch-rounds.jsonl'), JSON.stringify({
+      round: turn.round,
+      planId: plan.planId,
+      fromYear: turn.fromYear,
+      toYear: turn.toYear,
+      decisions: effectiveDecisions.map((d) => ({ polityId: d.polityId, source: d.source, commands: d.commands.length, rejected: d.rejected.length, error: d.error ?? null, cachedTokens: d.cachedTokens ?? null, ap: d.ap ?? null, actions: (d.actions ?? []).map((a) => ({ kind: a.kind, cost: a.cost, ok: a.ok })) })),
+      audits: plan.audits.map((a) => ({ polityId: a.polityId, kind: a.kind, outcome: a.outcome, source: a.source })),
+      intel: plan.intel.resolutions,
+      ap: ap.byPolity.map((p) => ({ polityId: p.polityId, apTotal: p.apTotal, apSpent: p.apSpent, remaining: p.remaining })),
+      ...(dropped.length ? { rejectedByReview: dropped } : {}),
+      ...(monarchEvents.length ? { monarchEvents } : {}),
+      ...(plan.petty ? { petty: { source: plan.petty.source, events: plan.petty.events, decisions: plan.petty.decisions, commands: plan.petty.commands, fallback: plan.petty.fallback, error: plan.petty.error ?? null } } : {}),
+      ...(plan.dm ? { dm: { source: plan.dm.source, decisions: plan.dm.decisions.length, commands: plan.dm.commands, error: plan.dm.error ?? null } } : {}),
+      fingerprint: turn.fingerprint,
+    }) + '\n');
+  } catch (e) {
+    localLogErrors.push(`monarch-rounds.jsonl:${e instanceof Error ? e.message : String(e)}`);
+  }
+  const logParts = [
+    engineLogError ? `引擎回合日志:${engineLogError}` : '',
+    localLogErrors.length ? `君主回合日志:${localLogErrors.join('; ')}` : '',
+  ].filter(Boolean);
+  const logError = logParts.length ? logParts.join('; ') : undefined;
+  if (logError) record.logError = logError;
   s.pendingPlan = undefined;
 
-  return {
+  const result: MonarchRoundResult = {
     sessionId: s.id,
     round: turn.round,
     fromYear: turn.fromYear,
     toYear: turn.toYear,
     years: turn.years,
-    decisions: plan.decisions,
-    ap: plan.ap,
+    decisions: effectiveDecisions,
+    ap,
     ...(monarchEvents.length ? { monarchEvents } : {}),
     ...(plan.petty ? { petty: plan.petty } : {}),
     ...(plan.dm ? { dm: plan.dm } : {}),
@@ -1150,11 +1348,20 @@ export async function monarchCommit(s: Session, opts: { reject?: readonly { poli
     events: turn.events,
     finished: turn.finished,
     fingerprint: turn.fingerprint,
+    ...(logError ? { logError } : {}),
   };
+  // 草稿已被消费:丢掉快照(副作用保留为正式回合状态,不回滚),否则下一次 plan 的 cancel 会误抹掉这一回合
+  planSnapshots.delete(s.id);
+  if (opts.idempotencyKey) commitIdempotency.set(s.id, { key: opts.idempotencyKey, result });
+  return result;
 }
 
 /** 跑一个完整的君主回合(不等复核):plan → commit;复核模式下界面用 plan / commit 两步 */
 export async function monarchRound(s: Session, opts: { years?: number } = {}): Promise<MonarchRoundResult> {
+  // 复核模式下拒绝一步跑完整个 round:否则会绕过玩家/DM 勾选,必须用 plan → commit 两步
+  if (s.review) {
+    throw new Error('复核(review)模式下不能直接跑完整回合;请先用 civ_monarch_plan 出方案、复核后再 civ_monarch_commit 提交(或 cancelMonarchPlan 撤销草稿重做)');
+  }
   await monarchPlan(s, opts);
   return monarchCommit(s);
 }
@@ -1184,6 +1391,10 @@ export interface ReplayResult {
   worldId: string;
   note: string;
   problems: string[];
+  /** 会话装上的推演插件数;回放不复用插件实例(独立) */
+  pluginCount: number;
+  /** 无插件时 civ 指纹才可逐位对比 */
+  fingerprintComparable: boolean;
 }
 
 const commandFrom = (v: Intervention): number => ('from' in v && typeof v.from === 'number' ? v.from : 0);
@@ -1195,7 +1406,11 @@ const commandFrom = (v: Intervention): number => ('from' in v && typeof v.from =
  */
 export function verifySession(s: Session): ReplayResult {
   const world: World = generateWorld({ ...DEFAULT_PARAMS, ...s.worldParams });
+  // 插件独立:回放不复用会话的 QuickJS 推演插件实例(带运行期状态,复用会污染/报错),
+  // 只重放纯引擎命令流,不依赖插件是否加载成功或可用。
   const params = { ...s.civParams };
+  delete params.plugins;
+  const pluginCount = s.civParams.plugins?.length ?? 0;
   const startPlay: PlayState = { year: s.startYear, commands: [] };
   let civ: Civ = playCiv(world, params, startPlay);
   let play: PlayState = startPlay;
@@ -1228,7 +1443,17 @@ export function verifySession(s: Session): ReplayResult {
   }
   const expected = civHash(s.civ);
   const actual = civHash(civ);
-  const ok = expected === actual && Math.floor(play.year) === Math.floor(s.play.year);
+  const yearOk = Math.floor(play.year) === Math.floor(s.play.year);
+  // 带插件时会话 civ 含插件效果,纯引擎回放的指纹本就不可逐位对比;
+  // ok 语义 = 命令流与年份一致、无异常,且(无插件时)fingerprint 逐位一致。
+  const fingerprintComparable = pluginCount === 0;
+  const fingerprintOk = !fingerprintComparable || expected === actual;
+  const ok = yearOk && fingerprintOk && problems.length === 0;
+  const note = ok
+    ? (fingerprintComparable
+      ? '回放一致:君主回合只是把同一串命令分批交给引擎,没有改变引擎结果'
+      : `回放一致(已剥离 ${pluginCount} 个会话插件):纯引擎命令流与年份逐位一致;插件效果不在回放里,civ 指纹不参与对比`)
+    : '回放不一致!检查是否有命令在错误年份生效、重推是否卡住,或会话状态被外部修改';
   return {
     sessionId: s.id,
     ok,
@@ -1239,10 +1464,10 @@ export function verifySession(s: Session): ReplayResult {
     commands: s.play.commands.length,
     steps,
     worldId: worldIdOf(s.worldParams),
-    note: ok
-      ? '回放一致:君主回合只是把同一串命令分批交给引擎,没有改变引擎结果'
-      : '回放不一致!检查是否有命令在错误年份生效,或会话状态被外部修改',
+    note,
     problems,
+    pluginCount,
+    fingerprintComparable,
   };
 }
 

@@ -69,6 +69,7 @@
     <span class="dock-sep" aria-hidden="true"></span>
     <button id="btnVerify" class="dock-btn quiet" type="button" disabled>回放对账</button>
     <button id="btnExport" class="dock-btn quiet" type="button" disabled>导出会话</button>
+    <a id="exportLink" class="dock-btn quiet export-link" href="#" download hidden>下载导出文件</a>
   </nav>
 
   <!-- 参数浮窗(点顶栏「参数」打开) -->
@@ -107,9 +108,13 @@
       </div>
       <div class="control-row">
         <label class="field check"><input id="dmPreset" type="checkbox" checked><span>DM 规则预设</span></label>
-        <label class="field check"><input id="magicField" type="checkbox" checked><span>魔力场</span></label>
+        <label class="field check" title="开局参数:只在点「开始会话」新建会话时生效;取消勾选会同时立刻隐藏地图上的紫色魔力颜色。只改显示请用下面的「显示魔力图层」"><input id="magicField" type="checkbox" checked><span>魔力场</span></label>
         <label class="field check"><input id="mock" type="checkbox" checked><span>mock 决策(不联网)</span></label>
         <label class="field narrow"><span>魔力强度</span><input id="magicStrength" type="number" value="1" min="0" max="3" step="0.5"></label>
+      </div>
+      <div class="control-row">
+        <label class="field check" title="只控制地图上的紫色魔力颜色,关掉不影响引擎推演"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
+        <span class="hint grow">本会话的地图颜色开关 · 关掉只影响显示,不影响推演</span>
       </div>
       <div class="control-row feature-row">
         <label class="field check"><input id="featLlm" type="checkbox" checked><span>LLM 扮演</span></label>
@@ -229,7 +234,7 @@
           <details class="llm-row" id="magicRow">
             <summary>本局动态层 · 魔力 <span class="muted">(每地块逐年演化:灵脉渗出 → 邻块扩散 → 自然消退;每 100 年存一帧,真影响城上限)</span></summary>
             <div class="control-row">
-              <label class="field check"><input id="magicEnable" type="checkbox" checked><span>显示魔力图层</span></label>
+              <span class="hint">「显示魔力图层」开关已移到上方「对局参数」首屏,这里只放年份与色带。</span>
               <label class="field"><span>图层年份</span><select id="magicYearPick"></select></label>
               <button id="btnMagicNow" class="btn" type="button">回到本回合</button>
               <span class="hint grow" id="magicStatusLine">开一个带「魔力场」的会话后,这里会出现逐年图层。</span>
@@ -294,8 +299,12 @@
       <span class="tab-note" id="tabNote"></span>
       <button class="fold-btn" type="button" data-fold="logPanel" aria-label="收起日志">▾</button>
     </div>
+    <!-- 三个持久容器:页签切换只切 hidden,不再整体 innerHTML 覆盖,命令区的草稿/焦点不会被冲掉 -->
     <div class="tab-body" id="tabBody">
-      <div class="side-empty">跑一回合后,这里会列出每个君主的理由和命令。</div>
+      <div class="tab-main" id="tabMain"><div class="side-empty">跑一回合后,这里会列出每个君主的理由和命令。</div></div>
+      <div class="dlg-jev-state" id="jevState" hidden></div>
+      <div class="dialogue-pane" id="dialoguePane" hidden></div>
+      <div class="dm-chat-holder" id="dmChatHolder" hidden></div>
     </div>
   </section>
 

@@ -220,30 +220,49 @@ function WorkSubmitDialog({ phone, work, view, onClose }: { phone: boolean; work
   const primaryOff = mine || netFail ? true : block?.kind === 'block' && block.act !== 'retry' ? false : !canSubmit;
 
   const n = (s: string) => chars(s).length;
-  const field = (label: string, side: string, input: ReactNode) => (
-    <div className="sub-f">
-      <div className="lab">
-        {label}
-        <small>{side}</small>
+  /** 一栏的即时校验三态:默认(空,不写) → 校验失败(红字) → 校验通过(绿字);手机上也看得见,读屏靠 aria-describedby 连上 */
+  const hintId = (k: SubmitField) => `submit-hint-${k}`;
+  const stateOf = (k: SubmitField, ok: boolean): 'idle' | 'bad' | 'ok' => (bad.includes(k) ? 'bad' : ok ? 'ok' : 'idle');
+  const field = (label: string, side: string, input: ReactNode, k: SubmitField, ok: boolean) => {
+    const st = stateOf(k, ok);
+    return (
+      <div className="sub-f">
+        <div className="lab">
+          {label}
+          <small>{side}</small>
+        </div>
+        {input}
+        {st !== 'idle' && (
+          <p id={hintId(k)} className={st === 'bad' ? 'acct-err' : 'acct-okl'} role="status">
+            {st === 'bad' ? '这一栏还差一点，改好再投' : '这一栏填好了'}
+          </p>
+        )}
       </div>
-      {input}
-    </div>
-  );
+    );
+  };
   const inCls = (k: SubmitField) => `acct-in${bad.includes(k) ? ' bad' : ''}`;
+  /** 有提示才把输入框和那行字连起来(aria-describedby),没有提示就不给 */
+  const ariaOf = (k: SubmitField, ok: boolean) => ({ 'aria-invalid': bad.includes(k) || undefined, 'aria-describedby': stateOf(k, ok) === 'idle' ? undefined : hintId(k) });
   const titleIn = field(
     '作品名',
     `${n(form.title)} / ${TITLE_MAX}`,
-    <input className={inCls('title')} data-act="submit-title" aria-label="作品名" value={form.title} disabled={dim} onChange={(e) => set('title', e.target.value, TITLE_MAX)} />,
+    <input className={inCls('title')} data-act="submit-title" aria-label="作品名" {...ariaOf('title', !!clean.title)} value={form.title} disabled={dim} onChange={(e) => set('title', e.target.value, TITLE_MAX)} />,
+    'title',
+    !!clean.title,
   );
   const byIn = field(
     '署名',
     phone ? '用笔名就行' : '作品墙上显示，用笔名就行',
-    <input className={inCls('by')} data-act="submit-by" aria-label="署名" value={form.by} disabled={dim} onChange={(e) => set('by', e.target.value, BY_MAX)} />,
+    <input className={inCls('by')} data-act="submit-by" aria-label="署名" {...ariaOf('by', !!clean.by)} value={form.by} disabled={dim} onChange={(e) => set('by', e.target.value, BY_MAX)} />,
+    'by',
+    !!clean.by,
   );
   const blurbIn = field(
     '一句话介绍',
     `${n(form.blurb)} / ${BLURB_MAX}`,
-    <textarea className={inCls('blurb')} data-act="submit-blurb" aria-label="一句话介绍" placeholder="说说它特别在哪" rows={2} value={form.blurb} disabled={dim} onChange={(e) => set('blurb', e.target.value.replace(/\n/g, ''), BLURB_MAX)} />,
+    <textarea className={inCls('blurb')} data-act="submit-blurb" aria-label="一句话介绍" {...ariaOf('blurb', !!clean.blurb)} placeholder="说说它特别在哪" rows={2} value={form.blurb} disabled={dim} onChange={(e) => set('blurb', e.target.value.replace(/\n/g, ''), BLURB_MAX)} />,
+    'blurb',
+    !!clean.blurb,
   );
 
   // 地图、新建参数、规则一下就交上去了,不出进度那一行

@@ -149,6 +149,9 @@ function useWorldDrag(snap: 'peek' | 'full') {
     const el = ref.current;
     if (!el || (e.pointerType === 'mouse' && e.button !== 0)) return;
     const t = e.target as HTMLElement;
+    // 搜索框(和别的能输入、能选字的地方)里按下:留给输入框自己(选字、移光标、弹手机键盘),别当成拖卡片;
+    // 拖起来时下面还会 blur 掉焦点,不排除的话在搜索框里一滑键盘就收了
+    if (t.closest('input, textarea, select, [contenteditable="true"], [role="searchbox"], [role="textbox"]')) return;
     // 拖动条、搜索框那一截、世界名那一行能拖(拉到顶时下面的列表留给滚动)
     if (!t.closest('.sheet-grip, .ps-head, .ps-world') || t.closest('.save-menu, .pm-menu')) return;
     press.current = { id: e.pointerId, y0: e.clientY, top0: el.offsetTop, moved: false, samples: [{ y: e.clientY, t: performance.now() }] };

@@ -106,6 +106,34 @@ export const SPECIAL_ACTION_NAMES: Record<SpecialActionKind, string> = {
   'pacify-region': '安抚地方',
 };
 
+/**
+ * 叙事标注(P5):标明每条特殊动作的效果性质,供 UI / 日志 / 报告标注「叙事」,
+ * 避免把会话层的记账近似误读成真实的引擎数值变化(见文件头说明 1 / 2)。
+ *  - 'narrative' = 仅记账/叙事,不产生真实引擎数值变化;
+ *  - 'mixed'    = 有真实引擎/会话效果,但带叙事近似成分(亲征 +20% 战力、安抚的稳定度说法都不真改数值);
+ *  - 'engine'   = 全部是真实状态变化。
+ */
+export type SpecialActionEffect = 'narrative' | 'mixed' | 'engine';
+export const SPECIAL_ACTION_EFFECT: Record<SpecialActionKind, SpecialActionEffect> = {
+  'cultivate-heir': 'engine',
+  'lead-army': 'mixed',
+  'dispatch-army': 'narrative',
+  'pacify-region': 'mixed',
+};
+/** 仅叙事/记账、不改引擎数值的动作集合(UI/日志据此标注「叙事(不产生引擎命令)」) */
+export const NARRATIVE_ONLY_ACTIONS: ReadonlySet<string> = new Set<string>(
+  Object.keys(SPECIAL_ACTION_EFFECT).filter((k) => SPECIAL_ACTION_EFFECT[k as SpecialActionKind] === 'narrative'),
+);
+/** 叙事常量:目前只是记账/叙事,尚未接进引擎钩子(见文件头 1);接上钩子后从这里移除 */
+export const NARRATIVE_ONLY_CONSTANTS: ReadonlySet<string> = new Set(['LEAD_ARMY_BONUS']);
+/** 给报告/UI 用的一句话叙事标注 */
+export function narrativeLabel(kind: string): string {
+  const effect = SPECIAL_ACTION_EFFECT[kind as SpecialActionKind];
+  if (effect === 'narrative') return '叙事(不产生引擎命令)';
+  if (effect === 'mixed') return '部分为叙事近似(战力/稳定度说法不真实改引擎数值)';
+  return '真实状态变化';
+}
+
 /** 亲征的战力加成:TODO 尚未真正接进引擎(见文件头说明 1) */
 export const LEAD_ARMY_BONUS = 1.2;
 /** 亲征时每年被俘 / 阵亡的概率(确定性 hash 掷,回合跨度线性放大) */

@@ -33,25 +33,12 @@ import { currentWorld, useSavesVersion } from './saveStore';
 import { bookTitleText, bookUnit, closeBookReader, getBookSource, openBookReader, startBook, stopBook, useBook } from './bookStore';
 import { useDialogEscape } from './BookDialog';
 import { useEra } from './editsStore';
+import { copyText } from './clipboard';
 import { eraText, yearFull, yearSpan, yearSpanAt, type Era } from '../gen/era';
 import { AiTag } from './aiTag';
 import './book.css';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
-
-/** 复制文字(没有剪贴板权限时退回老办法) */
-async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = Object.assign(document.createElement('textarea'), { value: text });
-    ta.style.cssText = 'position:fixed;left:-9999px;top:0';
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-  }
-}
 
 function download(text: string, name: string) {
   const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));

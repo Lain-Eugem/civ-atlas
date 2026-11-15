@@ -384,7 +384,7 @@ export function SaveMenu({ ready, icon }: SaveMenuProps) {
             </button>
           ) : (
             <>
-              <button className={`save-it${kept || mapOff || plgData.length || simOff ? ' off' : ''}`} data-act="share-link" aria-disabled={kept || mapOff || plgData.length || simOff ? true : undefined} disabled={!cur} onClick={kept || mapOff || plgData.length || simOff ? undefined : shareLink}>
+              <button className={`save-it${kept || mapOff || plgData.length || simOff ? ' off' : ''}`} data-act="share-link" data-tip="复制配方链接" data-tip-key="layer5" aria-disabled={kept || mapOff || plgData.length || simOff ? true : undefined} disabled={!cur} onClick={kept || mapOff || plgData.length || simOff ? undefined : shareLink}>
                 <Icon name="link" size={17} />
                 <span>
                   <b>复制配方链接</b>

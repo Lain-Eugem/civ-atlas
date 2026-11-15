@@ -196,16 +196,16 @@ export function planPettyBatch(envText: string, specs: readonly PettyQuestionSpe
     if (q.criteria !== undefined) item.criteria = q.criteria;
     if (q.label !== undefined) item.label = q.label;
 
-    if (picked.length >= c.maxQuestions) {
-      dropped.push({ key: q.key, priority: q.priority, label: q.label, reason: 'question-cap' });
-      continue;
-    }
     if (q.priority === 0) {
-      // P0 必含：即便越过目标也放；只有越过硬上限才标记 overBudget（仍放，交给上层决定是否拆批）
+      // P0 必含：不受 maxQuestions 问题数上限裁，也不受目标预算裁；只有越过硬上限才标 overBudget（仍放）。
       picked.push(item);
       used += item.tokens;
       byPriority['0'] += item.tokens;
       if (used > c.hardTokens) overBudget = true;
+      continue;
+    }
+    if (picked.length >= c.maxQuestions) {
+      dropped.push({ key: q.key, priority: q.priority, label: q.label, reason: 'question-cap' });
       continue;
     }
     const limit = c.targetTokens;

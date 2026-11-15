@@ -47,10 +47,16 @@ export function providerSettings(input: LlmProviderInput = {}): LlmProviderSetti
   if (!model) throw new Error('缺少 model(provider=custom 时必须给)');
   const temperature = clampNum(input.temperature ?? 0.7, 0, 2, 'temperature');
   const timeoutMs = clampNum(input.timeoutMs ?? 120_000, 5_000, 600_000, 'timeoutMs');
-  const apiKey = input.apiKey ?? envKey;
+  // 空串/纯空白的 Key 视为"没给"：UI 留空字段(传 '')不该挡住环境变量回退，也不该被当成有效 Key。
+  const apiKey = cleanKey(input.apiKey) ?? cleanKey(envKey);
   const out: LlmProviderSettings = { provider, baseUrl, model, temperature, timeoutMs };
   if (apiKey) out.apiKey = apiKey;
   return out;
+}
+
+/** 把空串/纯空白的 Key 归一成 undefined；其余原样 trim 后返回。 */
+function cleanKey(v: string | undefined): string | undefined {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
 }
 
 /** 给用户看的服务商信息(不含 Key) */
@@ -83,8 +89,14 @@ export async function askLlm(messages: readonly LlmMessage[], s: LlmProviderSett
   const body = JSON.stringify({ ...base, response_format: { type: 'json_object' } });
   let res = await fetchJson(url, body, s);
   if (res.status === 400) {
-    // 有些服务商不支持 response_format,去掉再试一次
-    res = await fetchJson(url, JSON.stringify(base), s);
+    // 只对"服务商不支持 response_format/json_object"这类 400 去掉参数重试一次；
+    // 其它 400(model 不存在、鉴权、上下文超长、messages 格式错)必须保留原始错误，别盲目发第二次请求。
+    const firstText = await res.text();
+    if (isResponseFormatError(firstText)) {
+      res = await fetchJson(url, JSON.stringify(base), s);
+    } else {
+      throw new Error(`LLM 请求失败 HTTP 400: ${firstText.slice(0, 500)}`);
+    }
   }
   const text = await res.text();
   if (!res.ok) throw new Error(`LLM 请求失败 HTTP ${res.status}: ${text.slice(0, 500)}`);
@@ -112,6 +124,11 @@ export async function askLlm(messages: readonly LlmMessage[], s: LlmProviderSett
     ...(promptTokens !== undefined ? { promptTokens } : {}),
     ...(cachedTokens !== undefined ? { cachedTokens } : {}),
   };
+}
+
+/** 400 错误体是否确实在抱怨 response_format / json_object 不被支持。 */
+function isResponseFormatError(text: string): boolean {
+  return /response[ _-]?format|json_object|json_schema/i.test(text);
 }
 
 async function fetchJson(url: string, body: string, s: LlmProviderSettings): Promise<Response> {

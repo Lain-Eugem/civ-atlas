@@ -4,6 +4,7 @@
  * 每个工具都是「无头引擎」的一层薄包装:参数进来 → 调 engine.ts → 返回 JSON 文本。
  * 工具名统一用 civ_ 前缀,避免和其他 MCP Server 撞名。
  */
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import {
   catalog,
   chronicleGet,
@@ -15,6 +16,7 @@ import {
   stateGet,
   submitOrders,
   turnStep,
+  withSessionLock,
   worldIdOf,
 } from './engine';
 import { compileMonarchOrders, MONARCH_MAX_ORDERS } from '../src/gen/civ/monarch';
@@ -37,6 +39,9 @@ export interface ToolResult {
 }
 
 const SESSION_ID = { type: 'string', description: '会话 id(civ_session_open 返回的 sessionId)' } as const;
+
+/** 单次交命令的条数边界(干预数量核对的入口):一次塞太多会拖垮一回合 */
+const MAX_ORDERS_PER_CALL = 200;
 
 export const TOOLS: ToolDef[] = [
   {
@@ -145,6 +150,7 @@ export const TOOLS: ToolDef[] = [
         sessionId: SESSION_ID,
         orders: {
           type: 'array',
+          maxItems: MAX_ORDERS_PER_CALL,
           description: '命令数组。原始格式:{"kind":"policy","a":"polity:c32577#0","preset":"expand"};君主格式:{"kind":"declare","b":6}',
           items: { type: 'object', additionalProperties: true },
         },
@@ -156,7 +162,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'civ_turn_step',
     description:
-      '把已提交的命令交给引擎,再推 stepYears 年(或指定 years 年)。返回年份变化、各国州数增减、本回合大事、引擎拒收的命令。',
+      '把已提交的命令交给引擎,再推 stepYears 年(或指定 years 年)。返回年份变化、各国州数增减、本回合大事、引擎拒收的命令。带 idempotencyKey 时,同一个键重复调用直接回放上一回合结果,不会多推一回合。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -164,9 +170,11 @@ export const TOOLS: ToolDef[] = [
         years: { type: 'integer', description: '可选:本回合推几年(默认用会话的 stepYears)', minimum: 1, maximum: 1000 },
         orders: {
           type: 'array',
+          maxItems: MAX_ORDERS_PER_CALL,
           description: '可选:本次临时附加的命令(等价于先 civ_orders_submit 再 step)',
           items: { type: 'object', additionalProperties: true },
         },
+        idempotencyKey: { type: 'string', description: '可选:幂等键;同一个键重复调用直接返回上一次结果(用于重试 / 防重复提交)' },
       },
       required: ['sessionId'],
     },
@@ -188,7 +196,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: 'civ_session_export',
-    description: '把会话导出成 JSON 文件(含会话参数、世界参数、命令历史、状态、编年史),便于复盘/对账。',
+    description: '把会话导出成 JSON 文件(含会话参数、世界参数、命令历史、状态、编年史),便于复盘/对账。path 只允许项目目录内的相对路径(不允许绝对路径或 .. 越界);不传则写到会话日志目录的 export.json。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -368,8 +376,15 @@ function text(value: unknown): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 }
 
-/** 执行一个工具。业务错误抛出 Error,由 server 转成 isError 结果。 */
+/** 执行一个工具。带 sessionId 的调用按会话排队,避免并发推演互相踩状态。 */
 export async function callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+  const sessionId = typeof args.sessionId === 'string' && args.sessionId !== '' ? args.sessionId : undefined;
+  if (sessionId === undefined) return dispatchTool(name, args);
+  return withSessionLock(sessionId, () => dispatchTool(name, args));
+}
+
+/** 工具分发本体。业务错误抛出 Error,由 server 转成 isError 结果。 */
+async function dispatchTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name) {
     case 'civ_world_create': {
       const seed = args.seed;
@@ -436,7 +451,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
           provider: typeof args.provider === 'string' ? args.provider : undefined,
           baseUrl: typeof args.baseUrl === 'string' ? args.baseUrl : undefined,
           model: typeof args.model === 'string' ? args.model : undefined,
-          apiKey: typeof args.apiKey === 'string' ? args.apiKey : undefined,
+          apiKey: apiKeyArg(args.apiKey),
           temperature: optNum(args.temperature, 'temperature'),
           timeoutMs: optNum(args.timeoutMs, 'timeoutMs'),
           maxDecisions: optNum(args.maxDecisions, 'maxDecisions'),
@@ -459,20 +474,40 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     }
     case 'civ_orders_submit': {
       const s = getSession(String(args.sessionId ?? ''));
-      const orders = args.orders;
-      if (!Array.isArray(orders)) throw new Error('orders 必须是数组');
+      const orders = ordersArg(args.orders);
       const polityId = optNum(args.polityId, 'polityId');
       if (polityId !== undefined) {
         const compiled = compileMonarchOrders(s.civ, s.play.year, Math.round(polityId), orders);
-        submitOrders(s, compiled.commands);
-        return text({ ...compiled, queued: s.queue.length, note: '君主格式已按国家编号编译;要生效请再调 civ_turn_step' });
+        const cleaned = submitOrders(s, compiled.commands);
+        // 干预数量核对:把输入 / 编译 / 接纳 / 拒收的数量摆在一起,调用方可以对账
+        return text({
+          ...compiled,
+          queued: s.queue.length,
+          checked: {
+            input: orders.length,
+            compiled: compiled.commands.length,
+            accepted: cleaned.commands.length,
+            rejected: compiled.rejected.length + cleaned.rejected.length,
+          },
+          note: '君主格式已按国家编号编译;要生效请再调 civ_turn_step',
+        });
       }
-      return text(submitOrders(s, orders));
+      const cleaned = submitOrders(s, orders);
+      return text({
+        ...cleaned,
+        checked: { input: orders.length, accepted: cleaned.commands.length, rejected: cleaned.rejected.length },
+      });
     }
     case 'civ_turn_step': {
       const s = getSession(String(args.sessionId ?? ''));
-      const orders = Array.isArray(args.orders) ? args.orders : undefined;
-      return text(turnStep(s, { years: optNum(args.years, 'years'), orders }));
+      const orders = args.orders === undefined ? undefined : ordersArg(args.orders);
+      return text(
+        turnStep(s, {
+          years: optNum(args.years, 'years'),
+          orders,
+          idempotencyKey: typeof args.idempotencyKey === 'string' ? args.idempotencyKey : undefined,
+        }),
+      );
     }
     case 'civ_chronicle_get': {
       const s = getSession(String(args.sessionId ?? ''));
@@ -487,7 +522,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     }
     case 'civ_session_export': {
       const s = getSession(String(args.sessionId ?? ''));
-      return text(exportSession(s, typeof args.path === 'string' ? args.path : undefined));
+      return text(exportSession(s, exportPathArg(args.path)));
     }
     case 'civ_brief_get': {
       const s = getSession(String(args.sessionId ?? ''));
@@ -503,7 +538,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
           provider: typeof args.provider === 'string' ? args.provider : undefined,
           baseUrl: typeof args.baseUrl === 'string' ? args.baseUrl : undefined,
           model: typeof args.model === 'string' ? args.model : undefined,
-          apiKey: typeof args.apiKey === 'string' ? args.apiKey : undefined,
+          apiKey: apiKeyArg(args.apiKey),
           temperature: optNum(args.temperature, 'temperature'),
           timeoutMs: optNum(args.timeoutMs, 'timeoutMs'),
         }),
@@ -522,7 +557,7 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
           maxQuestions: optNum(args.maxQuestions, 'maxQuestions'),
           budget: isObject(args.budget) ? (args.budget as never) : undefined,
           queue: isObject(args.queue) ? (args.queue as never) : undefined,
-          apiKey: typeof args.apiKey === 'string' ? args.apiKey : undefined,
+          apiKey: apiKeyArg(args.apiKey),
           baseUrl: typeof args.baseUrl === 'string' ? args.baseUrl : undefined,
           model: typeof args.model === 'string' ? args.model : undefined,
           timeoutMs: optNum(args.timeoutMs, 'timeoutMs'),
@@ -551,6 +586,35 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     default:
       throw Object.assign(new Error(`未知工具 ${name}`), { code: -32602 });
   }
+}
+
+/** 导出路径边界(与 engine.exportPathOf 同一口径):只允许项目目录内的相对路径 */
+function exportPathArg(v: unknown): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'string' || v.trim() === '') throw new Error('导出 path 必须是非空字符串,只允许项目目录内的相对路径');
+  if (isAbsolute(v)) throw new Error('导出 path 只允许项目目录内的相对路径(不能用绝对路径)');
+  const root = resolve(process.cwd());
+  const rel = relative(root, resolve(root, v));
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error('导出 path 只允许项目目录内的相对路径(不能越出项目目录)');
+  }
+  return v;
+}
+
+/** 空串 Key 视为未提供:否则会盖掉环境变量 / 在进程内存里存一份空 Key */
+function apiKeyArg(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim();
+  return t === '' ? undefined : t;
+}
+
+/** 命令数组边界:必须是数组且不超过单次上限(干预数量核对) */
+function ordersArg(v: unknown, name = 'orders'): unknown[] {
+  if (!Array.isArray(v)) throw new Error(`${name} 必须是数组`);
+  if (v.length > MAX_ORDERS_PER_CALL) {
+    throw new Error(`${name} 一次最多 ${MAX_ORDERS_PER_CALL} 条,收到 ${v.length} 条`);
+  }
+  return v;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

@@ -30,6 +30,8 @@ export type BoostIv = Extract<Intervention, { kind: 'boost' }>;
 export const IV_TOP_ERA = -17;
 /** 史事 intervene 的 n = 推了几州 × BOOST_N + 直接进到第几个时代 */
 export const BOOST_N = 16;
+/** 小事件 / 故事事件的 dev 委托"快 3 倍"的倍数(pettyEngine / storyEngine 和回放重建都用这一个) */
+export const DEV_BOOST_MUL = 3;
 
 /** 管着的一条快几倍:哪国(几州的 = 那几州)、哪几年、几倍 */
 interface BoostSeg {
@@ -60,15 +62,26 @@ export function installBoosts(sim: CivSim, iv: InterventionModel): void {
   const api = civApi(sim);
   const d = devModelOf(sim);
   const pm = iv.pm;
-  if (!d || !pm || !iv.list.some((v) => v.kind === 'boost' && v.mul !== undefined)) return;
+  // 快几倍除了直接的 boost 干预,还有 story / petty 把 dev 托给 boost 的:它们史事里的 war 指向 story / petty
+  // (不是 boost 干预),靠史事自带的 until 重建。没有这两类快几倍的世界什么都不挂,逐位不变
+  const hasMul = iv.list.some((v) => (v.kind === 'boost' && v.mul !== undefined) ||
+    (v.kind === 'petty' && v.effect.type === 'dev') ||
+    (v.kind === 'story' && (v.effects ?? []).some((x) => x.type === 'dev')));
+  if (!d || !pm || !hasMul) return;
   const segs: BoostSeg[] = [];
   for (let k = 0; k < sim.annalCount; k++) {
     const e = sim.annal(k);
     if (e.kind !== 'intervene' || e.b !== -1) continue;
     const v = iv.list[e.war];
-    if (v?.kind !== 'boost') continue;
-    const s = segOf(v, e.a, pm);
-    if (s) segs.push(s);
+    if (v?.kind === 'boost') {
+      const s = segOf(v, e.a, pm);
+      if (s) segs.push(s);
+    } else if (e.until !== undefined && v !== undefined &&
+      ((v.kind === 'petty' && v.effect.type === 'dev') ||
+        (v.kind === 'story' && (v.effects ?? []).some((x) => x.type === 'dev')))) {
+      // dev 委托:整国、快 3 倍、从史事那一年到 until,和 strikeBoost 当时 push 的那一段逐位一致
+      segs.push({ p: e.a, regions: null, from: e.year, until: e.until, mul: DEV_BOOST_MUL });
+    }
   }
   segsOf.set(sim, segs);
   // 一步里各州的倍数:这一步按各条的起止切成几段,每段取管着这州的最大倍数,再按各段占这一步的几成加起来
@@ -94,8 +107,12 @@ export function installBoosts(sim: CivSim, iv: InterventionModel): void {
   };
 }
 
-/** 推一把发展此刻生效(interventions.ts 在 from 那一刻调用;a = 国家此刻的编号,第 i 条干预)。史事见文件头 */
-export function strikeBoost(sim: CivSim, iv: InterventionModel, v: BoostIv, i: number, a: number, t: Year): void {
+/**
+ * 推一把发展此刻生效(interventions.ts 在 from 那一刻调用;a = 国家此刻的编号,第 i 条干预)。史事见文件头。
+ * devUntil:story / petty 委托 dev 时才传(快几倍的到期年份),把生效区间记进史事的 until 列,接着推时
+ * installBoosts 只凭这一条就能重建出同一段;普通 boost 不传,史事逐位不变(既有世界指纹不动)。
+ */
+export function strikeBoost(sim: CivSim, iv: InterventionModel, v: BoostIv, i: number, a: number, t: Year, devUntil?: number): void {
   const pm = iv.pm!;
   const S = pm.settlements;
   const R = pm.terrain.R;
@@ -124,10 +141,10 @@ export function strikeBoost(sim: CivSim, iv: InterventionModel, v: BoostIv, i: n
       }
     }
   }
-  const rec = (b: number, n = 0) => sim.record('intervene', { a, b, region: at, settlement: city, war: i, n });
+  const rec = (b: number, n = 0, until?: number) => sim.record('intervene', { a, b, region: at, settlement: city, war: i, n, ...(until !== undefined ? { until } : {}) });
   if (!alive) return rec(-3);
   if (v.mul !== undefined) {
-    rec(-1, regions.length * BOOST_N);
+    rec(-1, regions.length * BOOST_N, devUntil);
     const s = segOf(v, a, pm);
     if (s) segsOf.get(sim)?.push(s);
     return;

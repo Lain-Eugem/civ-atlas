@@ -193,6 +193,12 @@
     roundChip: $('#roundChip'),
     tabs: $('#tabs'),
     tabBody: $('#tabBody'),
+    // 三个持久页签容器:切页签只切 hidden,不再整体覆盖 tabBody.innerHTML
+    tabMain: $('#tabMain'),
+    dialoguePane: $('#dialoguePane'),
+    dmChatHolder: $('#dmChatHolder'),
+    jevState: $('#jevState'),
+    exportLink: $('#exportLink'),
     tabNote: $('#tabNote'),
     featLlm: $('#featLlm'),
     featJev: $('#featJev'),
@@ -268,6 +274,12 @@
     }
     if (el.reviewMode && cfg.review !== undefined) el.reviewMode.checked = !!cfg.review;
     if (el.mock && cfg.mock !== undefined) el.mock.checked = !!cfg.mock;
+    // 「魔力场 / 强度」是开局参数,也要跟着配置存:不然刷新页面时 index.html 的
+    // checked 默认值会把用户关掉的开关又悄悄勾回来。
+    if (el.magicField && cfg.magicField !== undefined) el.magicField.checked = !!cfg.magicField;
+    if (el.magicStrength && cfg.magicStrength !== undefined) el.magicStrength.value = String(cfg.magicStrength);
+    // 引导浮层的「先用 mock 离线演示」跟参数栏的 mock 同一份配置
+    if (el.obMock && cfg.mock !== undefined) el.obMock.checked = !!cfg.mock;
     if (cfg.style === 'fantasy' || cfg.style === 'satellite' || cfg.style === 'geo' || cfg.style === 'white' || cfg.style === 'classic') {
       S.style = cfg.style;
       if (el.mapStyle) el.mapStyle.value = cfg.style;
@@ -300,24 +312,33 @@
       mock: el.mock ? el.mock.checked : false,
       style: S.style,
       magicColors: S.magic.colors ? [...S.magic.colors] : null,
+      magicField: el.magicField ? el.magicField.checked : true,
+      magicStrength: el.magicStrength ? el.magicStrength.value : '1',
       onboarded: true,
     };
   }
 
-  /** 引导浮层里的值 → 参数栏(再一起存) */
+  /** 引导浮层里的值 → 参数栏(再一起存);obMock 是「先用 mock 离线演示」的总开关 */
   function applyOnboardToForm() {
     if (el.obProvider && el.provider) el.provider.value = el.obProvider.value;
     if (el.obBaseUrl && el.baseUrl) el.baseUrl.value = el.obBaseUrl.value.trim();
     if (el.obModel && el.model) el.model.value = el.obModel.value.trim();
     if (el.obKey && el.apiKey) el.apiKey.value = el.obKey.value;
     if (el.obJevKey && el.pettyKey) el.pettyKey.value = el.obJevKey.value;
+    // 引导里勾了 mock,就把参数栏的 mock 也勾上,后面所有 mock 联动都读这一份
+    if (el.obMock && el.mock) el.mock.checked = !!el.obMock.checked;
   }
 
   function onboardState() {
     const llmKey = el.obKey ? el.obKey.value.trim() : '';
     const jevKey = el.obJevKey ? el.obJevKey.value.trim() : '';
-    if (el.obLlmState) el.obLlmState.textContent = llmKey ? '已填(只存在这台机器)' : '没填:只能先勾 mock 离线演示';
-    if (el.obJevState) el.obJevState.textContent = jevKey ? '已填(只存在这台机器)' : '没填:审核与渗透会退回确定性规则';
+    const mock = !!(el.obMock && el.obMock.checked);
+    if (el.obLlmState) el.obLlmState.textContent = mock
+      ? 'mock 离线演示:不用填 Key,君主用确定性规则开口'
+      : llmKey ? '已填(只存在这台机器)' : '没填:只能先勾 mock 离线演示';
+    if (el.obJevState) el.obJevState.textContent = mock
+      ? 'mock 离线演示:审核与渗透退回确定性规则'
+      : jevKey ? '已填(只存在这台机器)' : '没填:审核与渗透会退回确定性规则';
   }
 
   function showOnboard() {
@@ -327,8 +348,10 @@
     if (el.obModel && el.model) el.obModel.value = el.model.value;
     if (el.obKey && el.apiKey) el.obKey.value = el.apiKey.value;
     if (el.obJevKey && el.pettyKey) el.obJevKey.value = el.pettyKey.value;
+    if (el.obMock && el.mock) el.obMock.checked = !!el.mock.checked;
     el.onboard.hidden = false;
     onboardState();
+    syncMockDisabled();
   }
 
   function hideOnboard() {
@@ -361,10 +384,50 @@
 
   function setBusy(on, title, sub) {
     S.busy = !!on;
+    // 挂接:任何耗时操作期间把 8 个表单开关一起锁住,解锁时按 mock 联动恢复
+    setFormLocked(!!on);
     if (!el.busy) return;
     el.busy.classList.toggle('show', !!on);
     if (title) el.busyTitle.textContent = title;
     if (sub !== undefined) el.busySub.textContent = sub;
+  }
+
+  /** 顶层操作互斥:上一个耗时请求没结束就拒绝新的,避免两次写互相覆盖 */
+  function acquireOp() {
+    if (S.busy) {
+      toast('上一个操作还没结束,请稍候', true);
+      return false;
+    }
+    return true;
+  }
+
+  /** 初始化 / 耗时请求期间锁住表单开关,避免用户改了配置和实际提交的不一致 */
+  const FORM_SWITCHES = ['featLlm', 'featJev', 'reviewMode', 'mock', 'dmEnable', 'dmMock', 'pettyEnable', 'pettyMock'];
+  function setFormLocked(locked) {
+    for (const key of FORM_SWITCHES) {
+      const input = el[key];
+      if (input) input.disabled = !!locked;
+    }
+    // 解锁时不能一律放开:真模型 / DM / Jev 的输入框要按各 mock 开关恢复禁用态
+    if (!locked) syncMockDisabled();
+  }
+
+  /** 统一 mock 联动:主 mock / DM mock / 小事件 mock / 引导浮层 mock 一处算清 */
+  function syncMockDisabled() {
+    const mainMock = !!(el.mock && el.mock.checked);
+    for (const key of ['provider', 'baseUrl', 'model', 'apiKey', 'temperature']) {
+      if (el[key]) el[key].disabled = mainMock;
+    }
+    const dmMock = !!(el.dmMock && el.dmMock.checked);
+    for (const key of ['dmBaseUrl', 'dmModel', 'dmKey']) {
+      if (el[key]) el[key].disabled = dmMock;
+    }
+    if (el.pettyKey) el.pettyKey.disabled = !!(el.pettyMock && el.pettyMock.checked) || mainMock;
+    // 引导浮层勾了「先用 mock 离线演示」:Key / 地址 / 模型都不用填
+    const obMock = !!(el.obMock && el.obMock.checked);
+    for (const key of ['obProvider', 'obBaseUrl', 'obModel', 'obKey', 'obJevKey', 'obJevBase', 'obJevModel']) {
+      if (el[key]) el[key].disabled = obMock;
+    }
   }
 
   function setStatus(text) {
@@ -2211,6 +2274,7 @@
   }
 
   async function exportFieldData() {
+    if (!acquireOp()) return;
     if (!S.field.data) {
       toast('先生成场,才能导出数值', true);
       return;
@@ -2616,17 +2680,51 @@
       </div>`;
   }
 
+  /** Jev 页签顶部的状态条:读 state.petty(小事件裁决层状态) */
+  function renderJevState() {
+    if (!el.jevState) return;
+    const pt = S.state && S.state.petty;
+    if (!pt || !pt.configured) {
+      el.jevState.classList.add('is-off');
+      el.jevState.innerHTML = '<b>小事件裁决层(Jev)未连接</b> · 审核与渗透退回确定性规则;小事不结算。勾「Jev 判断」并连接后,这里会显示画像与每回合裁决。';
+      return;
+    }
+    el.jevState.classList.remove('is-off');
+    const mode = pt.mock
+      ? 'mock(离线)'
+      : `${esc(pt.client && pt.client.baseUrl ? pt.client.baseUrl : '官方 Jev')}${pt.client && pt.client.model ? ' / ' + esc(pt.client.model) : ''}`;
+    const profile = pt.profile ? esc(pt.profile) : '—';
+    const last = pt.last ? ` · 上回合 ${fmtInt(pt.last.events)} 件 / ${fmtInt(pt.last.decided)} 条决定` : '';
+    el.jevState.innerHTML = `<b>小事件裁决层已连接</b> ${mode} · 画像 ${profile} · 已跑 ${fmtInt(pt.rounds)} 回合${last}`;
+  }
+
+  /**
+   * 切页签只切三个持久容器的 hidden(外加一条 Jev 状态条),绝不整体覆盖 tabBody.innerHTML:
+   * DM 命令区(#dmChatHolder)里的草稿 / 焦点、对话区(#dialoguePane)的 DOM 都得以保留。
+   */
   function renderTabBody() {
     if (!S.state || !el.tabBody) return;
-    if (S.tab === 'dm' || S.tab === 'jev') {
+    const isDm = S.tab === 'dm';
+    const isJev = S.tab === 'jev';
+    const isDialogue = isDm || isJev;
+    const main = el.tabMain;
+    const pane = el.dialoguePane;
+    const holder = el.dmChatHolder;
+    const jevBar = el.jevState;
+    // 只切 hidden,不重建容器:命令区的草稿 / 焦点不会被冲掉
+    if (main) main.hidden = isDialogue;
+    if (pane) pane.hidden = !isDialogue;
+    if (holder) holder.hidden = !isDm;   // 命令区只在 DM 页签可见,但 DOM 一直留着
+    if (jevBar) jevBar.hidden = !isJev;
+
+    if (isDialogue) {
       if (window.CivDialogue && S.dialogue) {
-        if (window.CivDialogue.renderInto) window.CivDialogue.renderInto(el.tabBody, S.dialogue, S.tab);
-        else if (window.CivDialogue.renderHtml) el.tabBody.innerHTML = window.CivDialogue.renderHtml(S.dialogue, S.tab);
-        if (S.tab === 'dm' && window.CivDmChat) {
+        if (pane) {
+          if (window.CivDialogue.renderInto) window.CivDialogue.renderInto(pane, S.dialogue, S.tab);
+          else if (window.CivDialogue.renderHtml) pane.innerHTML = window.CivDialogue.renderHtml(S.dialogue, S.tab);
+        }
+        if (isDm && holder && window.CivDmChat) {
           const pc = S.state.playerCommands || {};
-          const holder = document.createElement('div');
-          holder.className = 'dm-chat-holder';
-          el.tabBody.appendChild(holder);
           window.CivDmChat.renderInto(holder, {
             pending: pc.pending || [],
             recent: pc.recent || [],
@@ -2635,44 +2733,51 @@
             stepYears: S.state.stepYears || 5,
           }, {
             send: async (text) => {
-              if (!S.sessionId) return;
+              if (!S.sessionId) throw new Error('还没有会话');
+              if (!acquireOp()) throw new Error('上一个操作还没结束,请稍候');
               const d = await api('/api/dm/chat', { sessionId: S.sessionId, text });
               if (d && d.state) await applyState(d.state);
               if (d && d.reply && d.reply.ok === false) toast('没听懂:' + ((d.reply.rejected || []).join(';') || '换个说法'));
               else if (d && d.reply) toast('已入队:' + (d.reply.summary || ''));
             },
             cancel: async (id) => {
-              if (!S.sessionId) return;
+              if (!S.sessionId) throw new Error('还没有会话');
+              if (!acquireOp()) throw new Error('上一个操作还没结束,请稍候');
               const d = await api('/api/dm/chat/cancel', { sessionId: S.sessionId, id });
               if (d && d.state) await applyState(d.state);
             },
+            // 撤销失败由 dm-chat.js 通过这个回调报出来;撤销返回的 Promise 会被它消费
+            onError: (msg) => toast(msg, true),
             disabled: !S.sessionId || S.busy,
             busy: S.busy,
           });
         }
+        if (isJev) renderJevState();
         const rounds = S.dialogue.rounds || [];
-        const n = rounds.filter((r) => (S.tab === 'dm' ? r.kind === 'dm' : r.kind !== 'dm')).length;
+        const n = rounds.filter((r) => (isDm ? r.kind === 'dm' : r.kind !== 'dm')).length;
         el.tabNote.textContent = `${n} 条记录 · 第 ${S.state.rounds} / ${S.state.maxRounds} 回合`;
       } else {
-        el.tabBody.innerHTML = '<div class="side-empty">还没有对话记录;跑一回合后再看。</div>';
+        if (pane) pane.innerHTML = '<div class="side-empty">还没有对话记录;跑一回合后再看。</div>';
+        if (isJev) renderJevState();
         el.tabNote.textContent = '';
       }
       return;
     }
+    // 其余四个页签(decisions / crown / chronicle / rounds)都写进 #tabMain
     if (S.tab === 'crown') {
-      el.tabBody.innerHTML = renderCrown();
+      if (main) main.innerHTML = renderCrown();
       const card = (S.state.cards || []).find((c) => c.polityId === S.sel);
       el.tabNote.textContent = card ? `${card.name} · 记忆 ${((S.state.memory || []).find((m) => m.polityId === S.sel) || {}).entries?.length || 0} 条` : '跑一回合后生成';
       return;
     }
     if (S.tab === 'decisions') {
-      el.tabBody.innerHTML = renderDecisions();
+      if (main) main.innerHTML = renderDecisions();
       el.tabNote.textContent = `${S.state.monarchRounds.length} 回合${S.state.dmRounds && S.state.dmRounds.length ? ` · DM ${S.state.dmRounds.length} 回合` : ''}${S.state.pettyRounds && S.state.pettyRounds.length ? ` · 小事件 ${S.state.pettyRounds.length} 回合` : ''}`;
     } else if (S.tab === 'chronicle') {
-      el.tabBody.innerHTML = renderChronicle();
+      if (main) main.innerHTML = renderChronicle();
       el.tabNote.textContent = `共 ${fmtInt(S.state.chronicleTotal)} 条,最近 ${S.state.events.length} 条`;
     } else {
-      el.tabBody.innerHTML = renderRounds();
+      if (main) main.innerHTML = renderRounds();
       el.tabNote.textContent = `指纹 ${short(S.state.fingerprint, 12)}`;
     }
   }
@@ -2860,24 +2965,25 @@
 
   function refreshButtons() {
     const hasWorld = !!S.worldId;
-    if (el.btnStartCfg) el.btnStartCfg.disabled = !S.sessionId || S.busy || !window.CivStart;
     const hasSession = !!S.sessionId;
     const finished = !!(S.state && S.state.finished);
+    // 自动播放期间:暂停(btnAuto)永远可点,其余操作一律禁用,避免和后台回合互相写
+    if (el.btnStartCfg) el.btnStartCfg.disabled = !S.sessionId || S.busy || S.autoOn || !window.CivStart;
     el.btnSession.disabled = !hasWorld || S.busy || S.autoOn || !!S.plan;
     el.btnRound.disabled = !hasSession || finished || S.busy || S.autoOn || !!S.plan;
-    el.btnAuto.disabled = !hasSession || finished || S.busy || !!S.plan || (el.reviewMode && el.reviewMode.checked);
-    el.btnVerify.disabled = !hasSession || S.busy;
-    el.btnExport.disabled = !hasSession || S.busy;
-    el.btnDmConnect.disabled = !hasSession || S.busy;
-    el.btnPettyConnect.disabled = !hasSession || S.busy;
-    if (el.btnFieldApply) el.btnFieldApply.disabled = !hasWorld || S.busy;
-    if (el.btnFieldOff) el.btnFieldOff.disabled = !S.field.on || S.busy;
-    if (el.btnFieldData) el.btnFieldData.disabled = !S.field.data || S.busy;
-    if (el.magicField) el.magicField.disabled = S.busy;
-    if (el.magicStrength) el.magicStrength.disabled = S.busy;
-    if (el.magicEnable) el.magicEnable.disabled = !hasSession || S.busy;
-    if (el.magicYearPick) el.magicYearPick.disabled = !S.magic.meta || S.busy;
-    if (el.btnMagicNow) el.btnMagicNow.disabled = !hasSession || S.busy;
+    el.btnAuto.disabled = S.autoOn ? false : (!hasSession || finished || S.busy || !!S.plan || (el.reviewMode && el.reviewMode.checked));
+    el.btnVerify.disabled = !hasSession || S.busy || S.autoOn;
+    el.btnExport.disabled = !hasSession || S.busy || S.autoOn;
+    el.btnDmConnect.disabled = !hasSession || S.busy || S.autoOn;
+    el.btnPettyConnect.disabled = !hasSession || S.busy || S.autoOn;
+    if (el.btnFieldApply) el.btnFieldApply.disabled = !hasWorld || S.busy || S.autoOn;
+    if (el.btnFieldOff) el.btnFieldOff.disabled = !S.field.on || S.busy || S.autoOn;
+    if (el.btnFieldData) el.btnFieldData.disabled = !S.field.data || S.busy || S.autoOn;
+    if (el.magicField) el.magicField.disabled = S.busy || S.autoOn;
+    if (el.magicStrength) el.magicStrength.disabled = S.busy || S.autoOn;
+    if (el.magicEnable) el.magicEnable.disabled = !hasSession || S.busy || S.autoOn;
+    if (el.magicYearPick) el.magicYearPick.disabled = !S.magic.meta || S.busy || S.autoOn;
+    if (el.btnMagicNow) el.btnMagicNow.disabled = !hasSession || S.busy || S.autoOn;
     el.btnAuto.textContent = S.autoOn ? '暂停自动播放' : '自动播放';
     el.btnAuto.classList.toggle('playing', S.autoOn);
     // 已经有世界了就把「创建世界」从主按钮降级,免得一直抢眼
@@ -2922,31 +3028,127 @@
     box.hidden = true;
   }
 
+  /** 换世界 / 开新会话 / 重连时统一清掉「本局临时」UI 缓存,避免上一局的疆域/标签/对话残留 */
+  function resetTransientUi() {
+    S.plan = null;
+    S.autoOn = false;
+    if (el.reviewPanel) el.reviewPanel.hidden = true;
+    S.dialogue = null;
+    S.dialogueSession = null;
+    S.labels = null;
+    S.labelsSession = null;
+    S.labelsYear = null;
+    S.ownersImg = null;
+    S.ownerBorders = null;
+    S.ownerFingerprint = null;
+    S.regionLines = null;
+    S.colors = {};
+    S.grid = null;
+    S.sel = null;
+    clearOwnerTiles();
+    // 上一局的魔力层要整份清掉:只清瓦片的话 S.magic.on / img / data 还在,
+    // 新建「不带魔力场」的会话仍会画出旧紫色层,浮窗也还报旧的「魔力浓度」。
+    resetMagic(true);
+    if (window.CivRegions && window.CivRegions.setLines) window.CivRegions.setLines([]);
+    if (window.CivRegionAtlas && window.CivRegionAtlas.clear) window.CivRegionAtlas.clear();
+    atlasKey = '';
+    hideMapTip();
+    // 导出下载链接也是「本会话」的,换会话先收起来
+    if (el.exportLink) {
+      el.exportLink.hidden = true;
+      el.exportLink.removeAttribute('href');
+    }
+  }
+
+  /** /api/sessions 的会话摘要:worldId 在 world.worldId(老版本可能是平铺 worldId),做兼容兜底 */
+  function sessionInfoOf(s) {
+    const w = (s && s.world) || {};
+    return {
+      sessionId: s && s.sessionId,
+      worldId: (w && w.worldId) || (s && s.worldId) || '',
+      finished: !!(s && s.finished),
+      rounds: s && s.rounds,
+      maxRounds: s && s.maxRounds,
+      year: s && s.year,
+    };
+  }
+
+  /** 用 GET /api/state?sessionId= 把会话状态读回,成功后一次性原子写入 S */
+  async function reconnectSession(info) {
+    const sid = info && info.sessionId;
+    if (!sid) return;
+    try {
+      setBusy(true, '正在恢复上次会话…', '从服务端读回会话状态,重新接上地图与日志。');
+      // 所有写入都等这个 GET 成功后才发生:失败就不碰 S(原子写入)
+      const state = await api(`/api/state?sessionId=${encodeURIComponent(sid)}`);
+      const worldId = (state && state.summary && state.summary.world && state.summary.world.worldId) || info.worldId || '';
+      // 原子写入:中间不再 await,避免留下半截状态
+      S.worldId = worldId;
+      S.sessionId = sid;
+      S.state = state;
+      resetTransientUi();
+      // 参数栏的双开关 / 复核 / DM / Jev 也对齐到恢复出来的会话,方便接着跑
+      if (state.features) {
+        if (el.featLlm) el.featLlm.checked = !!state.features.llm;
+        if (el.featJev) el.featJev.checked = !!state.features.jev;
+      }
+      if (el.reviewMode) el.reviewMode.checked = !!state.review;
+      if (el.dmEnable) el.dmEnable.checked = !!(state.dm && state.dm.configured);
+      if (el.pettyEnable) el.pettyEnable.checked = !!(state.petty && state.petty.configured);
+      syncMockDisabled();
+      if (worldId) await loadBaseMap();
+      await applyState(state);
+      if (el.mapEmpty) el.mapEmpty.classList.add('hidden');
+      setHint(`已恢复上次会话 ${sid}。`);
+      toast(`已恢复会话 ${sid}:第 ${fmtInt(state.rounds)} / ${fmtInt(state.maxRounds)} 回合`);
+    } catch (e) {
+      toast(`恢复会话失败:${e instanceof Error ? e.message : String(e)}`, true);
+    } finally {
+      setBusy(false);
+      refreshButtons();
+    }
+  }
+
+  /** 启动时看看进程里有没有没结束的会话,问一句要不要恢复 */
+  async function bootstrap() {
+    let sessions;
+    try {
+      const d = await api('/api/sessions');
+      sessions = (d && d.sessions) || [];
+    } catch (_) {
+      return;   // 旧版服务端 / 服务没起:静默跳过,不影响正常新建
+    }
+    const alive = sessions.map(sessionInfoOf).filter((s) => s.sessionId && !s.finished);
+    if (!alive.length) return;
+    const target = alive[alive.length - 1];
+    const ok = window.confirm(`监视台里还有一个没结束的会话 ${target.sessionId}(第 ${fmtInt(target.rounds)} 回合),要恢复它吗?`);
+    if (!ok) return;
+    await reconnectSession(target);
+  }
+
+  /** 把 POST /api/export 返回的下载链接挂到 #exportLink 上,变成可点下载 */
+  function showExportLink(downloadUrl, filename) {
+    if (!el.exportLink) return;
+    el.exportLink.href = downloadUrl;
+    el.exportLink.setAttribute('download', filename || 'civ-atlas-export.json');
+    el.exportLink.textContent = filename ? `下载 ${filename}` : '下载导出文件';
+    el.exportLink.hidden = false;
+  }
+
   async function createWorld() {
+    if (!acquireOp()) return;
     try {
       setBusy(true, '正在生成世界…', '同样的种子 + 同样的地块数,每次都会得到同一个世界');
       const seed = int(el.seed, 7);
       const cells = int(el.cells, 34043);
       const d = await api('/api/world', { seed, cells });
+      // 会话级临时 UI 统一清(plan/autoOn/dialogue/labels/owner 缓存/sel/grid 等)
+      resetTransientUi();
       S.worldId = d.worldId;
       S.sessionId = null;
       S.state = null;
-      S.plan = null;
-      if (el.reviewPanel) el.reviewPanel.hidden = true;
-      S.ownersImg = null;
-      S.ownerBorders = null;
-      S.ownerFingerprint = null;
-      S.labels = null;
-      S.labelsYear = null;
-      S.regionLines = null;
-      if (window.CivRegions && window.CivRegions.setLines) window.CivRegions.setLines([]);
-      S.dialogue = null;
-      S.dialogueSession = null;
-      clearOwnerTiles();
-      S.grid = null;
-      S.sel = null;
+      // 换世界:底图 / 矢量 / 场 / 魔力的世界级缓存全部作废
       S.baseImg = null;
-      // 换世界:上一张图的底图缓存、矢量层缓存全部作废
       S.baseCache.clear();
       S.baseCacheWorldId = d.worldId;
       S.vecCache = null;
@@ -2954,14 +3156,10 @@
       S.vecWorldId = null;
       S.veins = null;
       S.veinsWorldId = null;
-      S.autoOn = false;
-      atlasKey = '';
-      if (window.CivRegionAtlas && window.CivRegionAtlas.clear) window.CivRegionAtlas.clear();
       S.field = { on: false, img: null, data: null, legend: null, kind: 'magic' };
       if (el.fieldEnable) el.fieldEnable.checked = false;
       if (el.fieldLegendWrap) el.fieldLegendWrap.classList.add('hidden');
-      resetMagic(true);
-      hideMapTip();
+      // resetTransientUi() 已经整份清过魔力层,这里不用再清一次
       updateFieldStatus();
       el.polityList.innerHTML = '';
       if (el.legend) el.legend.innerHTML = '';
@@ -2985,7 +3183,18 @@
   }
 
   async function startSession() {
+    if (!acquireOp()) return;
     if (!S.worldId) return;
+    // 已有会话:先确认再覆盖,免得手滑丢掉一整局
+    if (S.sessionId && !window.confirm('当前已经有会话了,开始新会话会丢弃这一局的进度。确定继续吗?')) return;
+    // 任一 await 失败就整体回滚到这几个字段,避免留下「半截新会话」在前端
+    const prev = {
+      sessionId: S.sessionId,
+      state: S.state,
+      plan: S.plan,
+      autoOn: S.autoOn,
+      worldId: S.worldId,
+    };
     try {
       setBusy(true, '正在推演到起始年…', '会话会先用引擎自动规则把历史推到起始年,再交给 AI 君主。');
       const features = { llm: !!el.featLlm.checked, jev: !!el.featJev.checked };
@@ -3000,10 +3209,9 @@
         features,
         review: !!el.reviewMode.checked,
       });
+      // 会话创建成功:清掉上一局的临时 UI,再写入本局字段
+      resetTransientUi();
       S.sessionId = d.session.sessionId;
-      S.autoOn = false;
-      S.plan = null;
-      if (el.reviewPanel) el.reviewPanel.hidden = true;
       saveCfg(cfgFromForm());
       let setup = null;
       const hasPolities = !!(d.state && Array.isArray(d.state.polities) && d.state.polities.length > 0);
@@ -3028,6 +3236,7 @@
           toast('「LLM 扮演」关着:这一局国家按引擎规则自动行动,只有 Jev 在结算小事。');
         }
       }
+      // DM / Jev 连接是「锦上添花」,失败不影响会话本身,各自吞掉(不触发整体回滚)
       if (el.dmEnable.checked) {
         try {
           setBusy(true, '正在连接 DM 小决策…', el.dmMock.checked ? 'mock 模式,不联网' : 'OpenAI 兼容服务;Key 只在服务端内存。');
@@ -3057,7 +3266,14 @@
           : '点「跑一回合」:每个君主先看简报,再下命令;高影响命令过 Jev 审核,收齐后引擎统一推演一个回合。',
       );
     } catch (e) {
-      toast(`开始会话失败:${e instanceof Error ? e.message : String(e)}`, true);
+      // 整体回滚:sessionId / state / plan / autoOn 全部回到开始前,不留半截状态
+      S.sessionId = prev.sessionId;
+      S.state = prev.state;
+      S.plan = prev.plan;
+      S.autoOn = prev.autoOn;
+      S.worldId = prev.worldId;
+      if (prev.sessionId && prev.state) void applyState(prev.state);
+      toast(`开始会话失败:${e instanceof Error ? e.message : String(e)};已回滚到开始前的状态`, true);
     } finally {
       setBusy(false);
       refreshButtons();
@@ -3073,16 +3289,29 @@
     await loadDialogue();
     await loadRegionAtlas(state);
     if (state.magic) void refreshMagic();
+    else if (S.magic.on || S.magic.data || S.magic.img) {
+      // 这一局没开魔力场(接口返回 magic:null),上面不会刷新图层,
+      // 得主动收掉上一局残留的整图 / 瓦片 / 浮窗数据,否则地图还是紫的。
+      resetMagic(true);
+      if (el.magicEnable) el.magicEnable.checked = false;
+    }
   }
 
+  /** 跑一回合:三个分支都返回 boolean,autoLoop 靠它 + rounds 是否推进来判停 */
   async function runRound() {
-    if (!S.sessionId || S.busyAutoBusy) return;
+    if (!acquireOp()) return false;
+    if (!S.sessionId || S.busyAutoBusy) return false;
     if (S.state && S.state.finished) {
       toast('会话已经结束;改起始年/回合数再开一个。', true);
-      return;
+      return false;
     }
-    if (el.reviewMode.checked) { await planRound(); return; }
-    if (el.featLlm && !el.featLlm.checked) { await engineRound(); return; }
+    // 复核 / 纯引擎分支内部失败会抛异常,这里统一折算成 false 给 autoLoop
+    if (el.reviewMode.checked) {
+      try { return await planRound(); } catch (_) { return false; }
+    }
+    if (el.featLlm && !el.featLlm.checked) {
+      try { return await engineRound(); } catch (_) { return false; }
+    }
     S.busyAutoBusy = true;
     try {
       setBusy(true, 'AI 君主回合进行中…', '每个君主看简报 → 下命令 → 收齐后统一推演;真模型时这一步要等网络。');
@@ -3091,9 +3320,10 @@
       await applyState(d.state);
       const r = d.round;
       toast(`第 ${r.round} 回合:第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年,${(r.decisions || []).length} 位君主、${(r.decisions || []).reduce((n, x) => n + (x.commands || []).length, 0)} 条命令`);
+      return true;
     } catch (e) {
       toast(`回合失败:${e instanceof Error ? e.message : String(e)}`, true);
-      throw e;
+      return false;
     } finally {
       S.busyAutoBusy = false;
       setBusy(false);
@@ -3103,7 +3333,8 @@
 
   /** LLM 关着时的回合:开了 Jev 就先结算小事,否则纯引擎推演 */
   async function engineRound() {
-    if (!S.sessionId || S.busyAutoBusy) return;
+    if (!acquireOp()) return false;
+    if (!S.sessionId || S.busyAutoBusy) return false;
     const jevOnly = !!(el.featJev && el.featJev.checked);
     S.busyAutoBusy = true;
     try {
@@ -3112,8 +3343,10 @@
       if (d.state) await applyState(d.state);
       const r = d.petty || d.turn || {};
       toast(`第 ${r.round ?? '?'} 回合:第 ${fmtInt(yearOf(r.fromYear))} → ${fmtInt(yearOf(r.toYear))} 年${jevOnly ? ' · Jev 结算小事' : ' · 引擎自动'}`);
+      return true;
     } catch (e) {
       toast(`回合失败:${e instanceof Error ? e.message : String(e)}`, true);
+      throw e;   // 不再吞异常:让上层(runRound / autoLoop)明确知道这轮失败了
     } finally {
       S.busyAutoBusy = false;
       setBusy(false);
@@ -3123,6 +3356,7 @@
 
   /** 给已有会话接上/重接君主模式(引导浮层保存后调用) */
   async function connectMonarchNow() {
+    if (!acquireOp()) return;
     if (!S.sessionId) return;
     const setup = await api('/api/monarch/setup', {
       sessionId: S.sessionId,
@@ -3139,7 +3373,8 @@
 
   /** 复核模式第一步:只出方案,不推演 */
   async function planRound() {
-    if (!S.sessionId || S.busyAutoBusy) return;
+    if (!acquireOp()) return false;
+    if (!S.sessionId || S.busyAutoBusy) return false;
     S.busyAutoBusy = true;
     try {
       setBusy(true, '正在出本回合方案…', '君主读简报 → 下命令 → 高影响命令过 Jev 审核;这一步还不推演。');
@@ -3150,8 +3385,10 @@
       renderReview();
       const n = (d.plan && d.plan.commands ? d.plan.commands.length : 0);
       toast(`方案已出:${n} 条命令待复核;在「本回合方案」里取消勾选即可否决。`);
+      return true;
     } catch (e) {
       toast(`出方案失败:${e instanceof Error ? e.message : String(e)}`, true);
+      return false;
     } finally {
       S.busyAutoBusy = false;
       setBusy(false);
@@ -3211,6 +3448,7 @@
   /** 复核模式第二步:按勾选结果提交 */
   async function commitRound() {
     if (!S.plan || !S.sessionId) return;
+    if (!acquireOp()) return;
     const reject = [...el.reviewBody.querySelectorAll('input[type=checkbox][data-polity]')]
       .filter((x) => !x.checked)
       .map((x) => ({ polityId: Number(x.dataset.polity), index: Number(x.dataset.index) }));
@@ -3230,20 +3468,60 @@
     }
   }
 
-  function cancelReview() {
-    S.plan = null;
-    if (el.reviewPanel) el.reviewPanel.hidden = true;
-    toast('方案已放弃(还没推演,世界没有变化)');
+  /** 放弃复核:显式 POST /api/monarch/cancel 通知服务端清掉待提交方案,用返回 state 刷新 */
+  async function cancelReview() {
+    if (!acquireOp()) return;
+    if (!S.sessionId || !S.plan) {
+      S.plan = null;
+      if (el.reviewPanel) el.reviewPanel.hidden = true;
+      refreshButtons();
+      toast('方案已放弃(还没推演,世界没有变化)');
+      return;
+    }
+    try {
+      setBusy(true, '正在放弃方案…');
+      const d = await api('/api/monarch/cancel', { sessionId: S.sessionId });
+      if (d && d.state) await applyState(d.state);
+      S.plan = null;
+      if (el.reviewPanel) el.reviewPanel.hidden = true;
+      toast('方案已放弃(服务端已清除待提交方案,还没推演,世界没有变化)');
+    } catch (e) {
+      // 通知失败也本地放弃,并明确提示,不让用户误以为服务端已同步
+      S.plan = null;
+      if (el.reviewPanel) el.reviewPanel.hidden = true;
+      toast(`方案已在本地放弃,但通知服务端失败:${e instanceof Error ? e.message : String(e)}。若服务端仍留着待提交方案,重新出一次方案即可覆盖。`, true);
+    } finally {
+      setBusy(false);
+      refreshButtons();
+    }
   }
 
+  /** 自动播放:每轮校验返回值与 rounds 是否推进,失败/未推进立即 break 并 toast */
   async function autoLoop() {
+    if (!acquireOp()) return;
     if (S.autoOn) return;
     if (!S.sessionId) return;
     S.autoOn = true;
     refreshButtons();
     try {
       while (S.autoOn && S.sessionId && S.state && !S.state.finished) {
-        await runRound();
+        const before = S.state.rounds;
+        let ok = false;
+        try {
+          ok = await runRound();
+        } catch (e) {
+          toast(`自动播放中止:回合执行失败(${e instanceof Error ? e.message : String(e)})`, true);
+          break;
+        }
+        if (!ok) {
+          toast('自动播放中止:本回合未成功执行', true);
+          break;
+        }
+        // 没推进就停,免得会话已结束 / 复核模式只出方案时空转
+        if (!S.state || S.state.rounds <= before) {
+          toast('自动播放中止:回合数没有推进(会话可能已结束或被暂停)', true);
+          break;
+        }
       }
     } finally {
       S.autoOn = false;
@@ -3304,6 +3582,7 @@
   }
 
   async function verifySession() {
+    if (!acquireOp()) return;
     if (!S.sessionId) return;
     try {
       setBusy(true, '正在回放对账…', '同一份世界 + 同一串命令,从第 0 年重推到当前年,比对指纹。');
@@ -3318,19 +3597,27 @@
       toast(`回放对账失败:${e instanceof Error ? e.message : String(e)}`, true);
     } finally {
       setBusy(false);
+      refreshButtons();
     }
   }
 
   async function exportSession() {
+    if (!acquireOp()) return;
     if (!S.sessionId) return;
     try {
       setBusy(true, '正在导出会话…');
       const d = await api('/api/export', { sessionId: S.sessionId });
-      toast(`已导出:${d.export.path}(${fmtInt(d.export.bytes)} 字节)`);
+      const out = d.export || {};
+      // 顶层 downloadUrl;兼容旧版把链接塞在 d.export.downloadUrl
+      const url = d.downloadUrl || out.downloadUrl || '';
+      const filename = d.filename || 'civ-atlas-export.json';
+      toast(`已导出:${out.path || ''}${out.bytes != null ? `(${fmtInt(out.bytes)} 字节)` : ''}`);
+      if (url) showExportLink(url, filename);
     } catch (e) {
       toast(`导出失败:${e instanceof Error ? e.message : String(e)}`, true);
     } finally {
       setBusy(false);
+      refreshButtons();
     }
   }
 
@@ -3353,7 +3640,8 @@
     el.btnWorld.addEventListener('click', () => { void createWorld(); });
     if (el.btnEmptyCreate) el.btnEmptyCreate.addEventListener('click', () => { void createWorld(); });
     el.btnSession.addEventListener('click', () => { void startSession(); });
-    el.btnRound.addEventListener('click', () => { void runRound(); });
+    // runRound 也会被 autoLoop 嵌套调用,所以互斥放在按钮这一层,不放进函数里
+    el.btnRound.addEventListener('click', () => { if (acquireOp()) void runRound().catch(() => {}); });
     el.btnAuto.addEventListener('click', () => {
       if (S.autoOn) stopAuto();
       else void autoLoop();
@@ -3361,6 +3649,7 @@
     el.btnVerify.addEventListener('click', () => { void verifySession(); });
     el.btnExport.addEventListener('click', () => { void exportSession(); });
     el.btnDmConnect.addEventListener('click', () => {
+      if (!acquireOp()) return;
       void (async () => {
         try {
           setBusy(true, el.dmMock.checked ? '正在连接 DM(mock)…' : '正在测试 DM 连接…', '只决定天灾和小贸易;Key 只在服务端内存。');
@@ -3376,6 +3665,7 @@
     });
 
     el.btnPettyConnect.addEventListener('click', () => {
+      if (!acquireOp()) return;
       void (async () => {
         try {
           setBusy(true, el.pettyMock.checked ? '正在连接小事件裁决层(mock)…' : '正在测试官方 Jev 连接…', '只裁决小事;Key 只在服务端内存。');
@@ -3409,8 +3699,10 @@
         // 跳过不等于关掉君主：保留 LLM 扮演、切成 mock，这样「先演示」时君主仍会开口。
         saveCfg({ ...cfgFromForm(), onboarded: true, features: { llm: true, jev: false }, mock: true });
         if (el.mock) el.mock.checked = true;
+        if (el.obMock) el.obMock.checked = true;
         if (el.featLlm) el.featLlm.checked = true;
         if (el.featJev) el.featJev.checked = false;
+        syncMockDisabled();
         hideOnboard();
         toast('已跳过:先用 mock 离线演示;随时点顶栏「参数」补 Key。');
       });
@@ -3418,6 +3710,14 @@
     for (const id of ['obProvider', 'obBaseUrl', 'obModel', 'obKey', 'obJevKey', 'obJevBase', 'obJevModel']) {
       const input = el[id];
       if (input) input.addEventListener('input', onboardState);
+    }
+    // 引导浮层「先用 mock 离线演示」:改动即时同步到参数栏 / 状态条 / 禁用态
+    if (el.obMock) {
+      el.obMock.addEventListener('change', () => {
+        applyOnboardToForm();
+        onboardState();
+        syncMockDisabled();
+      });
     }
     if (el.featJev) {
       el.featJev.addEventListener('change', () => {
@@ -3431,7 +3731,7 @@
       });
     }
     if (el.btnReviewCommit) el.btnReviewCommit.addEventListener('click', () => { void commitRound(); });
-    if (el.btnReviewCancel) el.btnReviewCancel.addEventListener('click', () => cancelReview());
+    if (el.btnReviewCancel) el.btnReviewCancel.addEventListener('click', () => { void cancelReview(); });
 
     // 君主卡保存(事件委托:卡片是动态渲染的)
     el.tabBody.addEventListener('click', (e) => {
@@ -3450,6 +3750,7 @@
       const polityId = Number(btn.dataset.polity);
       const ta = el.tabBody.querySelector('#crownPersona');
       if (!ta) return;
+      if (!acquireOp()) return;
       void (async () => {
         try {
           const d = await api('/api/monarch/card', { sessionId: S.sessionId, polityId, patch: { persona: ta.value } });
@@ -3474,24 +3775,13 @@
       if (row) selectPolity(Number(row.dataset.id));
     });
 
-    el.mock.addEventListener('change', () => {
-      el.provider.disabled = el.mock.checked;
-      el.apiKey.disabled = el.mock.checked;
-    });
+    el.mock.addEventListener('change', syncMockDisabled);
+    el.dmMock.addEventListener('change', syncMockDisabled);
+    el.pettyMock.addEventListener('change', syncMockDisabled);
 
-    el.dmMock.addEventListener('change', () => {
-      el.dmBaseUrl.disabled = el.dmMock.checked;
-      el.dmModel.disabled = el.dmMock.checked;
-      el.dmKey.disabled = el.dmMock.checked;
-    });
-
-    el.pettyMock.addEventListener('change', () => {
-      el.pettyKey.disabled = el.pettyMock.checked;
-    });
-
-    el.btnFieldApply.addEventListener('click', () => { void applyField(); });
+    el.btnFieldApply.addEventListener('click', () => { if (acquireOp()) void applyField(); });
     el.btnFieldOff.addEventListener('click', hideField);
-    el.btnFieldData.addEventListener('click', () => { void exportFieldData(); });
+    el.btnFieldData.addEventListener('click', () => { if (acquireOp()) void exportFieldData(); });
 
     el.fieldEnable.addEventListener('change', () => {
       if (!el.fieldEnable.checked) { hideField(); return; }
@@ -3502,7 +3792,7 @@
         draw();
         refreshButtons();
       } else {
-        void applyField();
+        if (acquireOp()) void applyField();
       }
     });
     [el.fieldKind, el.fieldRamp, el.fieldStretch, el.fieldContour, el.fieldGlow, el.fieldHillshade, el.fieldSmooth, el.fieldSeed, el.fieldScale]
@@ -3513,6 +3803,23 @@
     });
     el.fieldOpacityVal.textContent = (Number(el.fieldOpacity.value) || 0.85).toFixed(2);
 
+    if (el.magicField) {
+      el.magicField.addEventListener('change', () => {
+        if (!el.magicField.checked) {
+          // 用户关「魔力场」最直观的期待就是地图别再是紫的:先立刻收掉图层,
+          // 引擎里这个已开会话的魔力数据要重建会话才会真正没有,单独说清楚。
+          if (S.magic.on || S.magic.data || S.magic.img) hideMagic();
+          if (S.sessionId) toast('已隐藏地图上的魔力颜色;本会话的魔力场数据仍在,想彻底关掉请点「开始会话」重建。');
+        } else if (S.sessionId && S.magic.data) {
+          // 只是把显示勾回来,数据还在就直接重画,不必重新拉接口
+          if (el.magicEnable) el.magicEnable.checked = true;
+          S.magic.on = true;
+          renderMagicLegend();
+          draw();
+          refreshButtons();
+        }
+      });
+    }
     if (el.magicEnable) {
       el.magicEnable.addEventListener('change', () => {
         if (!el.magicEnable.checked) { hideMagic(); return; }
@@ -3522,18 +3829,19 @@
           draw();
           refreshButtons();
         } else {
-          void refreshMagic();
+          if (acquireOp()) void refreshMagic();
         }
       });
     }
     if (el.magicYearPick) {
-      el.magicYearPick.addEventListener('change', () => { void refreshMagic(Number(el.magicYearPick.value)); });
+      el.magicYearPick.addEventListener('change', () => { if (acquireOp()) void refreshMagic(Number(el.magicYearPick.value)); });
     }
     if (el.btnMagicNow) {
-      el.btnMagicNow.addEventListener('click', () => { void refreshMagic(); });
+      el.btnMagicNow.addEventListener('click', () => { if (acquireOp()) void refreshMagic(); });
     }
     if (el.magicPalette) {
       el.magicPalette.addEventListener('change', () => {
+        if (!acquireOp()) return;
         const key = el.magicPalette.value;
         if (!key) { setMagicColors(null); return; }
         if (key === 'custom') { setMagicColors(magicColorsFromInputs()); return; }
@@ -3544,12 +3852,14 @@
     for (const picker of [el.magicColor0, el.magicColor1, el.magicColor2]) {
       if (!picker) continue;
       picker.addEventListener('change', () => {
+        if (!acquireOp()) return;
         if (el.magicPalette) el.magicPalette.value = 'custom';
         setMagicColors(magicColorsFromInputs());
       });
     }
     if (el.btnMagicColorsReset) {
       el.btnMagicColorsReset.addEventListener('click', () => {
+        if (!acquireOp()) return;
         setMagicColors(null);
         if (el.magicPalette) el.magicPalette.value = '';
       });
@@ -3567,12 +3877,8 @@
     bindMap();
     bindChrome();
 
-    el.provider.disabled = el.mock.checked;
-    el.apiKey.disabled = el.mock.checked;
-    el.dmBaseUrl.disabled = el.dmMock.checked;
-    el.dmModel.disabled = el.dmMock.checked;
-    el.dmKey.disabled = el.dmMock.checked;
-    el.pettyKey.disabled = el.pettyMock.checked;
+    // 统一按当前所有 mock 开关刷新输入框禁用态(不再分散写一遍)
+    syncMockDisabled();
   }
 
   const savedCfg = loadCfg();
@@ -3581,4 +3887,6 @@
   if (!savedCfg.onboarded) showOnboard();
   refreshButtons();
   resizeCanvas();
+  // 进程里可能还留着没结束的会话:问一句要不要恢复
+  void bootstrap();
 })();

@@ -144,9 +144,16 @@ class SimBox extends Box {
       if (typeof fn !== 'function' || name === 'rand') throw new Error(`没有 ${name}`);
       // 参数照递数据的写法记:-0、±Infinity、NaN、undefined 各是各的
       const args = toWire(rest);
+      // 类型化数组的内容只在 bufs 里,text/patches 光记它的位置和类型:拿 text/patches 当缓存键,
+      // 内容不同、类型长度却一样的两块数组会撞成同一个键、读到别人那一次的结果。按内容区分代价太高,
+      // 带字节的参数干脆不进这一回合的缓存,每次照实参现算(既有读口参数都是标量,这一支平时不走)
+      const cacheable = args.bufs.length === 0;
       const key = `${kind}:${name}:${args.text}:${args.patches}`;
-      let hit = this.cache.get(key);
-      if (!hit) this.cache.set(key, (hit = toWire(Reflect.apply(fn, self, rest))));
+      let hit = cacheable ? this.cache.get(key) : undefined;
+      if (!hit) {
+        hit = toWire(Reflect.apply(fn, self, rest));
+        if (cacheable) this.cache.set(key, hit);
+      }
       w = hit;
     } catch (e) {
       return this.hostError(e);

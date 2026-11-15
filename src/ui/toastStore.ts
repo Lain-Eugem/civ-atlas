@@ -53,7 +53,12 @@ export interface ToastInput {
   tag?: string;
   /** 来源;同一来源的提示互相替换。不给 = 'default' */
   id?: string;
-  /** 这一条没了就调(到时收起、被关掉、被同一来源的新提示换掉,都算):「撤销」这类按钮从这一刻起点不到了 */
+  /**
+   * 这一条没了就调(到时收起、被关掉都算):「撤销」这类按钮从这一刻起点不到了。
+   * 被同一来源的新提示盖住时**不当场调**:收尾接给新提示,等新提示消失时才执行,
+   * 免得「已删除 / 撤销」刚被后来的通知盖住就立刻真删、撤销机会提前消失。
+   * 只有新提示自己显式带了 onGone(调用方明确接管这一来源),旧提示才就地收尾。
+   */
   onGone?: () => void;
 }
 
@@ -80,8 +85,12 @@ function stopTimer(id: string) {
 
 export function showToast(t: ToastInput): string {
   const id = t.id ?? 'default';
-  const toast: Toast = { ...t, id, stamp: ++seq };
   const replaced = list.find((x) => x.id === id);
+  // 新提示没有自己指定 onGone 时,把旧提示的收尾接过来:等这条新提示消失再执行,
+  // 撤销 / 回收站这类「过几秒还能反悔」的机会不会因一次同来源提示替换而提前消失。
+  // 新提示显式写了 onGone = 调用方要接管这个来源,旧提示就地收尾。
+  const carryGone = t.onGone === undefined ? replaced?.onGone : undefined;
+  const toast: Toast = { ...t, id, stamp: ++seq, ...(carryGone ? { onGone: carryGone } : {}) };
   const rest = list.filter((x) => x.id !== id);
   // "已完成"类的提示不盖住还没看的警告 / 出错(排在它们下面,警告关掉后再露出来);
   // 带按钮的("撤销")照常排最前:它到时就收,等警告关掉再露出来就晚了
@@ -105,7 +114,7 @@ export function showToast(t: ToastInput): string {
     );
   }
   emit();
-  replaced?.onGone?.();
+  if (t.onGone !== undefined) replaced?.onGone?.();
   return id;
 }
 

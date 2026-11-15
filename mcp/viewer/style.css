@@ -770,6 +770,24 @@ details.advanced > summary { font-weight: 500; }
 }
 
 .tab-body { flex: 1 1 auto; overflow-y: auto; padding: 11px 14px 16px; min-height: 0; }
+/* 三个持久页签容器:切换只切 hidden,命令区 DOM 不被重建 */
+.tab-main { min-height: 0; }
+.dialogue-pane { min-height: 0; }
+.dm-chat-holder { margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 8px; }
+.dlg-jev-state {
+  margin-bottom: 8px;
+  padding: 5px 9px;
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--ink-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.dlg-jev-state.is-off { border-left-color: var(--ink-3); background: var(--field); }
+.export-link { text-decoration: none; cursor: pointer; }
+.export-link:hover { background: var(--field); }
 
 /* 决策卡片 */
 .dec-round { margin-bottom: 14px; }

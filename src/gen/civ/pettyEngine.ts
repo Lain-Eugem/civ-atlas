@@ -13,7 +13,7 @@ import { regionOfKey, type Intervention } from '../edits';
 import { Layer, type Year } from './types';
 import type { CivSim } from './engine/sim';
 import type { InterventionModel } from './interventions';
-import { strikeBoost, type BoostIv } from './boost';
+import { DEV_BOOST_MUL, strikeBoost, type BoostIv } from './boost';
 
 export type PettyIv = Extract<Intervention, { kind: 'petty' }>;
 
@@ -38,10 +38,10 @@ export function strikePetty(sim: CivSim, iv: InterventionModel, v: PettyIv, i: n
 
   if (v.effect.type === 'dev') {
     // 委托 boost：快 3 倍、管 years 年；史事由 strikeBoost 记(intervene)
-    const boost: BoostIv = { kind: 'boost', a: v.a, from: v.from, mul: 3, until: v.from + v.effect.years } as BoostIv;
+    const boost: BoostIv = { kind: 'boost', a: v.a, from: v.from, mul: DEV_BOOST_MUL, until: v.from + v.effect.years } as BoostIv;
     const me = a >= 0 ? a : iv.resolve(v.a);
     if (me < 0) return;
-    strikeBoost(sim, iv, boost, i, me, t);
+    strikeBoost(sim, iv, boost, i, me, t, boost.until);
     return;
   }
 

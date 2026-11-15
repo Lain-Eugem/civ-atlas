@@ -9,6 +9,9 @@ export type ChronicleRefKind = (typeof CHRONICLE_REFS)[keyof typeof CHRONICLE_RE
 
 /** 一句最多几个字(不算占位符)、几个占位符;一个插件在一个世界里最多写几句 */
 export const CHRONICLE_LIMITS = { chars: 80, refs: 8, lines: 2000 } as const;
+/** 占位符里编号最多几位(存下的字按这个位数认);写入端和读回端共用,免得写进去 7 位编号、接着推读回时认不出 */
+const REF_ID_DIGITS = 6;
+const REF_ID_MAX = 10 ** REF_ID_DIGITS - 1;
 
 /** 插件交的一句 */
 export interface PluginChronicle {
@@ -27,7 +30,7 @@ export interface SimChronicleLine {
 
 const TEMPLATE_REF = /\{([国州城族]):([^{}]*)\}/g;
 const TEMPLATE_ONE = new RegExp(TEMPLATE_REF.source);
-const STORED_REF = /\{([国州城族]):(0|[1-9]\d{0,5})\}/g;
+const STORED_REF = new RegExp(`\\{([国州城族]):(0|[1-9]\\d{0,${REF_ID_DIGITS - 1}})\\}`, 'g');
 const REF_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/;
 /** 控制字符、改书写方向的字,还有私用区(编年史的名字占位符用它) */
 // eslint-disable-next-line no-control-regex
@@ -42,6 +45,8 @@ function checkId(kind: string, id: number, count: RefCount): void {
   if (!isRefChar(kind)) throw new Error(`认不出 {${kind}:…}`);
   const n = count(CHRONICLE_REFS[kind]);
   if (!(Number.isInteger(id) && id >= 0 && id < n)) throw new Error(`{${kind}:…} 指的 ${id} 不在 0 到 ${n - 1} 里`);
+  // 写入端也卡住编号位数:只校验 id < n 的话,n 一旦比 STORED_REF 认得的位数还大,写出来的编号读回时会被当成"认不出的占位符"
+  if (id > REF_ID_MAX) throw new Error(`{${kind}:…} 的编号不能超过 ${REF_ID_MAX}`);
 }
 
 function checkPlain(text: string, plain: number, refs: number): void {

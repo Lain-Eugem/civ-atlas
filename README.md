@@ -80,7 +80,7 @@ pnpm dev          # http://127.0.0.1:5188
 # 沙盒监视台在同一个服务器上:http://127.0.0.1:5188/sandbox/
 ```
 
-同一个开发服务器下就能打开两份界面:主站在 `/`,沙盒在 `/sandbox/`(首页左下角也有入口)。这一层由 `scripts/lib/sandboxViewer.ts` 这个 Vite 插件挂载(只在 `serve` 时生效,生产构建里没有);首次打开 `/sandbox/`(或 `mcp/` 源码有更新)时,它会自动构建 MCP 层并反代 `/sandbox/*` 与 `/api/*`,不用再单开一个 5190。
+同一个开发服务器下就能打开两份界面:主站在 `/`,沙盒在 `/sandbox/`(首页左下角也有入口)。这一层由 `scripts/lib/sandboxViewer.ts` 这个 Vite 插件挂载(只在 `serve` 时生效,生产构建里没有);首次打开 `/sandbox/`、或 `mcp/` 与 `src/` 下被编译源码的内容指纹有变化时,它会自动构建 MCP 层并反代 `/sandbox/*` 与 `/api/*`,不用再单开一个 5190(指纹记在 `mcp/.build/source.fingerprint`,不提交)。
 
 第一次打开 `/sandbox/` 会先弹一个引导浮层:**LLM(扮演君主)** 与 **Jev(裁决小事件 / 审核高影响命令)** 两把 Key 分开填,都能「测试连接」;不想联网就点「稍后配置」,自动切到 mock。Key 按你的选择存在本机浏览器的 `localStorage`(明文,只在本机),只 POST 给 `127.0.0.1` 上的监视台进程,不进会话日志、不进导出;公用电脑建议直接用 mock。
 
@@ -101,7 +101,7 @@ pnpm dev          # http://127.0.0.1:5188
 - **跨极回环**:世界东西相连,越过南北极也按球面的真实接法接到另一侧(纬度镜像 + 经度挪半圈),所以**上下左右都能一直拖**;点选国家、hover 数值、国都标注都按同一套变换反算。
 - **浮窗式界面**:顶栏、左侧行动栏、参数抽屉、国家面板、日志面板、右下缩放条都是浮在地图上的玻璃卡片,国家面板和日志面板能收起到只剩一条标题。
 
-> 地图渲染复用上游模块时有一个构建期细节:`src/render/labels/fonts.ts` 里有一句 Vite 专属的 `import.meta.env.BASE_URL`,在 CommonJS 产物里是语法错误。`mcp/build-compat.cjs` 会在 tsc 之后把**产物**里的这一句替换掉(幂等,不改上游 `src/`),`mcp/build.ps1` 与 Vite 自动构建都会调用。
+> 地图渲染复用上游模块时有一个构建期细节:`src/render/labels/fonts.ts` 里有一句 Vite 专属的 `import.meta.env.BASE_URL`,在 CommonJS 产物里是语法错误。`mcp/build-compat.cjs` 会在 tsc 之后把**产物**里的这一句替换掉(幂等,不改上游 `src/`),`mcp/build.ps1` 与 Vite 自动构建都会调用。CommonJS 目标下 tsc 另有 6 条既有诊断(`fonts.ts` 的 TS1343/TS2339、`selftest-monarch-sandbox.ts` 的 4 条 TS2345);`mcp/build.ps1` 只把这 6 条列为可容忍,其余任何类型错误都会打印全文并让构建失败。
 
 也可以单独起监视台(比如不跑主站、或接到别的端口):
 
@@ -219,7 +219,7 @@ civ-atlas/
 │   ├── 验收-2026-11-*/ ★      分阶段验收（多 seed 修复、河网、P0–P5 …）
 │   └── 交接-当前状态与待办.md / 君主沙盒-四功能可行性报告.md / development.md
 ├── examples/plugins/          10 个官方格式 .civplugin 示例 + .d.ts 接口
-├── ai-ruler/ ★               「AI 扮演统治者」独立原型（简报 → 决策 → 命令，含 mock）
+├── ai-ruler/ ★               「AI 扮演统治者」独立原型（已归档的本地实验，简报 → 决策 → 命令，含 mock）
 ├── .github/workflows/         部署与 CI（ci.yml 把单测 / 压力 / 冒烟分片并行）
 ├── 根目录文件
 │   ├── index.html / vite.config.ts / tsconfig.json / package.json    主站与构建配置
@@ -241,7 +241,7 @@ civ-atlas/
 - [`docs/君主沙盒-四功能可行性报告.md`](docs/君主沙盒-四功能可行性报告.md)：四项功能（引导 / 双开关 / 角色卡 / 提示词与情报）的实现方案、难度评级与风险点
 - [`docs/plugins/README.md`](docs/plugins/README.md)：官方推演 / 地图插件接口（api、sim、map、layer-format、limits、package）
 - [`本地运行说明.md`](本地运行说明.md) 与 [`启动.bat`](启动.bat)：Windows 一键起服务与排障
-- [`ai-ruler/README.md`](ai-ruler/README.md)：AI 统治者原型（可先不接 MCP 单独跑）
+- [`ai-ruler/README.md`](ai-ruler/README.md)：AI 统治者原型（**已归档的本地实验**，可先不接 MCP 单独跑；见文件内的归档说明）
 - [`docs/development.md`](docs/development.md)：上游的引擎开发说明
 - [`UPSTREAM.md`](UPSTREAM.md)：上游原版 README；[`CONTRIBUTING.md`](CONTRIBUTING.md)：参与方式
 

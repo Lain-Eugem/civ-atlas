@@ -50,19 +50,8 @@ export interface DetailProps {
   names: Record<string, string>;
 }
 
-/** 复制文字(没有剪贴板权限时退回老办法) */
-export async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = Object.assign(document.createElement('textarea'), { value: text });
-    ta.style.cssText = 'position:fixed;left:-9999px;top:0';
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-  }
-}
+/** 复制文字统一走 clipboard.ts(剪贴板接口不行时退回老办法,还会把焦点还回去) */
+export { copyText } from './clipboard';
 
 /** 时间轴跳到某一年(暂停) */
 export const jumpTo = (y: number) => setCivTime({ year: y, playing: false, scrubbing: false, story: false });

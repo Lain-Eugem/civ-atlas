@@ -15,8 +15,15 @@ import type { MonarchCard } from '../src/gen/civ/monarchCard';
 import { answerWeights, askJev, type JevSettings } from './petty-client';
 import type { Session } from './engine';
 
-/** 只有这些命令要过 Jev;其余由玩家 / DM 在复核界面决定 */
+/** 只有这些命令要过 Jev;其余由玩家 / DM 在复核界面决定。destroy/cede 不可逆,规则与 Jev 都有专门判据 */
 export const HIGH_IMPACT_KINDS: ReadonlySet<string> = new Set(['declare', 'press', 'destroy', 'cede']);
+/** 高影响命令的审核提示:尤其 destroy(灭国)/cede(割州)这类不可逆命令要更严格 */
+const IMPACT_NOTE: Record<string, string> = {
+  declare: '注意:宣战会开启一场战争。',
+  press: '注意:坚持打到底会拒绝引擎自动议和。',
+  destroy: '注意:灭国会永久抹掉一个国家,是不可逆的极端命令,请更严格地判断是否符合角色。',
+  cede: '注意:割让州土是重大且难以收回的让步,请更严格地判断是否符合角色。',
+};
 
 export type AuditOutcome = 'allow' | 'soften' | 'reject';
 
@@ -45,9 +52,11 @@ export function isHighImpact(v: Intervention): boolean {
   return HIGH_IMPACT_KINDS.has(v.kind);
 }
 
-/** 降级成什么:宣战 → 守成;坚持打 → 停止扩张 */
+/** 降级成什么:坚持打 → 停手;宣战/灭国/割州 → 守成(不真去开战、灭国、割地) */
 export function softenCommand(kind: string): unknown {
   if (kind === 'press') return { kind: 'halt' };
+  // destroy/cede 显式列出:降级为守成,绝不放行这两类不可逆命令
+  if (kind === 'destroy' || kind === 'cede') return { kind: 'policy', preset: 'hold' };
   return { kind: 'policy', preset: 'hold' };
 }
 
@@ -68,6 +77,21 @@ export function auditByRule(entry: AuditEntry, index: number): AuditVerdict {
   }
   if (v.kind === 'press' && c.preferences.war === 'avoid') {
     return { ...base, outcome: 'soften', reason: '他偏好避战,坚持打到底不符合角色' };
+  }
+  if (v.kind === 'destroy') {
+    // 灭国不可逆:不好战且谨慎、或重荣誉的君主都不会轻易赶尽杀绝
+    if (c.preferences.war === 'avoid' && c.traits.caution >= 60) {
+      return { ...base, outcome: 'soften', reason: `他偏好避战且谨慎(${c.traits.caution}),主动灭国不像他会做的事` };
+    }
+    if (c.traits.honor >= 70 && c.traits.caution >= 55) {
+      return { ...base, outcome: 'soften', reason: `重荣誉(${c.traits.honor})又谨慎,灭人之国、赶尽杀绝不符合角色` };
+    }
+  }
+  if (v.kind === 'cede') {
+    // 割州是重大且难收回的让步:野心大或极重荣誉的君主不会主动割地
+    if (c.traits.ambition >= 70 || (c.traits.honor >= 70 && c.traits.caution >= 55)) {
+      return { ...base, outcome: 'soften', reason: `野心${c.traits.ambition}/荣誉${c.traits.honor},主动割让州土不像他会做的事` };
+    }
   }
   return { ...base, outcome: 'allow', reason: '规则审核:未见与角色冲突' };
 }
@@ -113,7 +137,9 @@ export async function auditMonarchCommands(
     questions[auditQuestionKey(p.entry.polityId, p.index)] = {
       type: 'choice',
       instructions:
-        '判断这位君主的这条命令是否符合"他这个人"的身份、性格与能力(不是判断对不对国家有利)。' + commandFacts(p.entry, p.entry.commands[p.index]!),
+        '判断这位君主的这条命令是否符合"他这个人"的身份、性格与能力(不是判断对不对国家有利)。' +
+        (IMPACT_NOTE[p.entry.commands[p.index]!.kind] ?? '') +
+        commandFacts(p.entry, p.entry.commands[p.index]!),
       criteria: {
         fit: '符合:像他这样的人会想到、也办得到',
         stretch: '勉强:有点出格,但可以说得通',

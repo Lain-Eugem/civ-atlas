@@ -322,7 +322,7 @@
    * ------------------------------------------------------------------ */
 
   var draft = '';
-  var live = { sending: false };
+  var live = { sending: false, cancelling: false };
   var state = null;
 
   function isDisabled() {
@@ -330,7 +330,7 @@
   }
 
   function isBusy() {
-    if (live.sending) return true;
+    if (live.sending || live.cancelling) return true;
     return !!(state && state.handlers && state.handlers.busy);
   }
 
@@ -353,7 +353,9 @@
 
   function finishSend(text, ok) {
     live.sending = false;
-    if (ok && draft === text) {
+    // text 是 draft.trim():用 trim 后比较,否则带首尾空格的草稿永远清不掉
+    // (发送期间用户又改了输入时 trim 不等,草稿保留,符合预期)
+    if (ok && draft.trim() === text) {
       draft = '';
       if (state && state.ta) state.ta.value = '';
     }
@@ -397,18 +399,36 @@
     }
   }
 
+  function reportCancelError(err) {
+    var msg = '撤销失败:' + (err && err.message ? err.message : String(err));
+    if (state && state.handlers && typeof state.handlers.onError === 'function') {
+      try { state.handlers.onError(msg); } catch (_) {}
+    }
+  }
+
   function doCancel(index) {
-    if (!state) return;
+    if (!state || live.cancelling) return;
     if (isBusy()) return;
     var handlers = state.handlers || {};
     if (typeof handlers.cancel !== 'function') return;
     var list = state.view && state.view.pending ? state.view.pending : [];
     var item = list[index];
     if (!item || item.id === undefined || item.id === null) return;
+    var ret;
     try {
-      handlers.cancel(item.id);
+      ret = handlers.cancel(item.id);
     } catch (err) {
-      /* 撤销失败就等下一次 state 刷新 */
+      reportCancelError(err);
+      return;
+    }
+    // 撤销是异步请求:等它落定再解锁,失败要报出来而不是静默吞掉
+    if (ret && typeof ret.then === 'function') {
+      live.cancelling = true;
+      syncControls();
+      ret.then(
+        function () { live.cancelling = false; syncControls(); },
+        function (err) { live.cancelling = false; syncControls(); reportCancelError(err); }
+      );
     }
   }
 
@@ -451,6 +471,14 @@
     if (state && state.ta && typeof state.ta.value === 'string' && state.ta.value !== draft) {
       draft = state.ta.value;
     }
+    /* 重渲染会重建 textarea:先记下焦点与选区,渲染后恢复,避免打字被打断 */
+    var hadFocus = false;
+    var selStart = null;
+    var selEnd = null;
+    if (state && state.ta && doc.activeElement === state.ta) {
+      hadFocus = true;
+      try { selStart = state.ta.selectionStart; selEnd = state.ta.selectionEnd; } catch (_) {}
+    }
 
     var v = normView(view);
     var h = handlers && typeof handlers === 'object' ? handlers : {};
@@ -484,6 +512,12 @@
 
     if (ta) {
       ta.value = draft;
+      if (hadFocus) {
+        try {
+          ta.focus({ preventScroll: true });
+          if (selStart !== null && typeof ta.setSelectionRange === 'function') ta.setSelectionRange(selStart, selEnd);
+        } catch (_) {}
+      }
       ta.addEventListener('input', onInput);
       ta.addEventListener('keydown', onKeyDown);
     }

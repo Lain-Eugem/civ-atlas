@@ -1115,6 +1115,24 @@ function interveneStory(civ: Civ, e: Annal, id: number): IvStory {
       return decreeStory(civ, e, id, v, A, R, fail, done);
     case 'boost':
       return boostStory(civ, e, v, A, R, fail, done);
+    case 'story': {
+      // DM 故事事件:正文就是作者写的短标题和叙事;真实效果(sack / capacity / dev)只落在引擎状态上,编年史不逐条列
+      const head = v.title || A || '故事';
+      return done(v.text ? `${head},${v.text}` : head);
+    }
+    case 'petty': {
+      // 小事件裁决层:dev 委托推发展 / sack 记折损。b = -1 是委托 boost 记的(生效),b > 0 是 sack 生效,
+      // b = 0 是没生效(城 / 州指不到)。把折损写进正文,别让小事件只剩一个国名
+      if (v.effect.type === 'dev') return done(`${A}百业日兴`);
+      const city = cityName(civ, e.settlement);
+      const where = city || R;
+      const loss = ['轻', '中', '重'][v.effect.loss - 1] ?? '';
+      return e.b > 0 ? done(`${where}遭${loss}折损`) : fail(`欲令${where}遭折损,然其地无城`, '那一刻没有这座城');
+    }
+    case 'intel': {
+      // 渗透他国:只记一笔(谁派人探谁的底),不改引擎数值
+      return B ? done(`${A}遣人探${B}虚实`) : fail(`${A}欲探他国,然其国不存`, '对方在新历史里没有(或那一年还没立国)');
+    }
     default:
       return done(A);
   }
@@ -4582,6 +4600,10 @@ export function* chronicleSteps(civ: Civ): Generator<void, ChronicleEntry[]> {
     if (e.kind === 'intervene' && civ.interventions?.[e.war]?.guide) continue;
     // 即位(等在位的那位下台):登记的那一条不列,真即位时另有一条
     if (e.kind === 'intervene' && e.b === IV_WAIT && civ.interventions?.[e.war]?.kind === 'crown') continue;
+    // 故事事件的 dev 委托:strikeBoost 记的那一条(b = -1、带 until)只用于接着推重建发展段,
+    // 编年史由干预自己的汇总史事写(上面 case 'story'),这一条不另列,免得同一件故事重复上屏。
+    // petty 的 dev 委托没有汇总史事、要留着当正文,所以这里只认 war 指向 story 的
+    if (e.kind === 'intervene' && e.b === -1 && e.until !== undefined && civ.interventions?.[e.war]?.kind === 'story') continue;
     if (e.kind === 'fall' && e.b < 0 && mergedAt.has(`${e.a}|${e.year}`)) continue;
     if (e.kind === 'conquer' && e.b < 0 && e.a >= 0) {
       let g = tribal.get(e.a);

@@ -54,6 +54,10 @@
   /** 请求期间又有新编辑 */
   var dirtyAgain = false;
   var applyTimer = 0;
+  /** 本次 flush 的请求体快照:409 需要确认时用它带 force 重提 */
+  var pendingSnapshot = null;
+  /** 当前 flush 的 Promise:关闭面板时 await 它,确保改动落盘 */
+  var inFlight = null;
   /** 删除确认框里的待执行动作 */
   var confirmAction = null;
   /** bindPick 注册的外部回调 */
@@ -343,10 +347,15 @@
     el('startNationRows').addEventListener('blur', onRenameBlur, true);
     el('startConfirmYes').addEventListener('click', function () {
       var act = confirmAction;
+      confirmAction = null;
       hideConfirm();
       if (typeof act === 'function') act();
     });
-    el('startConfirmNo').addEventListener('click', hideConfirm);
+    el('startConfirmNo').addEventListener('click', function () {
+      confirmAction = null;
+      pendingSnapshot = null;
+      hideConfirm();
+    });
   }
 
   // ── 请求 ──────────────────────────────────────────────────────────────────
@@ -814,8 +823,8 @@
     }
   }
 
-  function gotoStartYear() {
-    close();
+  async function gotoStartYear() {
+    await close();
     var btn = document.getElementById('btnParams');
     if (btn) btn.click();
     window.setTimeout(function () {
@@ -1115,10 +1124,13 @@
   }
 
   function flush() {
-    if (!cfg || busy || !canEdit()) { dirtyAgain = true; return; }
+    if (!cfg || !canEdit()) { dirtyAgain = true; return inFlight || Promise.resolve(); }
     var setupBody = buildSetupBody();
     var customBody = buildCustomBody();
-    if (!setupBody && !customBody) return;
+    if (!setupBody && !customBody) return inFlight || Promise.resolve();
+    if (busy) { dirtyAgain = true; return inFlight || Promise.resolve(); }
+    // 409 快照:确认删除时要拿这次的请求体带 force 重提,不能事后重建(pending 已被清掉)
+    pendingSnapshot = { setupBody: setupBody, customBody: customBody };
     busy = true;
     setBusy(true);
     var setupData = null;
@@ -1141,8 +1153,9 @@
         });
       });
     }
-    chain.then(function (data) {
+    inFlight = chain.then(function (data) {
       var latest = data && data.state ? data : (setupData && setupData.state ? setupData : null);
+      pendingSnapshot = null;
       resetPending();
       if (latest) {
         if (latest.state && cfg) cfg.state = latest.state;
@@ -1179,9 +1192,16 @@
       clearPlacePreview();
       if (err && err.needConfirm && Array.isArray(err.needConfirm)) {
         var msg = err.needConfirm.map(function (c) { return c.message || ''; }).join('\n');
+        var snap = pendingSnapshot || { setupBody: buildSetupBody(), customBody: null };
         confirmAction = function () {
-          var body = Object.assign({ sessionId: cfg.sessionId, force: true }, buildSetupBody() || {});
-          setupCall(body).then(function () { return loadConfig({ fillCard: false }); }).catch(function (e2) {
+          var body = Object.assign({ sessionId: cfg.sessionId, force: true }, snap.setupBody || {});
+          pendingSnapshot = null;
+          return setupCall(body).then(function () {
+            var tail = snap.customBody
+              ? apiCall('/api/session/custom-start', Object.assign({ sessionId: cfg.sessionId }, snap.customBody))
+              : Promise.resolve();
+            return tail.then(function () { return loadConfig({ fillCard: false }); });
+          }).catch(function (e2) {
             toastMsg('删除失败:' + (e2 && e2.message ? e2.message : String(e2)), true);
           });
         };
@@ -1190,6 +1210,7 @@
         toastMsg('有国家只剩最后一个州:确认后才能整个删掉', true);
       } else {
         toastMsg('保存失败:' + (err && err.message ? err.message : String(err)), true);
+        pendingSnapshot = null;
       }
       resetPending();
       return loadConfig({ fillCard: false }).catch(function () {});
@@ -1197,8 +1218,10 @@
       busy = false;
       setBusy(false);
       renderAll();
+      inFlight = null;
       if (dirtyAgain) { dirtyAgain = false; schedule(); }
     });
+    return inFlight;
   }
 
   // ── 打开/关闭 ─────────────────────────────────────────────────────────────
@@ -1218,6 +1241,8 @@
     regionDirty = false;
     busy = false;
     dirtyAgain = false;
+    pendingSnapshot = null;
+    inFlight = null;
     editingPid = null;
     createdPid = null;
     confirmAction = null;
@@ -1255,12 +1280,28 @@
     });
   }
 
-  function finish() {
-    toastMsg('✓ 开局设置已保存(改动是即时生效的)');
-    close();
+  /** 关闭前把 debounce 里还没落盘的改动 flush 完,避免一关就丢 */
+  async function flushPending() {
+    if (applyTimer) { window.clearTimeout(applyTimer); applyTimer = 0; }
+    if (inFlight) await inFlight;
+    if (!cfg || !canEdit() || busy) return;
+    // 等完上一轮后再把期间新攒的 pending 也落盘
+    if (buildSetupBody() || buildCustomBody()) await flush();
   }
 
-  function close() {
+  async function finish() {
+    await close();
+    toastMsg('✓ 开局设置已保存(改动是即时生效的)');
+  }
+
+  async function close() {
+    try { await flushPending(); }
+    catch (_) { /* flush 内部已给出提示 */ }
+    // 409 还在等确认时不能悄悄关掉,否则确认框(在面板里)就看不见了
+    if (pendingSnapshot) {
+      toastMsg('有改动需要先点「确认删除」再关闭', true);
+      return;
+    }
     if (applyTimer) { window.clearTimeout(applyTimer); applyTimer = 0; }
     setPlaceMode(false);
     clearPlacePreview();

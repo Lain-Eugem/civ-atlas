@@ -19,9 +19,11 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, rmSync, statSync } from 'node:fs';
-import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
-import { deflateSync, gzipSync } from 'node:zlib';
+import { extname, join, normalize, resolve, sep, dirname, basename, isAbsolute } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { constants as osConstants, setPriority } from 'node:os';
+
+import { encodePng } from './png';
 
 import {
   createWorld,
@@ -38,12 +40,15 @@ import {
   worldIdOf,
   nationControlOf,
   nationControlView,
+  listSessions,
+  withSessionLock,
+  deleteSession,
   type EventView,
   type PolityView,
   type RulerView,
   type Session,
 } from './engine';
-import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, monarchPanels, setMonarchCard, verifySession } from './monarch';
+import { setupMonarch, monarchRound, monarchPlan, monarchCommit, monarchStatus, monarchPanels, setMonarchCard, verifySession, cancelMonarchPlan } from './monarch';
 import { listStartNations, applyCustomStart, applyStartSetup, startConfigStatus, autoNationName, inferCardFromBiography, hasUsableCities, noCitiesMessage, previewNationAt, type StartSetupInput } from './monarch-start';
 import { CARD_LIFESPAN_DEFAULT } from '../src/gen/civ/monarchCard';
 import { dmRound, dmSetup, dmStatus } from './dm';
@@ -93,252 +98,8 @@ function gameYearOf(playYear: number): number {
 }
 
 /* ------------------------------------------------------------------ *
- * PNG 编码(node:zlib 手写,8-bit RGBA)
+ * 旧沙盒底图(classic)的兼容导出
  * ------------------------------------------------------------------ */
-
-const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
-  }
-  return table;
-})();
-
-function crc32(buf: Buffer): number {
-  let c = -1;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff]! ^ (c >>> 8);
-  return (c ^ -1) >>> 0;
-}
-
-function pngChunk(type: string, data: Buffer): Buffer {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const typ = Buffer.from(type, 'ascii');
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(Buffer.concat([typ, data])), 0);
-  return Buffer.concat([len, typ, data, crc]);
-}
-
-function encodePng(width: number, height: number, rgba: Uint8Array | Uint8ClampedArray): Buffer {
-  const stride = width * 4;
-  const raw = Buffer.alloc((stride + 1) * height);
-  for (let y = 0; y < height; y++) {
-    raw[y * (stride + 1)] = 0; // filter: none
-    raw.set(rgba.subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // RGBA
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', deflateSync(raw, { level: 6 })),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-}
-
-/* ------------------------------------------------------------------ *
- * 地图配色
- * ------------------------------------------------------------------ */
-
-function cellColor(world: World, i: number): RGB {
-  const e = world.elevation[i] ?? 0;
-  const water = world.water[i] ?? 0;
-  const ice = world.seaIce[i] ?? 0;
-  if (water !== 0) {
-    // 海:越深越暗;湖单独一点绿蓝
-    const depth = clamp(-e / 1200, 0, 1);
-    let r = 46 + (1 - depth) * 20;
-    let g = 82 + (1 - depth) * 26;
-    let b = 116 + (1 - depth) * 34;
-    if (water === 2) {
-      r = 58; g = 96; b = 104;
-    }
-    if (ice > 0.5) {
-      const t = clamp((ice - 0.5) / 0.5, 0, 1);
-      r = r * (1 - t) + 208 * t;
-      g = g * (1 - t) + 218 * t;
-      b = b * (1 - t) + 230 * t;
-    }
-    return [r, g, b];
-  }
-  // 陆地:海拔(绝对米数,按 6000m 归一)→ 低地绿、山地褐、高山灰白
-  const t = clamp(e / 6000, 0, 1);
-  const stops: Array<[number, number, number, number]> = [
-    [0.0, 84, 112, 70],
-    [0.03, 100, 126, 80],
-    [0.09, 120, 136, 88],
-    [0.16, 138, 140, 96],
-    [0.25, 152, 142, 106],
-    [0.36, 164, 150, 120],
-    [0.5, 178, 168, 150],
-    [0.65, 194, 190, 184],
-    [0.8, 212, 214, 212],
-    [0.92, 236, 238, 236],
-    [1.0, 250, 250, 250],
-  ];
-  let rgb: RGB = [250, 250, 250];
-  for (let s = 1; s < stops.length; s++) {
-    const a = stops[s - 1]!;
-    const b = stops[s]!;
-    if (t <= b[0]) {
-      const u = (t - a[0]) / Math.max(1e-6, b[0] - a[0]);
-      rgb = [a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u, a[3] + (b[3] - a[3]) * u];
-      break;
-    }
-  }
-  // 气候着色:高纬/高山加雪,干热区加土黄,湿热区压深绿
-  const temp = world.temperature[i] ?? 0;
-  const rain = world.precipitation[i] ?? 0;
-  if (temp < -4) {
-    const k = clamp((-4 - temp) / 20, 0, 1) * 0.85;
-    rgb = [rgb[0] + (238 - rgb[0]) * k, rgb[1] + (242 - rgb[1]) * k, rgb[2] + (246 - rgb[2]) * k];
-  } else if (temp > 8 && rain < 260) {
-    const k = clamp((260 - rain) / 260, 0, 1) * 0.6;
-    rgb = [rgb[0] + (198 - rgb[0]) * k, rgb[1] + (180 - rgb[1]) * k, rgb[2] + (128 - rgb[2]) * k];
-  } else if (temp > 20 && rain > 1800) {
-    const k = clamp((rain - 1800) / 1600, 0, 1) * 0.45;
-    rgb = [rgb[0] + (48 - rgb[0]) * k, rgb[1] + (88 - rgb[1]) * k, rgb[2] + (52 - rgb[2]) * k];
-  }
-  return rgb;
-}
-
-/** 邻域海拔梯度光照:西北向光,给地形一点立体感(只作用在陆地上) */
-function terrainShade(world: World): Float32Array {
-  const mesh = world.mesh;
-  const n = mesh.n;
-  const out = new Float32Array(n);
-  const max = Math.max(1, world.maxElevation);
-  const W = mesh.width;
-  const xs = mesh.x;
-  const ys = mesh.y;
-  const e = world.elevation;
-  for (let i = 0; i < n; i++) {
-    let gx = 0;
-    let gy = 0;
-    let cnt = 0;
-    const ei = e[i] ?? 0;
-    const xi = xs[i] ?? 0;
-    const yi = ys[i] ?? 0;
-    for (let k = mesh.adjStart[i] ?? 0; k < (mesh.adjStart[i + 1] ?? 0); k++) {
-      const j = mesh.adj[k]!;
-      let dx = (xs[j] ?? 0) - xi;
-      if (dx > W / 2) dx -= W;
-      else if (dx < -W / 2) dx += W;
-      const dy = (ys[j] ?? 0) - yi;
-      const d2 = dx * dx + dy * dy;
-      if (d2 > 1e-6) {
-        const de = ((e[j] ?? 0) - ei) / max;
-        gx += (de * dx) / d2;
-        gy += (de * dy) / d2;
-        cnt++;
-      }
-    }
-    let f = 1;
-    if (cnt > 0) {
-      gx /= cnt;
-      gy /= cnt;
-      const lit = gx * -0.55 + gy * -0.83;
-      f = 1 + lit * 130;
-    }
-    out[i] = clamp(f, 0.7, 1.3);
-  }
-  return out;
-}
-
-function mix(c0: RGB, c1: RGB, t: number, out: Uint8Array, o: number): void {
-  const k = clamp(t, 0, 1);
-  out[o] = Math.round(c0[0] * (1 - k) + c1[0] * k);
-  out[o + 1] = Math.round(c0[1] * (1 - k) + c1[1] * k);
-  out[o + 2] = Math.round(c0[2] * (1 - k) + c1[2] * k);
-  out[o + 3] = 255;
-}
-
-/* ------------------------------------------------------------------ *
- * 三角形栅格化(等距圆柱主图,2048 像素宽)
- * 地图在页面上是铺满整个窗口的,1024 宽会被放大到 1.7 倍以上而发虚;
- * 2048 宽在常见屏幕上正好是 1:1 左右。点击选国用的是下面另算的 240 格网格,不受这里影响。
- * ------------------------------------------------------------------ */
-
-const MAP_OUT_W = 2048;
-
-function triangleFill(
-  px: Uint8Array,
-  W: number,
-  H: number,
-  ax: number, ay: number,
-  bx: number, by: number,
-  cx: number, cy: number,
-  ca: RGB, cb: RGB, cc: RGB,
-): void {
-  const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)));
-  const maxX = Math.min(W - 1, Math.ceil(Math.max(ax, bx, cx)));
-  const minY = Math.max(0, Math.floor(Math.min(ay, by, cy)));
-  const maxY = Math.min(H - 1, Math.ceil(Math.max(ay, by, cy)));
-  if (minX > maxX || minY > maxY) return;
-  const d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
-  if (Math.abs(d) < 1e-9) return;
-  const inv = 1 / d;
-  for (let y = minY; y <= maxY; y++) {
-    const py = y + 0.5;
-    for (let x = minX; x <= maxX; x++) {
-      const pxx = x + 0.5;
-      let l0 = ((by - cy) * (pxx - cx) + (cx - bx) * (py - cy)) * inv;
-      if (l0 < -0.0005 || l0 > 1.0005) continue;
-      let l1 = ((cy - ay) * (pxx - cx) + (ax - cx) * (py - cy)) * inv;
-      if (l1 < -0.0005 || l1 > 1.0005) continue;
-      const l2 = 1 - l0 - l1;
-      if (l2 < -0.0005 || l2 > 1.0005) continue;
-      l0 = clamp(l0, 0, 1);
-      l1 = clamp(l1, 0, 1);
-      const o = (y * W + x) * 4;
-      px[o] = Math.round(ca[0] * l0 + cb[0] * l1 + cc[0] * (1 - l0 - l1));
-      px[o + 1] = Math.round(ca[1] * l0 + cb[1] * l1 + cc[1] * (1 - l0 - l1));
-      px[o + 2] = Math.round(ca[2] * l0 + cb[2] * l1 + cc[2] * (1 - l0 - l1));
-      px[o + 3] = 255;
-    }
-  }
-}
-
-function stampCells(
-  px: Uint8Array,
-  W: number,
-  H: number,
-  sx: number,
-  sy: number,
-  n: number,
-  x: Float32Array,
-  y: Float32Array,
-  colorOf: (i: number) => RGB | null,
-  radius: number,
-): void {
-  const r = Math.max(0, Math.round(radius));
-  for (let i = 0; i < n; i++) {
-    const c = colorOf(i);
-    if (!c) continue;
-    const cx = Math.round((x[i] ?? 0) * sx) % W;
-    const cy = Math.round((y[i] ?? 0) * sy);
-    for (let dy = -r; dy <= r; dy++) {
-      const py = cy + dy;
-      if (py < 0 || py >= H) continue;
-      for (let dx = -r; dx <= r; dx++) {
-        const pxx = (cx + dx + W) % W;
-        const o = (py * W + pxx) * 4;
-        px[o] = c[0];
-        px[o + 1] = c[1];
-        px[o + 2] = c[2];
-        px[o + 3] = 255;
-      }
-    }
-  }
-}
 
 interface MapImage {
   width: number;
@@ -346,61 +107,13 @@ interface MapImage {
   rgba: Uint8Array;
 }
 
-/** 基础地形图(海/陆/湖/冰),按世界 id 缓存 */
+/**
+ * 兼容导出:改造前的沙盒底图(classic)是「三角形栅格 + 地块小方块」这套纯 viewer 内的画法,
+ * 现已并入 mcp/terrain.ts 的 renderWhole(和 geo/satellite 同一条写实流水线)。
+ * 这里只留一层转发,内部不再保留那套死代码;外部若曾 import 本函数也不会落到空符号。
+ */
 function renderWorldMap(world: World): MapImage {
-  const W = MAP_OUT_W;
-  const H = Math.max(64, Math.round((MAP_OUT_W * world.height) / world.width));
-  const sx = W / world.width;
-  const sy = H / world.height;
-  const px = new Uint8Array(W * H * 4);
-  // 先铺一层深海,三角形/地块没盖到的地方(缝、极区)也不会空
-  for (let o = 0; o < px.length; o += 4) {
-    px[o] = 14; px[o + 1] = 30; px[o + 2] = 48; px[o + 3] = 255;
-  }
-  const n = world.mesh.n;
-  const colors = new Uint8Array(n * 3);
-  const shade = terrainShade(world);
-  for (let i = 0; i < n; i++) {
-    const c = cellColor(world, i);
-    const k = (world.water[i] ?? 0) === 0 ? shade[i]! : 1;
-    colors[i * 3] = Math.min(255, Math.round(c[0] * k));
-    colors[i * 3 + 1] = Math.min(255, Math.round(c[1] * k));
-    colors[i * 3 + 2] = Math.min(255, Math.round(c[2] * k));
-  }
-  const colorAt = (i: number): RGB => [colors[i * 3]!, colors[i * 3 + 1]!, colors[i * 3 + 2]!];
-
-  // 地块小方块保底,保证极区/接缝被覆盖
-  stampCells(px, W, H, sx, sy, n, world.mesh.x, world.mesh.y, (i) => colorAt(i), Math.max(1, Math.round(world.mesh.spacing * sx * 0.55)));
-
-  const tri = world.mesh.triangles;
-  for (let t = 0; t + 2 < tri.length; t += 3) {
-    const ia = tri[t]!;
-    const ib = tri[t + 1]!;
-    const ic = tri[t + 2]!;
-    const ax = (world.mesh.x[ia] ?? 0) * sx;
-    const bx = (world.mesh.x[ib] ?? 0) * sx;
-    const cx = (world.mesh.x[ic] ?? 0) * sx;
-    const ay = (world.mesh.y[ia] ?? 0) * sy;
-    const by = (world.mesh.y[ib] ?? 0) * sy;
-    const cy = (world.mesh.y[ic] ?? 0) * sy;
-    const ca = colorAt(ia);
-    const cb = colorAt(ib);
-    const cc = colorAt(ic);
-    const span = Math.max(ax, bx, cx) - Math.min(ax, bx, cx);
-    if (span > W / 2) {
-      // 跨 180° 经线 / 包着极点的三角形:三点各自折到同一边,再左右各画一份
-      const wxs = [ax, bx, cx].map((v) => (v > W / 2 ? v - W : v));
-      triangleFill(px, W, H, wxs[0]!, ay, wxs[1]!, by, wxs[2]!, cy, ca, cb, cc);
-      triangleFill(px, W, H, wxs[0]! + W, ay, wxs[1]! + W, by, wxs[2]! + W, cy, ca, cb, cc);
-    } else {
-      triangleFill(px, W, H, ax, ay, bx, by, cx, cy, ca, cb, cc);
-    }
-  }
-  // 极区最上/最下几行容易露出背景色:用相邻行的像素盖住
-  const pad = Math.min(3, H - 1);
-  for (let y = 0; y < pad; y++) px.copyWithin(y * W * 4, pad * W * 4, (pad + 1) * W * 4);
-  for (let y = 0; y < pad; y++) px.copyWithin((H - 1 - y) * W * 4, (H - 2 - pad) * W * 4, (H - 1 - pad) * W * 4);
-  return { width: W, height: H, rgba: px };
+  return renderWhole(world, 'classic');
 }
 
 interface OwnerMap extends MapImage {
@@ -477,6 +190,8 @@ function stateView(s: Session): Record<string, unknown> {
   const civ = s.civ;
   const world = s.world;
   const year = gameYearOf(s.play.year);
+  // 历史遗留的 playerPolityId 可能指向已被删除 / 越界的国家:polityName 收到 undefined 会抛,先守卫
+  const playerPolity = s.playerPolityId != null ? civ.polities[s.playerPolityId] : undefined;
   const polities = (st.polities as PolityView[]).map((p) => {
     const pol: Polity | undefined = civ.polities[p.id];
     const cap = p.capital >= 0 ? civ.settlements[p.capital] : undefined;
@@ -590,7 +305,7 @@ function stateView(s: Session): Record<string, unknown> {
     pendingStartSetup: s.pendingStartSetup ?? null,
     // DM 硬命令(上帝视角):不依赖任何"玩家国家";playerPolityId 只是历史遗留的面板聚焦字段
     playerPolityId: s.playerPolityId ?? null,
-    playerPolityName: s.playerPolityId != null ? polityName(civ.polities[s.playerPolityId], year) : null,
+    playerPolityName: playerPolity ? polityName(playerPolity, year) : null,
     playerCommands: playerCommandView(s),
   };
 }
@@ -599,43 +314,94 @@ function stateView(s: Session): Record<string, unknown> {
  * 会话表 / 缓存
  * ------------------------------------------------------------------ */
 
-const baseCache = new Map<string, Buffer>();
+/**
+ * 所有内存缓存统一的封顶容器:超过上限时淘汰最久没用到的键(LRU),
+ * 取代原来散落在各处的「size > N 就 clear()」(那会把热数据一起冲掉)。
+ * set 返回被淘汰的 key,供 tileCache 同步清掉 tileLines 这类伴生缓存。
+ */
+class BoundedCache<V> {
+  private readonly map = new Map<string, V>();
+  constructor(private readonly max: number) {}
+
+  get(key: string): V | undefined {
+    const v = this.map.get(key);
+    if (v !== undefined) {
+      this.map.delete(key);
+      this.map.set(key, v);
+    }
+    return v;
+  }
+
+  has(key: string): boolean { return this.map.has(key); }
+
+  set(key: string, value: V): string[] {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, value);
+    const evicted: string[] = [];
+    while (this.map.size > this.max) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined) break;
+      this.map.delete(oldest);
+      evicted.push(oldest);
+    }
+    return evicted;
+  }
+
+  delete(key: string): boolean { return this.map.delete(key); }
+
+  /** 按前缀清理:会话状态变了,把该会话所有回合的旧缓存一次性作废 */
+  deletePrefix(prefix: string): void {
+    for (const key of [...this.map.keys()]) if (key.startsWith(prefix)) this.map.delete(key);
+  }
+
+  keys(): IterableIterator<string> { return this.map.keys(); }
+  clear(): void { this.map.clear(); }
+  get size(): number { return this.map.size; }
+}
+
+/** 按会话缓存的键统一带回合号:同一回合里的开局设置/改卡会改状态但年份不一定变,
+ * 只靠 fingerprint 可能命中旧缓存;加上 rounds 后每次推演自然换键。 */
+function sessionKey(s: Session, ...parts: (string | number)[]): string {
+  return [s.id, `r${s.rounds}`, ...parts].join('|');
+}
+
+const baseCache = new BoundedCache<Buffer>(64);
 /** 瓦片像素的渲染版本:terrain.ts 改了底图 / 瓦片的上色、河网等算法时 +1 */
 const TILE_RENDER_VER = 11;
 /** 高清瓦片:key = worldId | 画法 | 渲染版本 | LOD | 球面展开坐标上的块号 */
-const tileCache = new Map<string, Buffer>();
+const tileCache = new BoundedCache<Buffer>(192);
 /** 每块瓦片自己的海岸 / 湖岸线(按该块的倍率追的,和这块地形严丝合缝) */
-const tileLines = new Map<string, { sea: number[][]; lake: number[][] }>();
-const TILE_CACHE_MAX = 192;
+const tileLines = new BoundedCache<{ sea: number[][]; lake: number[][] }>(192);
 /** 矢量层(海岸线 / 波纹 / 符号):按世界缓存一份 JSON */
-const vectorCache = new Map<string, string>();
-const ownerCache = new Map<string, { fingerprint: string; json: Record<string, unknown> }>();
-const chronCache = new Map<string, { fingerprint: string; entries: EventView[]; total: number }>();
+const vectorCache = new BoundedCache<string>(32);
+const ownerCache = new BoundedCache<{ fingerprint: string; json: Record<string, unknown> }>(64);
+const chronCache = new BoundedCache<{ fingerprint: string; entries: EventView[]; total: number }>(64);
 /** 场的计算层帧缓存:键 = worldId|kind|seed|scale;同世界同参数只算一次 */
-const fieldFrames = new Map<string, FieldFrame>();
+const fieldFrames = new BoundedCache<FieldFrame>(32);
 /** 场的渲染层缓存:键 = frame.hash|样式 JSON;改样式只重画,不动计算层 */
-const fieldPngs = new Map<string, { png: Buffer; legend: unknown }>();
-/** 「魔力」动态图层的 PNG 缓存:键 = sessionId|年份 */
-const magicPngs = new Map<string, { png: Buffer; legend: unknown; frameYear: number | null }>();
-/** 「魔力」高清瓦片缓存:键 = sessionId|年份|S|x|y|size(每块只算一次) */
-const magicTilePngs = new Map<string, Buffer>();
-/** 疆域高清瓦片缓存:键 = sessionId|状态指纹|S|x|y|size(和整张疆域图同时失效) */
-const ownerTilePngs = new Map<string, Buffer>();
-/** 标签层缓存:键 = sessionId|年份(世界 / 文明状态不变时只生成一次) */
-const labelsCache = new Map<string, string>();
-const dialogueCache = new Map<string, string>();
-const veinCache = new Map<string, string>();
-/** Region atlas cache: key = sessionId|fingerprint|scale */
-const atlasCache = new Map<string, string>();
+const fieldPngs = new BoundedCache<{ png: Buffer; legend: unknown }>(48);
+/** 「魔力」动态图层的 PNG 缓存:键 = sessionKey(年份) */
+const magicPngs = new BoundedCache<{ png: Buffer; legend: unknown; frameYear: number | null }>(24);
+/** 「魔力」高清瓦片缓存:键 = sessionKey(年份|S|x|y|size) */
+const magicTilePngs = new BoundedCache<Buffer>(512);
+/** 疆域高清瓦片缓存:键 = sessionKey(状态指纹|S|x|y|size) */
+const ownerTilePngs = new BoundedCache<Buffer>(512);
+/** 标签层缓存:键 = sessionKey(年份) */
+const labelsCache = new BoundedCache<string>(8);
+const dialogueCache = new BoundedCache<string>(16);
+const veinCache = new BoundedCache<string>(16);
+/** Region atlas cache: key = sessionKey(fingerprint|scale) */
+const atlasCache = new BoundedCache<string>(6);
 
-/** 会话状态变了:整张疆域图和它的疆域瓦片都作废(瓦片按 session 前缀清) */
+/** 会话状态变了:整张疆域图和它的疆域瓦片都作废(按会话前缀清,覆盖该会话所有回合号) */
 function invalidateOwnerCache(sid: string): void {
-  ownerCache.delete(sid);
   const prefix = `${sid}|`;
-  for (const key of ownerTilePngs.keys()) if (key.startsWith(prefix)) ownerTilePngs.delete(key);
-  for (const key of atlasCache.keys()) if (key.startsWith(prefix)) atlasCache.delete(key);
+  ownerCache.deletePrefix(prefix);
+  ownerTilePngs.deletePrefix(prefix);
+  atlasCache.deletePrefix(prefix);
   // 标签层也按会话缓存:开局增删国家发生在同一回合里,年份没变,不清理会继续显示已删国家的国名。
-  for (const key of labelsCache.keys()) if (key.startsWith(prefix)) labelsCache.delete(key);
+  labelsCache.deletePrefix(prefix);
+  chronCache.deletePrefix(prefix);
 }
 
 function optNum(v: string | null): number | undefined {
@@ -655,7 +421,6 @@ function getFieldFrameCached(world: World, worldId: string, kind: FieldKind, see
   const hit = fieldFrames.get(key);
   if (hit) return hit;
   const frame = fieldFrame(world, kind, { seed, scale });
-  if (fieldFrames.size > 32) fieldFrames.clear();
   fieldFrames.set(key, frame);
   return frame;
 }
@@ -752,17 +517,11 @@ async function getBasePng(worldId: string, style: TerrainStyle): Promise<Buffer>
   return png;
 }
 
-/** 缓存按 LRU 简单封顶,免得反复放大把内存吃光 */
+/** 缓存按 LRU 简单封顶,伴生的 tileLines 跟着被淘汰的 key 一起删 */
 function cacheTile(key: string, png: Buffer, lines?: { sea: number[][]; lake: number[][] }): void {
-  tileCache.set(key, png);
+  const evicted = tileCache.set(key, png);
+  for (const k of evicted) tileLines.delete(k);
   if (lines) tileLines.set(key, lines);
-  if (tileCache.size > TILE_CACHE_MAX) {
-    const oldest = tileCache.keys().next().value;
-    if (oldest !== undefined) {
-      tileCache.delete(oldest);
-      tileLines.delete(oldest);
-    }
-  }
 }
 
 // ---- 预渲染:启动时把 S=2/4/8 的瓦片算好落盘,前端按进度条等到全部就绪 ----
@@ -771,7 +530,7 @@ const PREWARM_SIZE = 512;
 const TILE_DISK_ROOT = resolve('.runs', 'tiles');
 
 interface PrewarmState { state: 'running' | 'done' | 'failed'; done: number; total: number; startedAt: number; style: TerrainStyle }
-const prewarmState = new Map<string, PrewarmState>();
+const prewarmState = new BoundedCache<PrewarmState>(16);
 
 function tileDiskPath(t: TileQuery, ext = 'png'): string {
   return join(TILE_DISK_ROOT, t.worldId, t.style, `v${TILE_RENDER_VER}`, String(t.S), `${t.x}_${t.y}_${t.size}.${ext}`);
@@ -860,7 +619,7 @@ function getOwnerMap(s: Session): {
   height: number;
 } {
   const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
-  const hit = ownerCache.get(s.id);
+  const hit = ownerCache.get(sessionKey(s));
   if (hit && hit.fingerprint === fingerprint) {
     const j = hit.json as {
       png: string;
@@ -884,7 +643,7 @@ function getOwnerMap(s: Session): {
     width: map.width,
     height: map.height,
   };
-  ownerCache.set(s.id, { fingerprint, json });
+  ownerCache.set(sessionKey(s), { fingerprint, json });
   return {
     png,
     grid: map.grid,
@@ -898,12 +657,12 @@ function getOwnerMap(s: Session): {
 }
 
 function eventsOf(s: Session): { entries: EventView[]; total: number } {
-  const hit = chronCache.get(s.id);
+  const hit = chronCache.get(sessionKey(s));
   const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
   if (hit && hit.fingerprint === fingerprint) return hit;
   const chron = chronicleGet(s, { limit: 500 });
   const v = { fingerprint, entries: chron.entries, total: chron.total };
-  chronCache.set(s.id, v);
+  chronCache.set(sessionKey(s), v);
   return v;
 }
 
@@ -937,20 +696,32 @@ function fail(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { error: message });
 }
 
+const BODY_MAX = 4 * 1024 * 1024;
+
 function readBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolveBody, reject) => {
+    // Content-Length 明显超限时直接拒,并把流排空(不 destroy:还要写回 413 响应体)
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > BODY_MAX) {
+      reject(new Error('请求体太大'));
+      req.resume();
+      return;
+    }
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = false;
     req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return; // 超限后继续把流读完,但不再堆积内存
       size += chunk.length;
-      if (size > 4 * 1024 * 1024) {
+      if (size > BODY_MAX) {
+        tooLarge = true;
         reject(new Error('请求体太大'));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (tooLarge) return;
       if (!chunks.length) return resolveBody({});
       try {
         resolveBody(JSON.parse(Buffer.concat(chunks).toString('utf8')));
@@ -976,11 +747,61 @@ function num(args: Args, key: string, fallback: number): number {
 
 const VALID_PROVIDERS = new Set(['deepseek', 'bailian', 'custom', 'mock']);
 
+/** 放弃复核:撤销服务端待提交方案(回滚 plan 阶段落下的角色卡/继位/死亡/后代/AP/情报),幂等。
+ * 不进全局锁,免得长回合正占着锁时按不到。 */
+function handleMonarchCancel(res: ServerResponse, args: Args): boolean {
+  const sid = String(args.sessionId ?? '');
+  if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+  let s: Session;
+  try { s = getSession(sid); } catch (e) {
+    fail(res, 404, e instanceof Error ? e.message : String(e));
+    return true;
+  }
+  cancelMonarchPlan(s);
+  invalidateOwnerCache(s.id);
+  sendJson(res, 200, { ok: true, state: stateView(s) });
+  return true;
+}
+
 async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: string, url: URL): Promise<boolean> {
   const method = req.method ?? 'GET';
 
   if (method === 'GET' && pathname === '/api/health') {
     sendJson(res, 200, { ok: true, viewer: 'civ-atlas-mcp-viewer', staticDir: STATIC_DIR });
+    return true;
+  }
+
+  // 进程内会话清单(重启会清空):前端可据此恢复会话、发现没被正确清理的幽灵会话
+  if (method === 'GET' && pathname === '/api/sessions') {
+    sendJson(res, 200, { sessions: listSessions() });
+    return true;
+  }
+
+  // 导出文件下载:只按 sessionId 定位该会话 logDir 下的 basename,
+  // 拒绝 .. / 绝对路径 / 任何路径分隔符,从根上堵住路径穿越;没有先导出过就 404。
+  if (method === 'GET' && pathname === '/api/export/file') {
+    const sid = url.searchParams.get('sessionId') ?? '';
+    const name = url.searchParams.get('name') ?? 'export.json';
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    if (!name || name === '.' || name === '..' || name.includes('..') ||
+        name.includes('/') || name.includes('\\') || isAbsolute(name) || basename(name) !== name) {
+      fail(res, 400, 'name 只能是该会话目录下的文件名');
+      return true;
+    }
+    const s = getSession(sid);
+    const root = resolve(s.logDir);
+    const file = resolve(root, name);
+    if (!file.startsWith(root + sep) || !existsSync(file)) {
+      fail(res, 404, '导出文件不存在,请先 POST /api/export');
+      return true;
+    }
+    const body = readFileSync(file);
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-disposition': `attachment; filename="${name}"`,
+      'cache-control': 'no-store',
+    });
+    res.end(body);
     return true;
   }
 
@@ -1104,12 +925,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
     const s = getSession(sid);
     const year = s.play.year;
-    const key = `${s.id}|${year}`;
+    const key = sessionKey(s, year);
     let json = labelsCache.get(key);
     if (!json) {
       json = JSON.stringify(buildLabels(s.world, s.civ, { year }));
       labelsCache.set(key, json);
-      if (labelsCache.size > 8) labelsCache.clear();
     }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(json);
@@ -1131,7 +951,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
     const s = getSession(sid);
     const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
-    const key = `${sid}|${fingerprint}|${S}|${x}|${y}|${size}`;
+    const key = sessionKey(s, fingerprint, S, x, y, size);
     const hit = ownerTilePngs.get(key);
     if (hit) { sendPng(res, hit); return true; }
     const civ = ownerCivData(s.civ);
@@ -1139,7 +959,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       (await renderViaPool(worldIdOf(s.worldParams), s.world, { kind: 'owner', S, x, y, size, civ })) ??
       renderOwnerTilePixels(s.world, civ, S, x, y, size);
     const png = encodePng(map.width, map.height, map.rgba);
-    if (ownerTilePngs.size > 512) ownerTilePngs.clear();
     ownerTilePngs.set(key, png);
     sendPng(res, png);
     return true;
@@ -1168,7 +987,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const scale = Math.max(1, Math.min(8, Math.round(Number(q.get('scale') ?? 2)) || 2));
     const s = getSession(sid);
     const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
-    const key = `${s.id}|${fingerprint}|${scale}`;
+    const key = sessionKey(s, fingerprint, scale);
     let json = atlasCache.get(key);
     if (!json) {
       const at = regionAtlas(s.world, s.civ, scale);
@@ -1184,7 +1003,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         dataGzB64: gz.toString('base64'),
       });
       atlasCache.set(key, json);
-      if (atlasCache.size > 6) atlasCache.clear();
     }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(json);
@@ -1198,17 +1016,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
     const s = getSession(sid);
     const rawLimit = q.get('limit');
-    const limit = rawLimit === null || rawLimit === '' ? 80 : Number(rawLimit);
+    const limit = Math.max(1, Math.min(500, Math.round(
+      rawLimit === null || rawLimit === '' ? 80 : Number(rawLimit),
+    )));
     if (!Number.isFinite(limit)) { fail(res, 400, 'limit 必须是数字'); return true; }
     const kindRaw = q.get('kind');
     const kind = kindRaw === 'dm' || kindRaw === 'jev' || kindRaw === 'monarch' ? kindRaw : undefined;
     const fingerprint = String(stateGet(s, { chronicle: false }).fingerprint ?? '');
-    const key = `${s.id}|${fingerprint}|${limit}|${kind ?? ''}`;
+    const key = sessionKey(s, fingerprint, limit, kind ?? '');
     let json = dialogueCache.get(key);
     if (!json) {
       json = JSON.stringify(dialogueView(s, { limit, kind }));
       dialogueCache.set(key, json);
-      if (dialogueCache.size > 16) dialogueCache.clear();
     }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(json);
@@ -1239,7 +1058,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const hit = fieldPngs.get(key);
     if (hit) { sendPng(res, hit.png); return true; }
     const out = renderFieldMap(rec.world, frame, style);
-    if (fieldPngs.size > 48) fieldPngs.clear();
     fieldPngs.set(key, { png: out.png, legend: out.legend });
     sendPng(res, out.png);
     return true;
@@ -1310,14 +1128,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     const colorKey = colors ? colors.join(',') : '';
     const asked = optNum(url.searchParams.get('year'));
     const lo = layer.years[0];
+    if (lo === undefined) { fail(res, 404, '魔力图层还没有帧(推演一回合后再看)'); return true; }
     const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(lo, asked));
-    const key = `${s.id}|${year}|${colorKey}`;
+    const key = sessionKey(s, year, colorKey);
     const hit = magicPngs.get(key);
     if (hit) { sendPng(res, hit.png); return true; }
     const style = colors ? { ...DEFAULT_MAGIC_STYLE, colors } : DEFAULT_MAGIC_STYLE;
     const out = renderMagicMap(s.world, s.civ, year, style);
     if (!out) { fail(res, 404, '没有魔力图层'); return true; }
-    if (magicPngs.size > 24) magicPngs.clear();
     magicPngs.set(key, { png: out.png, legend: out.legend, frameYear: out.frameYear });
     sendPng(res, out.png);
     return true;
@@ -1331,7 +1149,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (!layer) { fail(res, 404, '这个会话没有开「魔力」场(开会话时 magicField:true)'); return true; }
     const colors = parseMagicColors(url.searchParams.get('colors'));
     const asked = optNum(url.searchParams.get('year'));
-    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
+    const lo = layer.years[0];
+    if (lo === undefined) { fail(res, 404, '魔力图层还没有帧(推演一回合后再看)'); return true; }
+    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(lo, asked));
     const data = magicDataJson(s.world, s.civ, s.id, year, Math.max(32, Math.min(512, optNum(url.searchParams.get('gridW')) ?? 256)), colors ?? undefined);
     if (!data) { fail(res, 404, '没有魔力图层'); return true; }
     sendJson(res, 200, { ...data, legend: magicLegendOf(s.civ, year, colors ?? undefined) });
@@ -1353,16 +1173,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (!Number.isFinite(x) || !Number.isFinite(y)) { fail(res, 400, 'x / y 必须是数字'); return true; }
     if (!Number.isInteger(size) || size < 16 || size > 1024) { fail(res, 400, 'size 超出范围'); return true; }
     const asked = optNum(q.get('year'));
-    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(layer.years[0], asked));
+    const lo = layer.years[0];
+    if (lo === undefined) { fail(res, 404, '魔力图层还没有帧(推演一回合后再看)'); return true; }
+    const year = asked === undefined ? s.play.year : Math.min(s.play.year, Math.max(lo, asked));
     const colors = parseMagicColors(q.get('colors'));
     const colorKey = colors ? colors.join(',') : '';
-    const key = `${s.id}|${year}|${S}|${x}|${y}|${size}|${colorKey}`;
+    const key = sessionKey(s, year, S, x, y, size, colorKey);
     const hit = magicTilePngs.get(key);
     if (hit) { sendPng(res, hit); return true; }
     const style = colors ? { ...DEFAULT_MAGIC_STYLE, colors } : DEFAULT_MAGIC_STYLE;
     const out = renderMagicTile(s.world, s.civ, year, S, x, y, size, style);
     if (!out) { fail(res, 404, '没有魔力图层'); return true; }
-    if (magicTilePngs.size > 512) magicTilePngs.clear();
     magicTilePngs.set(key, out.png);
     sendPng(res, out.png);
     return true;
@@ -1417,9 +1238,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
   }
 
   if (method === 'POST') {
-    const args = (await readBody(req)) as Args;
+    let args: Args;
+    try {
+      args = (await readBody(req)) as Args;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      fail(res, message === '请求体太大' ? 413 : 400, message);
+      return true;
+    }
+    // 放弃复核不需要排队:长回合可能正占着全局锁,而它只清待提交方案、不改推演状态
+    if (pathname === '/api/monarch/cancel') return handleMonarchCancel(res, args);
+    return await withPostLock(() => handlePost(res, pathname, args));
+  }
 
-    if (pathname === '/api/world') {
+  return false;
+}
+
+/** engine 的全局会话锁(单参数重载):所有写操作串行,避免并发改同一份会话状态。 */
+function withPostLock<T>(fn: () => Promise<T>): Promise<T> {
+  return withSessionLock(fn) as Promise<T>;
+}
+
+/** 所有会改会话状态的 POST 在这里串行执行;readBody / cancel 已在锁外处理完。 */
+async function handlePost(res: ServerResponse, pathname: string, args: Args): Promise<boolean> {
+  if (pathname === '/api/world') {
       const seed = num(args, 'seed', 7);
       const cells = num(args, 'cells', 34043);
       const rec = createWorld({ seed, params: { cells } });
@@ -1454,7 +1296,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         args.setup && typeof args.setup === 'object' && !Array.isArray(args.setup)
           ? (args.setup as StartSetupInput)
           : undefined;
-      const { session, summary } = openSession({
+      const { session } = openSession({
         worldId,
         startYear,
         stepYears,
@@ -1471,13 +1313,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         try {
           startSetup = applyStartSetup(session);
         } catch (e) {
+          // 会话已经注册进引擎,但前端这次拿不到 id:删掉它 + 清掉日志目录,
+          // 别留一个谁也访问不到的幽灵会话(内存和磁盘都算)
+          deleteSession(session.id);
+          try { rmSync(session.logDir, { recursive: true, force: true }); } catch { /* 清理失败不盖掉原始错误 */ }
           fail(res, 400, e instanceof Error ? e.message : String(e));
           return true;
         }
       }
       invalidateOwnerCache(session.id);
-      chronCache.delete(session.id);
-      sendJson(res, 200, { session: summary, state: stateView(session), ...(startSetup ? { startSetup } : {}) });
+      // 摘要必须在应用 setup 之后重取:openSession 返回的还是 pendingStartSetup 的旧快照
+      sendJson(res, 200, { session: sessionSummary(session), state: stateView(session), ...(startSetup ? { startSetup } : {}) });
       return true;
     }
 
@@ -1561,7 +1407,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         return true;
       }
       invalidateOwnerCache(s.id);
-      chronCache.delete(s.id);
       sendJson(res, 200, { ok: true, result, state: stateView(s) });
       return true;
     }
@@ -1595,7 +1440,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const result = applyCustomStart(s, input);
       // m05242 修正:custom-start 的 polityId 只表示"要改哪一国的君主卡/疆域",不再写入 playerPolityId(没有玩家国家)。
       invalidateOwnerCache(s.id);
-      chronCache.delete(s.id);
       sendJson(res, 200, { state: stateView(s), result });
       return true;
     }
@@ -1633,6 +1477,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       const sid = String(args.sessionId ?? '');
       if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
       const s = getSession(sid);
+      // 复核模式必须走 plan → commit;monarchRound 内部也会拒绝,这里先给个友好提示
+      if (s.review) { fail(res, 409, '复核模式下请先 /api/monarch/plan 出方案,再 /api/monarch/commit 提交'); return true; }
       const round = await monarchRound(s, args.years === undefined ? {} : { years: num(args, 'years', s.stepYears) });
       invalidateOwnerCache(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
@@ -1658,7 +1504,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
             .map((r) => ({ polityId: Number(r.polityId), index: Number(r.index) }))
             .filter((r) => Number.isInteger(r.polityId) && Number.isInteger(r.index))
         : undefined;
-      const round = await monarchCommit(s, reject ? { reject } : {});
+      const planId = args.planId === undefined || args.planId === null || args.planId === ''
+        ? undefined : String(args.planId);
+      const pending = s.pendingPlan as { planId?: string } | undefined;
+      if (!pending) { fail(res, 409, '没有待提交的回合方案;先跑 /api/monarch/plan'); return true; }
+      // 防止把上一回合 / 另一个会话的旧方案提交到当前状态上
+      if (planId !== undefined && pending.planId !== undefined && String(pending.planId) !== planId) {
+        fail(res, 409, '方案已过期(planId 不匹配),请重新出方案');
+        return true;
+      }
+      const round = await monarchCommit(s, {
+        ...(reject ? { reject } : {}),
+        ...(planId !== undefined ? { planId } : {}),
+      });
       invalidateOwnerCache(s.id);
       sendJson(res, 200, { round, state: stateView(s) });
       return true;
@@ -1791,13 +1649,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
       return true;
     }
 
-    if (pathname === '/api/export') {
-      const sid = String(args.sessionId ?? '');
-      if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
-      const s = getSession(sid);
-      sendJson(res, 200, { export: exportSession(s) });
-      return true;
-    }
+  if (pathname === '/api/export') {
+    const sid = String(args.sessionId ?? '');
+    if (!sid) { fail(res, 400, '缺 sessionId'); return true; }
+    const s = getSession(sid);
+    const out = exportSession(s);
+    const filename = `civ-atlas-${sid}.json`;
+    sendJson(res, 200, {
+      export: out,
+      filename,
+      downloadUrl: `/api/export/file?sessionId=${encodeURIComponent(sid)}&name=export.json`,
+    });
+    return true;
   }
 
   return false;
@@ -1809,7 +1672,13 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     res.end();
     return;
   }
-  const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.replace(/^\/+/, ''));
+  let rel: string;
+  try {
+    rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.replace(/^\/+/, ''));
+  } catch {
+    fail(res, 400, '路径编码不合法');
+    return;
+  }
   const file = resolve(STATIC_DIR, normalize(rel));
   const root = resolve(STATIC_DIR) + sep;
   if (!file.startsWith(root) && file !== resolve(STATIC_DIR, 'index.html')) {
@@ -1828,8 +1697,52 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   res.end(body);
 }
 
+/**
+ * 只给本机浏览器用:挡住 DNS rebinding / 跨站 CSRF。
+ * 服务只监听 127.0.0.1,但恶意网页仍能用简单 POST 打到本机并触发副作用(推演、开会话、导出),
+ * CORS 只挡响应读取、挡不住请求本身,所以按 Host / Sec-Fetch-Site / Origin 三重校验:
+ *   - Host 必须是 127.0.0.1 / localhost / [::1](可带端口);
+ *   - 浏览器发的 Sec-Fetch-Site 只能是 same-origin 或 none(地址栏直接访问),其余一律拒绝;
+ *   - 带 Origin 时,它的主机必须也是这几个本机别名;端口允许不同,因为 /sandbox/ 是
+ *     dev server(5188) 转发到监视台(随机端口),两边都是本机服务,严格比 host:port 会把
+ *     这条合法路径误判成跨源攻击。
+ * 外部页面伪造不了 127.0.0.1 的 Origin,DNS rebinding 的 Host 也不是本机别名(第一关已挡住)。
+ * 非浏览器客户端(curl / Node fetch)不带这两个头,只按 Host 校验。
+ */
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+function checkLocalRequest(req: IncomingMessage): string | null {
+  const host = (req.headers.host ?? '').toLowerCase();
+  if (!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/.test(host)) {
+    return `拒绝非本机来源的 Host:${host || '(空)'}`;
+  }
+  const site = req.headers['sec-fetch-site'];
+  if (site !== undefined && site !== 'none' && site !== 'same-origin') {
+    return `拒绝跨站请求(Sec-Fetch-Site: ${String(site)})`;
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    let u: URL;
+    try { u = new URL(String(origin)); }
+    catch { return 'Origin 不合法'; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return `拒绝非 HTTP 来源的 Origin:${u.protocol}`;
+    // 只认本机别名,不比端口:浏览器按真实来源填 Origin,外部站点伪造不了它。
+    if (!LOCAL_HOSTS.has(u.hostname.toLowerCase())) return `拒绝非本机来源的 Origin:${u.host}`;
+  }
+  return null;
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+  const denied = checkLocalRequest(req);
+  if (denied) { fail(res, 403, denied); return; }
+  let url: URL;
+  try {
+    // 畸形 Host / 畸形 req.url 都会让 new URL 抛异常:别让它冒泡成 500 或把连接挂死
+    url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+  } catch {
+    if (!res.headersSent && !res.writableEnded) fail(res, 400, '请求地址不合法');
+    return;
+  }
   const pathname = url.pathname;
   try {
     if (pathname.startsWith('/api/')) {
@@ -1843,6 +1756,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     serveStatic(req, res, pathname);
   } catch (e) {
+    // 413 等响应可能已经写出去了,别二次写导致 ERR_STREAM_WRITE_AFTER_END
+    if (res.headersSent || res.writableEnded) return;
     const message = e instanceof Error ? e.message : String(e);
     const status = /找不到|缺 |只能是|必须是|已经|没有可|请求体/.test(message) ? 400 : 500;
     fail(res, status, message);

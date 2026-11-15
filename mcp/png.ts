@@ -36,7 +36,7 @@ function pngChunk(type: string, data: Buffer): Buffer {
 }
 
 /** width×height 的 8-bit RGBA 像素 → PNG 文件字节。 */
-export function encodePng(width: number, height: number, rgba: Uint8Array): Buffer {
+export function encodePng(width: number, height: number, rgba: Uint8Array | Uint8ClampedArray): Buffer {
   const stride = width * 4;
   const raw = Buffer.alloc((stride + 1) * height);
   for (let y = 0; y < height; y++) {

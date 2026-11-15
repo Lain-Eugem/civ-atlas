@@ -1,5 +1,7 @@
 # AI 统治者 demo（在本地 civ-atlas 上让 AI 治国）
 
+> **归档说明（2026-11-15）**：本目录是 2026-11-12 前后的**本地实验原型 / 历史归档**，不是当前「多 Agent 沙盒」（MCP 工具层 + AI 君主 + DM + 查看器）的一部分，也不再维护。`ai-ruler/.build/`（编译产物）与 `ai-ruler/out/`（mock 推演日志）都在 `.gitignore` 里、不提交，属于归档产物；`src/` 一行未改。当前可运行的君主 / DM / 查看器能力请看根目录 [`README.md`](../README.md) 与 [`mcp/README.md`](../mcp/README.md)。
+
 让 AI（真的模型，或者不用 Key 的假 AI）扮演一个国家，每回合读一眼局势、下几条命令，再由 civ-atlas 自己的推演引擎把世界接着推进几年。
 
 这是**本地实验**：只在仓库里加了一个 `ai-ruler/` 文件夹，`src/` 一行没改，也不影响网页版和存档。
@@ -88,7 +90,7 @@ node ai-ruler\.build\ai-ruler\run.js --dry-run
 ## 已知限制
 
 - AI 每回合只看一段简报文字，不能自己翻地图/编年史（那是官方内置助手才有的工具循环）。想加深可以照 `src/ai/agent/assistant.ts` 的工具集给它加工具。
-- 命令只有 5 种；引擎其实有 23 种干预（割让、立国、迁都、君主婚配、天灾等），要接得补 `run.ts` 里的 `buildCommands`。
+- 命令只有 5 种（`policy` / `declare` / `ally` / `halt` / `boost`）；引擎实际有 **27 种干预**（权威来源：`src/gen/edits.ts` 的 `INTERVENTION_KINDS` 数组与 `Intervention` 联合类型——割让 `cede`、立国 `found`、迁都 `move`、君主婚配 `marry`、天灾 `disaster`，以及后加的 `press` / `intel` / `petty` / `story` 等）。早期写的「23 种」是过时数字，已按当前代码核对修正；要接更多得补 `run.ts` 里的 `buildCommands`。
 - 「逐年」是按回合算的；每回合 1 年时州数往往看不出变化，所以默认 5 年。
 - 真模型容易写出不合法命令：程序会拒收并打印原因，这是预期行为。
 - 这是本地实验，不会出现在 civ-atlas 的网页界面里；要变成正式功能得改 `src/`，而且会破坏「同种子逐位一致」的确定性。
